@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "scanwich"
+version = "0.1.0"
+description = "Make searchable sandwich PDFs with pluggable OCR backends"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+authors = [{ name = "Jayson Reis" }]
+dependencies = [
+  "easyocr>=1.7.2",
+  "Pillow>=10",
+  "reportlab>=4",
+]
+
+[project.optional-dependencies]
+test = ["pypdf>=5"]
+
+[project.scripts]
+scanwich = "scanwich.cli:main"
+
+[project.entry-points."scanwich.ocr_backends"]
+easyocr = "scanwich.backends.easyocr:factory"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"

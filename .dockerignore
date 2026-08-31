@@ -1,0 +1,10 @@
+.git
+.direnv
+.venv
+.ruff_cache
+__pycache__
+*.egg-info
+*.pdf
+*.txt
+ocr-results
+result
