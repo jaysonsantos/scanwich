@@ -19,9 +19,8 @@ def convert_pdf(
     output_pdf: Path,
     *,
     backend: OcrBackend,
-    dpi: int = 300,
+    dpi: int | None = None,
     ocr_output_directory: Path | None = None,
-    magick_command: str = "magick",
 ) -> None:
     input_pdf = input_pdf.expanduser().resolve()
     output_pdf = output_pdf.expanduser().resolve()
@@ -29,29 +28,28 @@ def convert_pdf(
         raise FileNotFoundError(f"input PDF does not exist: {input_pdf}")
     if input_pdf == output_pdf:
         raise ValueError("input and output PDF paths must be different")
-    if dpi <= 0:
+    if dpi is not None and dpi <= 0:
         raise ValueError("DPI must be greater than zero")
 
     output_pdf.parent.mkdir(parents=True, exist_ok=True)
     with TemporaryDirectory(prefix="scanwich-") as temporary_directory:
         work_directory = Path(temporary_directory)
-        logger.info("Rasterizing %s at %d DPI", input_pdf, dpi)
-        page_images = rasterize_pdf(
+        logger.info("Rasterizing %s", input_pdf)
+        pages = rasterize_pdf(
             input_pdf,
             work_directory / "pages",
             dpi=dpi,
-            magick_command=magick_command,
         )
-        logger.info("Rasterized %d page(s)", len(page_images))
+        logger.info("Rasterized %d page(s)", len(pages))
         page_regions = []
-        for page_number, image_path in enumerate(page_images, start=1):
+        for page_number, page in enumerate(pages, start=1):
             logger.info(
                 "Recognizing page %d/%d with %s",
                 page_number,
-                len(page_images),
+                len(pages),
                 type(backend).__name__,
             )
-            regions = list(backend.recognize(image_path))
+            regions = list(backend.recognize(page.image_path))
             page_regions.append(regions)
             logger.info("Recognized %d text region(s) on page %d", len(regions), page_number)
             if ocr_output_directory is not None:
@@ -60,7 +58,7 @@ def convert_pdf(
 
         temporary_pdf = work_directory / "result.pdf"
         logger.info("Assembling searchable PDF")
-        assemble_searchable_pdf(page_images, page_regions, temporary_pdf, dpi=dpi)
+        assemble_searchable_pdf(pages, page_regions, temporary_pdf)
         os.replace(temporary_pdf, output_pdf)
         logger.info("Wrote searchable PDF to %s", output_pdf)
 

@@ -29,16 +29,11 @@
             dependencies = with python.pkgs; [
               easyocr
               pillow
+              pypdfium2
               reportlab
             ];
             nativeCheckInputs = [
               python.pkgs.pypdf
-              pkgs.imagemagick
-              pkgs.ghostscript
-            ];
-
-            makeWrapperArgs = [
-              "--prefix PATH : ${nixpkgs.lib.makeBinPath [ pkgs.imagemagick pkgs.ghostscript ]}"
             ];
 
             checkPhase = ''
@@ -51,7 +46,6 @@
         in
         {
           default = package;
-          ghostscript-source = pkgs.ghostscript.src;
           scanwich = package;
         }
       );
@@ -83,8 +77,6 @@
             inputsFrom = [ self.packages.${system}.default ];
             packages = [
               self.packages.${system}.default
-              pkgs.imagemagick
-              pkgs.ghostscript
               pkgs.python3Packages.pypdf
               pkgs.python3Packages.ruff
             ];

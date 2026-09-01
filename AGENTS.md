@@ -13,8 +13,8 @@ Container model warm-up code is in `docker/`, while Nix packaging is defined by 
 ## Build, Test, and Development Commands
 
 - `direnv allow` activates the Nix development shell through `.envrc` on directory entry.
-- `nix develop "path:$PWD"` opens the same shell manually with Python, ImageMagick,
-  Ghostscript, Ruff, and test dependencies.
+- `nix develop "path:$PWD"` opens the same shell manually with Python, PDFium, Ruff, and test
+  dependencies.
 - `nix run . -- input.pdf output.pdf -l de pt en` builds and runs Scanwich locally.
 - `nix flake check "path:$PWD"` builds the package and runs the complete unit test suite.
 - `nix develop "path:$PWD" -c ruff check src tests docker` checks Python style.

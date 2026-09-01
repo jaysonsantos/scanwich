@@ -63,4 +63,4 @@ class ConversionTests(TestCase):
             self.assertIn("Rasterized 1 page(s)", progress)
             self.assertIn("Recognizing page 1/1 with FakeBackend", progress)
             self.assertIn("Recognized 1 text region(s) on page 1", progress)
-            self.assertIn(f"Wrote searchable PDF to {output_pdf}", progress)
+            self.assertIn(f"Wrote searchable PDF to {output_pdf.resolve()}", progress)

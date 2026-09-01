@@ -1,7 +1,7 @@
 # Scanwich
 
-Scanwich turns an image-based PDF into a searchable sandwich PDF. ImageMagick renders each
-source page, an OCR backend returns text polygons, and the tool rebuilds each page with:
+Scanwich turns an image-based PDF into a searchable sandwich PDF. PDFium renders each source
+page, an OCR backend returns text polygons, and the tool rebuilds each page with:
 
 - the original rendered page as the visible layer; and
 - invisible, selectable text aligned with the OCR polygons.
@@ -11,7 +11,7 @@ EasyOCR-specific result types.
 
 ## Run with Nix
 
-The flake provides Python, EasyOCR, ImageMagick, Ghostscript, Pillow, and ReportLab:
+The flake provides Python, EasyOCR, pypdfium2/PDFium, Pillow, and ReportLab:
 
 ```console
 nix run . -- \
@@ -90,13 +90,15 @@ scanwich input.pdf output.pdf \
 
 ## Notes
 
-- `--dpi` defaults to 300. Higher values can improve OCR while increasing memory use.
+- By default, Scanwich infers each page's DPI from a full-page image. It falls back to 300 DPI
+  for vector or ambiguous pages and caps inferred values at 300 DPI.
+- `--dpi` overrides automatic DPI selection for every page. Higher values can improve OCR while
+  increasing memory use.
 - `--ocr-output-dir` saves one normalized JSON file per page.
-- The output page size is derived from the raster dimensions and DPI.
+- Output pages retain the source PDF's page dimensions.
 - The output is written atomically after every page has been processed successfully.
 
 ## License
 
 Scanwich is licensed under the [MIT License](LICENSE). Dependencies keep their own
-licenses; see [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md). The container includes
-the exact Nix-pinned Ghostscript source alongside the AGPL-licensed Ghostscript binary.
+licenses; see [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).

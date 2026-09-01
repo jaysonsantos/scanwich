@@ -41,16 +41,15 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="KEY=VALUE",
         help="backend setting; VALUE accepts JSON (repeatable)",
     )
-    parser.add_argument("--dpi", type=int, default=300, help="rasterization DPI (default: 300)")
+    parser.add_argument(
+        "--dpi",
+        type=int,
+        help="rasterization DPI (default: infer from a full-page image, otherwise 300)",
+    )
     parser.add_argument(
         "--ocr-output-dir",
         type=Path,
         help="also save normalized per-page OCR JSON files",
-    )
-    parser.add_argument(
-        "--magick-command",
-        default="magick",
-        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--list-backends",
@@ -94,7 +93,6 @@ def main(argv: Sequence[str] | None = None) -> int:
             backend=backend,
             dpi=args.dpi,
             ocr_output_directory=args.ocr_output_dir,
-            magick_command=args.magick_command,
         )
     except (FileNotFoundError, PdfPipelineError, TypeError, ValueError, RuntimeError) as error:
         logger.error("%s", error)
