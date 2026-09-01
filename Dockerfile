@@ -1,4 +1,4 @@
-FROM docker.io/nixos/nix:2.31.2
+FROM docker.io/nixos/nix:2.35.2
 
 ENV NIX_CONFIG="experimental-features = nix-command flakes"
 ENV EASYOCR_MODULE_PATH="/opt/easyocr"
