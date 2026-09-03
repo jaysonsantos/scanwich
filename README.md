@@ -88,6 +88,33 @@ scanwich input.pdf output.pdf \
   --backend-option 'readtext={"batch_size": 4}'
 ```
 
+### OpenRouter vision backend
+
+The built-in `openrouter` backend sends each rasterized page to OpenRouter's
+OpenAI-compatible chat-completions endpoint. It defaults to the image-capable
+`deepseek/deepseek-v4-flash-vision-exp` model. Set the API key in the environment rather
+than passing it on the command line:
+
+```console
+export OPENROUTER_API_KEY=...
+scanwich input.pdf output.pdf \
+  --ocr-backend openrouter \
+  -l de pt en
+```
+
+The backend accepts `model`, `base_url`, `api_key_env`, `timeout`, `max_tokens`, and
+`reasoning_effort` backend options. For example:
+
+```console
+scanwich input.pdf output.pdf \
+  --ocr-backend openrouter \
+  --backend-option timeout=300 \
+  --backend-option reasoning_effort=low
+```
+
+Page images are base64-encoded and sent to OpenRouter and its selected model provider. Do
+not use this backend for documents that must remain local.
+
 ## Notes
 
 - By default, Scanwich infers each page's DPI from a full-page image. It falls back to 300 DPI

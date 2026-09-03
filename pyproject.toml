@@ -12,6 +12,7 @@ license = "MIT"
 authors = [{ name = "Jayson Reis" }]
 dependencies = [
   "easyocr>=1.7.2",
+  "openai>=1.0",
   "Pillow>=10",
   "pypdfium2>=5.11",
   "reportlab>=4",
@@ -25,6 +26,7 @@ scanwich = "scanwich.cli:main"
 
 [project.entry-points."scanwich.ocr_backends"]
 easyocr = "scanwich.backends.easyocr:factory"
+openrouter = "scanwich.backends.openrouter:factory"
 
 [tool.setuptools.packages.find]
 where = ["src"]
