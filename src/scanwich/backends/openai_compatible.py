@@ -186,7 +186,8 @@ def _parse_json_payload(content: str) -> Any:
         return json.loads(content)
     except json.JSONDecodeError:
         logger.debug(
-            "OpenAI-compatible returned non-JSON content; attempting fallback parse: %s", content
+            "OpenAI-compatible returned non-JSON content; attempting fallback parse (%d chars)",
+            len(content),
         )
 
     stripped = content.strip()

@@ -111,7 +111,8 @@ OpenAI-compatible service:
 scanwich input.pdf output.pdf \
   --ocr-backend openai-compatible \
   --backend-option base_url=https://example.invalid/v1 \
-  --backend-option api_key_env=EXAMPLE_API_KEY
+  --backend-option api_key_env=EXAMPLE_API_KEY \
+  --backend-option model=provider/vision-model
 ```
 
 Page images are base64-encoded and sent to the configured service and its selected model
