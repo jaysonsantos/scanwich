@@ -29,8 +29,8 @@ APP_TITLE = "Scanwich"
 logger = logging.getLogger(__name__)
 
 
-class OpenRouterBackend:
-    """Vision OCR through OpenRouter's OpenAI-compatible chat endpoint."""
+class OpenAICompatibleBackend:
+    """Vision OCR through an OpenAI-compatible chat-completions endpoint."""
 
     def __init__(self, *, languages: Sequence[str], options: Mapping[str, Any]) -> None:
         option_values = dict(options)
@@ -55,7 +55,7 @@ class OpenRouterBackend:
         )
         if option_values:
             unsupported = ", ".join(sorted(option_values))
-            raise TypeError(f"unsupported OpenRouter backend option(s): {unsupported}")
+            raise TypeError(f"unsupported OpenAI-compatible backend option(s): {unsupported}")
         self._client: Any | None = None
 
     def recognize(self, image_path: Path) -> list[OcrRegion]:
@@ -87,26 +87,33 @@ class OpenRouterBackend:
             "response_format": {"type": "json_object"},
         }
         if self._reasoning_effort is not None:
-            request["reasoning_effort"] = self._reasoning_effort
+            request["extra_body"] = {"reasoning_effort": self._reasoning_effort}
 
-        logger.info("Sending page image to OpenRouter model %s", self._model)
+        logger.info("Sending page image to OpenAI-compatible model %s", self._model)
         started_at = time.monotonic()
         try:
             completion = client.chat.completions.create(**request)
         except Exception as error:
             raise RuntimeError(
-                f"OpenRouter request failed for model {self._model}: {error}"
+                f"OpenAI-compatible request failed for model {self._model}: {error}"
             ) from error
         logger.info(
-            "OpenRouter response received after %.1f seconds", time.monotonic() - started_at
+            "OpenAI-compatible response received after %.1f seconds", time.monotonic() - started_at
         )
 
         choices = getattr(completion, "choices", None)
         if not choices:
-            raise RuntimeError("OpenRouter returned no completion choices")
-        content = getattr(getattr(choices[0], "message", None), "content", None)
+            raise RuntimeError("OpenAI-compatible service returned no completion choices")
+        choice = choices[0]
+        finish_reason = getattr(choice, "finish_reason", None)
+        if finish_reason not in {None, "stop"}:
+            raise RuntimeError(
+                "OpenAI-compatible completion ended before OCR was complete: "
+                f"finish_reason={finish_reason!r}"
+            )
+        content = getattr(getattr(choice, "message", None), "content", None)
         if not isinstance(content, str) or not content.strip():
-            raise RuntimeError("OpenRouter returned an empty or unsupported response")
+            raise RuntimeError("OpenAI-compatible service returned an empty or unsupported response")
         payload = _parse_json_payload(content)
         return _parse_regions(payload, image_width=width, image_height=height)
 
@@ -116,22 +123,24 @@ class OpenRouterBackend:
 
         api_key = os.environ.get(self._api_key_env)
         if not api_key:
-            raise RuntimeError(f"the OpenRouter backend requires {self._api_key_env} to be set")
-        logger.info("Initializing OpenRouter client for model %s", self._model)
+            raise RuntimeError(f"the OpenAI-compatible backend requires {self._api_key_env} to be set")
+        logger.info("Initializing OpenAI-compatible client for model %s", self._model)
         try:
             from openai import OpenAI
         except ImportError as error:
-            raise RuntimeError("the OpenRouter backend requires the 'openai' package") from error
+            raise RuntimeError("the OpenAI-compatible backend requires the 'openai' package") from error
 
-        self._client = OpenAI(
-            api_key=api_key,
-            base_url=self._base_url,
-            timeout=self._timeout,
-            default_headers={
+        client_options: dict[str, Any] = {
+            "api_key": api_key,
+            "base_url": self._base_url,
+            "timeout": self._timeout,
+        }
+        if self._base_url == DEFAULT_BASE_URL:
+            client_options["default_headers"] = {
                 "HTTP-Referer": HTTP_REFERER,
-                "X-OpenRouter-Title": APP_TITLE,
-            },
-        )
+                "X-Title": APP_TITLE,
+            }
+        self._client = OpenAI(**client_options)
         return self._client
 
     def _prompt(self, *, width: int, height: int) -> str:
@@ -141,26 +150,33 @@ class OpenRouterBackend:
             f"Expected language codes: {languages}. Preserve spelling, case, punctuation, numbers, "
             "and diacritics exactly. Return regions in natural reading order. For each region, "
             "return a tight four-point polygon ordered top-left, top-right, bottom-right, "
-            "bottom-left. Express x and y on a normalized 0-to-1000 grid, where (0, 0) is the "
-            "image's top-left and (1000, 1000) is its bottom-right. Return an empty regions array "
-            "when no text is visible. Return one JSON object with exactly this shape: "
-            '{"regions":[{"text":"visible text","polygon":[{"x":0,"y":0},'
-            '{"x":1000,"y":0},{"x":1000,"y":1000},{"x":0,"y":1000}]}]}.'
+            "bottom-left. Use coordinate_system=normalized and express x and y on a normalized "
+            "0-to-1000 grid, where (0, 0) is the "
+            "image's top-left and (1000, 1000) is its bottom-right. Return an empty regions "
+            "array when no text is visible. Return one JSON object with exactly this shape: "
+            '{"coordinate_system":"normalized","regions":[{"text":"visible text",'
+            '"polygon":[{"x":0,"y":0},{"x":1000,"y":0},{"x":1000,"y":1000},'
+            '{"x":0,"y":1000}]}]}. The coordinate_system may instead be "pixels" only '
+            "when every coordinate is expressed in native image pixels."
         )
 
 
 def _encode_image(image_path: Path) -> tuple[int, int, str]:
     try:
-        with Image.open(image_path) as image:
-            width, height = image.size
-            mime_type = Image.MIME.get(image.format or "")
-        image_bytes = image_path.read_bytes()
+        with image_path.open("rb") as image_file:
+            with Image.open(image_file) as image:
+                width, height = image.size
+                mime_type = Image.MIME.get(image.format or "")
+            image_file.seek(0)
+            image_bytes = image_file.read()
     except OSError as error:
         raise RuntimeError(f"could not read OCR page image {image_path}: {error}") from error
     if width <= 0 or height <= 0:
         raise RuntimeError(f"OCR page image has invalid dimensions: {width}x{height}")
     if mime_type not in {"image/png", "image/jpeg", "image/webp", "image/gif"}:
-        raise RuntimeError(f"OpenRouter does not support image type {mime_type or 'unknown'}")
+        raise RuntimeError(
+            f"OpenAI-compatible service does not support image type {mime_type or 'unknown'}"
+        )
     encoded = base64.b64encode(image_bytes).decode("ascii")
     return width, height, f"data:{mime_type};base64,{encoded}"
 
@@ -169,7 +185,9 @@ def _parse_json_payload(content: str) -> Any:
     try:
         return json.loads(content)
     except json.JSONDecodeError:
-        pass
+        logger.debug(
+            "OpenAI-compatible returned non-JSON content; attempting fallback parse: %s", content
+        )
 
     stripped = content.strip()
     if stripped.startswith("```"):
@@ -181,36 +199,46 @@ def _parse_json_payload(content: str) -> Any:
 
     object_start = stripped.find("{")
     if object_start == -1:
-        raise RuntimeError("OpenRouter returned invalid JSON")
+        raise RuntimeError("OpenAI-compatible service returned invalid JSON")
     try:
-        payload, _ = json.JSONDecoder().raw_decode(stripped[object_start:])
+        payload, end = json.JSONDecoder().raw_decode(stripped[object_start:])
     except json.JSONDecodeError as error:
-        raise RuntimeError("OpenRouter returned invalid JSON") from error
+        raise RuntimeError("OpenAI-compatible service returned invalid JSON") from error
+    remainder = stripped[object_start + end :]
+    if remainder.strip():
+        raise RuntimeError("OpenAI-compatible service returned invalid JSON with trailing text")
+    logger.warning("OpenAI-compatible service returned non-JSON output; fallback parser used")
     return payload
 
 
 def _parse_regions(payload: Any, *, image_width: int, image_height: int) -> list[OcrRegion]:
     if not isinstance(payload, Mapping):
-        raise TypeError("OpenRouter OCR response must be a JSON object")
+        raise TypeError("OpenAI-compatible OCR response must be a JSON object")
+    coordinate_system = payload.get("coordinate_system")
+    if not isinstance(coordinate_system, str) or coordinate_system not in {"normalized", "pixels"}:
+        raise TypeError(
+            "OpenAI-compatible OCR response must declare coordinate_system as "
+            "'normalized' or 'pixels'"
+        )
     raw_regions = payload.get("regions")
     if not isinstance(raw_regions, list):
-        raise TypeError("OpenRouter OCR response must contain a regions array")
+        raise TypeError("OpenAI-compatible OCR response must contain a regions array")
 
     raw_parsed_regions: list[tuple[str, tuple[Point, ...]]] = []
     for region_index, raw_region in enumerate(raw_regions, start=1):
         if not isinstance(raw_region, Mapping):
-            raise TypeError(f"OpenRouter OCR region {region_index} must be an object")
+            raise TypeError(f"OpenAI-compatible OCR region {region_index} must be an object")
         text = raw_region.get("text")
         if not isinstance(text, str):
-            raise TypeError(f"OpenRouter OCR region {region_index} text must be a string")
+            raise TypeError(f"OpenAI-compatible OCR region {region_index} text must be a string")
         if not text.strip():
-            raise RuntimeError(f"OpenRouter OCR region {region_index} has no text")
+            raise RuntimeError(f"OpenAI-compatible OCR region {region_index} has no text")
         raw_polygon = raw_region.get("polygon")
         if not isinstance(raw_polygon, list):
-            raise TypeError(f"OpenRouter OCR region {region_index} polygon must be an array")
+            raise TypeError(f"OpenAI-compatible OCR region {region_index} polygon must be an array")
         if len(raw_polygon) != 4:
             raise RuntimeError(
-                f"OpenRouter OCR region {region_index} polygon must contain four points"
+                f"OpenAI-compatible OCR region {region_index} polygon must contain four points"
             )
         points = tuple(
             _parse_raw_point(
@@ -222,8 +250,9 @@ def _parse_regions(payload: Any, *, image_width: int, image_height: int) -> list
         )
         raw_parsed_regions.append((text.strip(), points))
 
-    coordinate_system = _select_coordinate_system(
+    _validate_coordinate_system(
         raw_parsed_regions,
+        coordinate_system=coordinate_system,
         image_width=image_width,
         image_height=image_height,
     )
@@ -257,7 +286,7 @@ def _parse_raw_point(
 ) -> Point:
     if not isinstance(raw_point, Mapping):
         raise TypeError(
-            f"OpenRouter OCR region {region_index} point {point_index} must be an object"
+            f"OpenAI-compatible OCR region {region_index} point {point_index} must be an object"
         )
     x = _parse_coordinate(raw_point.get("x"), region_index=region_index, point_index=point_index)
     y = _parse_coordinate(raw_point.get("y"), region_index=region_index, point_index=point_index)
@@ -267,43 +296,47 @@ def _parse_raw_point(
 def _parse_coordinate(value: Any, *, region_index: int, point_index: int) -> float:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise TypeError(
-            f"OpenRouter OCR region {region_index} point {point_index} has a non-numeric coordinate"
+            f"OpenAI-compatible OCR region {region_index} point {point_index} has a non-numeric coordinate"
         )
     coordinate = float(value)
     if not math.isfinite(coordinate):
         raise RuntimeError(
-            f"OpenRouter OCR region {region_index} point {point_index} is not finite"
+            f"OpenAI-compatible OCR region {region_index} point {point_index} is not finite"
         )
     return coordinate
 
 
-def _select_coordinate_system(
+def _validate_coordinate_system(
     regions: Sequence[tuple[str, tuple[Point, ...]]],
     *,
+    coordinate_system: str,
     image_width: int,
     image_height: int,
-) -> str:
+) -> None:
     points = [point for _, polygon in regions for point in polygon]
-    if _points_fit(
-        points,
-        maximum_x=NORMALIZED_COORDINATE_MAX,
-        maximum_y=NORMALIZED_COORDINATE_MAX,
-        tolerance_x=NORMALIZED_COORDINATE_TOLERANCE,
-        tolerance_y=NORMALIZED_COORDINATE_TOLERANCE,
-    ):
-        return "normalized"
+    if coordinate_system == "normalized":
+        fits = _points_fit(
+            points,
+            maximum_x=NORMALIZED_COORDINATE_MAX,
+            maximum_y=NORMALIZED_COORDINATE_MAX,
+            tolerance_x=NORMALIZED_COORDINATE_TOLERANCE,
+            tolerance_y=NORMALIZED_COORDINATE_TOLERANCE,
+        )
+    else:
+        fits = _points_fit(
+            points,
+            maximum_x=float(image_width),
+            maximum_y=float(image_height),
+            tolerance_x=image_width * PIXEL_COORDINATE_TOLERANCE_RATIO,
+            tolerance_y=image_height * PIXEL_COORDINATE_TOLERANCE_RATIO,
+        )
 
-    if _points_fit(
-        points,
-        maximum_x=float(image_width),
-        maximum_y=float(image_height),
-        tolerance_x=image_width * PIXEL_COORDINATE_TOLERANCE_RATIO,
-        tolerance_y=image_height * PIXEL_COORDINATE_TOLERANCE_RATIO,
-    ):
-        logger.warning("OpenRouter returned native pixel coordinates; using them directly")
-        return "pixels"
-
-    raise RuntimeError("OpenRouter OCR coordinates exceed both normalized and image bounds")
+    if not fits:
+        raise RuntimeError("OpenAI-compatible OCR coordinates exceed their declared bounds")
+    if coordinate_system == "pixels":
+        logger.warning(
+            "OpenAI-compatible service returned native pixel coordinates; using them directly"
+        )
 
 
 def _points_fit(
@@ -369,7 +402,7 @@ def _clamp_coordinate(
     clamped = min(max(coordinate, 0.0), maximum)
     if clamped != coordinate:
         logger.warning(
-            "Clamping OpenRouter OCR region %d point %d %s coordinate %.1f to %.1f",
+            "Clamping OpenAI-compatible OCR region %d point %d %s coordinate %.1f to %.1f",
             region_index,
             point_index,
             axis,
@@ -382,7 +415,7 @@ def _clamp_coordinate(
 def _pop_string(options: dict[str, Any], name: str, default: str) -> str:
     value = options.pop(name, default)
     if not isinstance(value, str) or not value.strip():
-        raise TypeError(f"OpenRouter's {name!r} backend option must be a non-empty string")
+        raise TypeError(f"OpenAI-compatible's {name!r} backend option must be a non-empty string")
     return value.strip()
 
 
@@ -391,26 +424,26 @@ def _pop_optional_string(options: dict[str, Any], name: str, default: str) -> st
     if value is None:
         return None
     if not isinstance(value, str) or not value.strip():
-        raise TypeError(f"OpenRouter's {name!r} backend option must be a string or null")
+        raise TypeError(f"OpenAI-compatible's {name!r} backend option must be a string or null")
     return value.strip()
 
 
 def _pop_positive_number(options: dict[str, Any], name: str, default: float) -> float:
     value = options.pop(name, default)
     if isinstance(value, bool) or not isinstance(value, (int, float)):
-        raise TypeError(f"OpenRouter's {name!r} backend option must be a positive number")
+        raise TypeError(f"OpenAI-compatible's {name!r} backend option must be a positive number")
     result = float(value)
     if not math.isfinite(result) or result <= 0:
-        raise ValueError(f"OpenRouter's {name!r} backend option must be greater than zero")
+        raise ValueError(f"OpenAI-compatible's {name!r} backend option must be greater than zero")
     return result
 
 
 def _pop_positive_integer(options: dict[str, Any], name: str, default: int) -> int:
     value = options.pop(name, default)
     if isinstance(value, bool) or not isinstance(value, int):
-        raise TypeError(f"OpenRouter's {name!r} backend option must be a positive integer")
+        raise TypeError(f"OpenAI-compatible's {name!r} backend option must be a positive integer")
     if value <= 0:
-        raise ValueError(f"OpenRouter's {name!r} backend option must be greater than zero")
+        raise ValueError(f"OpenAI-compatible's {name!r} backend option must be greater than zero")
     return value
 
 
@@ -418,5 +451,5 @@ def factory(
     *,
     languages: Sequence[str],
     options: Mapping[str, Any],
-) -> OpenRouterBackend:
-    return OpenRouterBackend(languages=languages, options=options)
+) -> OpenAICompatibleBackend:
+    return OpenAICompatibleBackend(languages=languages, options=options)

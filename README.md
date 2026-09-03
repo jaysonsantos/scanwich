@@ -88,32 +88,34 @@ scanwich input.pdf output.pdf \
   --backend-option 'readtext={"batch_size": 4}'
 ```
 
-### OpenRouter vision backend
+### OpenAI-compatible vision backend
 
-The built-in `openrouter` backend sends each rasterized page to OpenRouter's
-OpenAI-compatible chat-completions endpoint. It defaults to the image-capable
-`deepseek/deepseek-v4-flash-vision-exp` model. Set the API key in the environment rather
-than passing it on the command line:
+The built-in `openai-compatible` backend sends each rasterized page to an OpenAI-compatible
+chat-completions endpoint. It defaults to OpenRouter and the image-capable
+`deepseek/deepseek-v4-flash-vision-exp` model. Install the optional SDK dependency with
+`pip install scanwich[openai-compatible]` (the Nix package and container include it), then set
+the API key in the environment rather than passing it on the command line:
 
 ```console
 export OPENROUTER_API_KEY=...
 scanwich input.pdf output.pdf \
-  --ocr-backend openrouter \
+  --ocr-backend openai-compatible \
   -l de pt en
 ```
 
 The backend accepts `model`, `base_url`, `api_key_env`, `timeout`, `max_tokens`, and
-`reasoning_effort` backend options. For example:
+`reasoning_effort` backend options. Set `base_url` and `api_key_env` to use another
+OpenAI-compatible service:
 
 ```console
 scanwich input.pdf output.pdf \
-  --ocr-backend openrouter \
-  --backend-option timeout=300 \
-  --backend-option reasoning_effort=low
+  --ocr-backend openai-compatible \
+  --backend-option base_url=https://example.invalid/v1 \
+  --backend-option api_key_env=EXAMPLE_API_KEY
 ```
 
-Page images are base64-encoded and sent to OpenRouter and its selected model provider. Do
-not use this backend for documents that must remain local.
+Page images are base64-encoded and sent to the configured service and its selected model
+provider. Do not use this backend for documents that must remain local.
 
 ## Notes
 
