@@ -6,7 +6,9 @@ page, an OCR backend returns text polygons, and the tool rebuilds each page with
 - the original rendered page as the visible layer; and
 - invisible, selectable text aligned with the OCR polygons.
 
-EasyOCR is the default backend. The PDF pipeline itself does not import or depend on
+EasyOCR is the default backend for the CLI and the standard image.
+For pip installations, use `pip install "scanwich[easyocr]"`.
+The PDF pipeline itself does not import or depend on
 EasyOCR-specific result types.
 
 ## Run with Nix
@@ -57,6 +59,36 @@ podman run --rm \
   /input/document.pdf /output/document-searchable.pdf -l de pt en
 ```
 
+### OpenAI-compatible image
+
+Build this target to include only the OpenAI-compatible provider.
+It excludes EasyOCR, PyTorch, torchvision, OpenCV, and EasyOCR models.
+
+```console
+docker build --target openai-compatible --tag scanwich:openai-compatible .
+docker run --rm scanwich:openai-compatible --list-backends
+```
+
+The image selects `openai-compatible` by default. Pass the API key from your environment:
+
+```console
+export OPENROUTER_API_KEY=...
+docker run --rm \
+  --env OPENROUTER_API_KEY \
+  --volume /path/to/input:/input:ro \
+  --volume /path/to/output:/output \
+  scanwich:openai-compatible \
+  /input/document.pdf /output/document-searchable.pdf -l de pt en
+```
+
+Use the same commands with `podman` instead of `docker` if you use Podman.
+The default build target and published `latest` image retain EasyOCR and its models.
+Pushes to `main` also publish `ghcr.io/jaysonsantos/scanwich:openai-compatible` for `linux/amd64`.
+Manual workflow runs publish both images too.
+The workflow adds commit tags: `sha-<short-sha>` for the standard image and `openai-compatible-sha-<short-sha>` for the OpenAI-compatible image.
+Use `nix build .#scanwich-openai-compatible` to build the package without a container.
+For direct CLI use, pass `--ocr-backend openai-compatible`.
+
 ## OCR plugins
 
 Select a provider with `--ocr-backend NAME`; inspect installed providers with
@@ -92,9 +124,10 @@ scanwich input.pdf output.pdf \
 
 The built-in `openai-compatible` backend sends each rasterized page to an OpenAI-compatible
 chat-completions endpoint. It defaults to OpenRouter and the image-capable
-`deepseek/deepseek-v4-flash-vision-exp` model. Install the optional SDK dependency with
-`pip install scanwich[openai-compatible]` (the Nix package and container include it), then set
-the API key in the environment rather than passing it on the command line:
+`deepseek/deepseek-v4-flash-vision-exp` model.
+Install the SDK with `pip install "scanwich[openai-compatible]"`.
+Both Nix packages and image targets include the SDK.
+Set the API key in the environment:
 
 ```console
 export OPENROUTER_API_KEY=...
