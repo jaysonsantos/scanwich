@@ -18,6 +18,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+openai-compatible = ["openai>=1.0"]
 test = ["pypdf>=5"]
 
 [project.scripts]
@@ -25,6 +26,7 @@ scanwich = "scanwich.cli:main"
 
 [project.entry-points."scanwich.ocr_backends"]
 easyocr = "scanwich.backends.easyocr:factory"
+openai-compatible = "scanwich.backends.openai_compatible:factory"
 
 [tool.setuptools.packages.find]
 where = ["src"]

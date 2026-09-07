@@ -28,6 +28,7 @@
             build-system = [ python.pkgs.setuptools ];
             dependencies = with python.pkgs; [
               easyocr
+              openai
               pillow
               pypdfium2
               reportlab

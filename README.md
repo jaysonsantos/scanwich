@@ -88,6 +88,36 @@ scanwich input.pdf output.pdf \
   --backend-option 'readtext={"batch_size": 4}'
 ```
 
+### OpenAI-compatible vision backend
+
+The built-in `openai-compatible` backend sends each rasterized page to an OpenAI-compatible
+chat-completions endpoint. It defaults to OpenRouter and the image-capable
+`deepseek/deepseek-v4-flash-vision-exp` model. Install the optional SDK dependency with
+`pip install scanwich[openai-compatible]` (the Nix package and container include it), then set
+the API key in the environment rather than passing it on the command line:
+
+```console
+export OPENROUTER_API_KEY=...
+scanwich input.pdf output.pdf \
+  --ocr-backend openai-compatible \
+  -l de pt en
+```
+
+The backend accepts `model`, `base_url`, `api_key_env`, `timeout`, `max_tokens`, and
+`reasoning_effort` backend options. Set `base_url` and `api_key_env` to use another
+OpenAI-compatible service:
+
+```console
+scanwich input.pdf output.pdf \
+  --ocr-backend openai-compatible \
+  --backend-option base_url=https://example.invalid/v1 \
+  --backend-option api_key_env=EXAMPLE_API_KEY \
+  --backend-option model=provider/vision-model
+```
+
+Page images are base64-encoded and sent to the configured service and its selected model
+provider. Do not use this backend for documents that must remain local.
+
 ## Notes
 
 - By default, Scanwich infers each page's DPI from a full-page image. It falls back to 300 DPI
