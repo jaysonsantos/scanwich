@@ -20,7 +20,18 @@ env:
 
 jobs:
   publish:
+    name: Publish ${{ matrix.target }} image
     runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: easyocr
+            tag: latest
+            sha-prefix: sha-
+          - target: openai-compatible
+            tag: openai-compatible
+            sha-prefix: openai-compatible-sha-
 
     steps:
       - name: Check out repository
@@ -42,16 +53,17 @@ jobs:
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           tags: |
-            type=raw,value=latest
-            type=sha,prefix=sha-
+            type=raw,value=${{ matrix.tag }}
+            type=sha,prefix=${{ matrix.sha-prefix }}
 
       - name: Build and push image
         uses: docker/build-push-action@v7
         with:
           context: .
+          target: ${{ matrix.target }}
           platforms: linux/amd64
           push: true
           tags: ${{ steps.metadata.outputs.tags }}
           labels: ${{ steps.metadata.outputs.labels }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          cache-from: type=gha,scope=${{ matrix.target }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.target }}

@@ -1389,13 +1389,15 @@ name = "scanwich"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
-    { name = "easyocr" },
     { name = "pillow" },
     { name = "pypdfium2" },
     { name = "reportlab" },
 ]
 
 [package.optional-dependencies]
+easyocr = [
+    { name = "easyocr" },
+]
 openai-compatible = [
     { name = "openai" },
 ]
@@ -1405,14 +1407,14 @@ test = [
 
 [package.metadata]
 requires-dist = [
-    { name = "easyocr", specifier = ">=1.7.2" },
+    { name = "easyocr", marker = "extra == 'easyocr'", specifier = ">=1.7.2" },
     { name = "openai", marker = "extra == 'openai-compatible'", specifier = ">=1.0" },
     { name = "pillow", specifier = ">=10" },
     { name = "pypdf", marker = "extra == 'test'", specifier = ">=5" },
     { name = "pypdfium2", specifier = ">=5.11" },
     { name = "reportlab", specifier = ">=4" },
 ]
-provides-extras = ["openai-compatible", "test"]
+provides-extras = ["easyocr", "openai-compatible", "test"]
 
 [[package]]
 name = "scikit-image"

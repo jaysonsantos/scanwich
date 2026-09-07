@@ -11,13 +11,13 @@ requires-python = ">=3.11"
 license = "MIT"
 authors = [{ name = "Jayson Reis" }]
 dependencies = [
-  "easyocr>=1.7.2",
   "Pillow>=10",
   "pypdfium2>=5.11",
   "reportlab>=4",
 ]
 
 [project.optional-dependencies]
+easyocr = ["easyocr>=1.7.2"]
 openai-compatible = ["openai>=1.0"]
 test = ["pypdf>=5"]
 

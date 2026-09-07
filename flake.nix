@@ -19,35 +19,54 @@
         let
           pkgs = nixpkgs.legacyPackages.${system};
           python = pkgs.python3;
-          package = python.pkgs.buildPythonApplication {
-            pname = "scanwich";
-            version = "0.1.0";
-            pyproject = true;
-            src = self;
+          makePackage =
+            withEasyocr:
+            python.pkgs.buildPythonApplication {
+              pname = "scanwich";
+              version = "0.1.0";
+              pyproject = true;
+              src = self;
 
-            build-system = [ python.pkgs.setuptools ];
-            dependencies = with python.pkgs; [
-              easyocr
-              openai
-              pillow
-              pypdfium2
-              reportlab
-            ];
-            nativeCheckInputs = [
-              python.pkgs.pypdf
-            ];
+              build-system = [ python.pkgs.setuptools ];
+              dependencies =
+                with python.pkgs;
+                [
+                  openai
+                  pillow
+                  pypdfium2
+                  reportlab
+                ]
+                ++ pkgs.lib.optionals withEasyocr [ python.pkgs.easyocr ];
 
-            checkPhase = ''
-              runHook preCheck
-              python -m unittest discover -s tests -v
-              runHook postCheck
-            '';
-            pythonImportsCheck = [ "scanwich" ];
-          };
+              postPatch = pkgs.lib.optionalString (!withEasyocr) ''
+                substituteInPlace pyproject.toml \
+                  --replace-fail 'easyocr = "scanwich.backends.easyocr:factory"' ""
+              '';
+              nativeCheckInputs = [
+                python.pkgs.pypdf
+              ];
+
+              checkPhase = ''
+                runHook preCheck
+                python -m unittest discover -s tests -v
+                ${pkgs.lib.optionalString (!withEasyocr) ''
+                  python - <<'PYTHON'
+                  from importlib.util import find_spec
+
+                  for name in ("easyocr", "torch", "torchvision", "cv2", "scipy", "skimage"):
+                      assert find_spec(name) is None, f"unexpected dependency: {name}"
+                  PYTHON
+                  test "$("$out/bin/scanwich" --list-backends)" = "openai-compatible"
+                ''}
+                runHook postCheck
+              '';
+              pythonImportsCheck = [ "scanwich" ];
+            };
         in
         {
-          default = package;
-          scanwich = package;
+          default = makePackage true;
+          scanwich = makePackage true;
+          scanwich-openai-compatible = makePackage false;
         }
       );
 
@@ -66,6 +85,7 @@
 
       checks = forAllSystems (system: {
         default = self.packages.${system}.default;
+        openai-compatible = self.packages.${system}.scanwich-openai-compatible;
       });
 
       devShells = forAllSystems (
