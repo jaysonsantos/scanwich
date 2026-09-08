@@ -298,6 +298,7 @@ class TestAsyncBackend(IsolatedAsyncioTestCase):
     def test_alias_validation_and_defaults(self):
         for alias, expected in (
             ("glm-ocr", "zai-org/GLM-OCR"),
+            ("luna", "gpt-5.6-luna"),
             ("provider/custom", "provider/custom"),
         ):
             backend = OpenAICompatibleBackend(languages=["en"], options={"model": alias})

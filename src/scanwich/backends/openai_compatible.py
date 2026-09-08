@@ -16,7 +16,11 @@ from PIL import Image
 from scanwich.models import OcrRegion, Point
 
 DEFAULT_MODEL = "deepseek/deepseek-v4-flash-vision-exp"
-DEFAULT_MODEL_ALIASES = {"deepseek": DEFAULT_MODEL, "glm-ocr": "zai-org/GLM-OCR"}
+DEFAULT_MODEL_ALIASES = {
+    "deepseek": DEFAULT_MODEL,
+    "glm-ocr": "zai-org/GLM-OCR",
+    "luna": "gpt-5.6-luna",
+}
 DEFAULT_BASE_URL = "https://openrouter.ai/api/v1"
 DEFAULT_API_KEY_ENV = "OPENROUTER_API_KEY"
 DEFAULT_TIMEOUT_SECONDS = 180.0

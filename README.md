@@ -219,6 +219,37 @@ Both Nix packages and container targets include the API dependencies and `scanwi
 Use `--entrypoint /opt/scanwich/bin/scanwich-api` to start the API in a container.
 Pass `--host 0.0.0.0` and publish port 8000 for container access.
 
+### Hermes and Luna
+
+The `luna` alias resolves to `gpt-5.6-luna`.
+Hermes can route this model through its authenticated `openai-codex` provider.
+Its API runs locally; the model runs through the upstream provider.
+
+Add these routes under `platforms.api_server.extra` in your Hermes configuration:
+
+```yaml
+model_routes:
+  luna:
+    model: gpt-5.6-luna
+    provider: openai-codex
+  gpt-5.6-luna:
+    model: gpt-5.6-luna
+    provider: openai-codex
+```
+
+Enable the Hermes API server and set its `API_SERVER_KEY`.
+Restart the Hermes gateway after the configuration change.
+Set `base_url` in `api.hermes.example.json` to the address of your Hermes API.
+Export the same `API_SERVER_KEY` in the Scanwich environment, then start the API:
+
+```console
+scanwich-api --config api.hermes.example.json
+```
+
+A generated invoice image passed live Luna tests for `text`, `pdf`, and `pdf+text` through Hermes.
+The checks confirmed the invoice number and amount in plain text and searchable PDF text.
+These checks used no private documents.
+
 ## PDF notes
 
 - By default, Scanwich infers each page's DPI from a full-page image. It falls back to 300 DPI
