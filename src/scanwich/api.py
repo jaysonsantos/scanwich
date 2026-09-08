@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import logging
+from collections.abc import Sequence
+from enum import StrEnum
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from typing import Annotated, Any
+from typing import Annotated, Any, Literal
 
 from fastapi import FastAPI, Form, HTTPException, UploadFile
 from PIL import Image
@@ -19,7 +22,9 @@ from pydantic_settings import (
 )
 from starlette.concurrency import run_in_threadpool
 
+from scanwich.models import OcrRegion
 from scanwich.ocr import available_backends, load_backend
+from scanwich.pdf import DEFAULT_DPI, RasterizedPage, assemble_searchable_pdf
 
 logger = logging.getLogger(__name__)
 
@@ -74,14 +79,43 @@ class BackendsResponse(BaseModel):
     backends: list[str]
 
 
-class RegionResponse(BaseModel):
-    text: str = Field(min_length=1)
-    polygon: list[tuple[float, float]] = Field(min_length=4, max_length=4)
-    confidence: float | None = None
+class OutputFormat(StrEnum):
+    PDF = "pdf"
+    TEXT = "text"
+    PDF_TEXT = "pdf+text"
 
 
-class OcrResponse(BaseModel):
-    regions: list[RegionResponse]
+class PdfResponse(BaseModel):
+    output: Literal["pdf"] = "pdf"
+    pdf_base64: str
+
+
+class TextResponse(BaseModel):
+    output: Literal["text"] = "text"
+    text: str
+
+
+class PdfTextResponse(BaseModel):
+    output: Literal["pdf+text"] = "pdf+text"
+    pdf_base64: str
+    text: str
+
+
+OcrResponse = Annotated[PdfResponse | TextResponse | PdfTextResponse, Field(discriminator="output")]
+
+
+def _make_pdf(path: Path, regions: Sequence[OcrRegion]) -> str:
+    with Image.open(path) as image:
+        width, height = image.size
+    page = RasterizedPage(
+        image_path=path,
+        width_points=width * 72 / DEFAULT_DPI,
+        height_points=height * 72 / DEFAULT_DPI,
+        dpi=DEFAULT_DPI,
+    )
+    output_path = path.parent / "result.pdf"
+    assemble_searchable_pdf([page], [regions], output_path)
+    return base64.b64encode(output_path.read_bytes()).decode("ascii")
 
 
 def _check_image(path: Path) -> None:
@@ -103,6 +137,7 @@ def create_app(config: ApiConfig | None = None) -> FastAPI:
     async def recognize(
         backend_name: str,
         image: UploadFile,
+        output: Annotated[OutputFormat, Form()] = OutputFormat.PDF,
         model: Annotated[str | None, Form()] = None,
         languages: Annotated[list[str] | None, Form()] = None,
     ) -> OcrResponse:
@@ -118,12 +153,12 @@ def create_app(config: ApiConfig | None = None) -> FastAPI:
             path = Path(directory) / "page"
             size = 0
             try:
-                with path.open("wb") as output:
+                with path.open("wb") as image_file:
                     while chunk := await image.read(1024 * 1024):
                         size += len(chunk)
                         if size > config.max_image_bytes:
                             raise HTTPException(413, "Image exceeds the configured size limit")
-                        await run_in_threadpool(output.write, chunk)
+                        await run_in_threadpool(image_file.write, chunk)
                 await run_in_threadpool(_check_image, path)
             except (OSError, ValueError, Image.DecompressionBombError) as error:
                 raise HTTPException(422, "Invalid image") from error
@@ -135,14 +170,27 @@ def create_app(config: ApiConfig | None = None) -> FastAPI:
                     load_backend, backend_name, languages=languages or ["en"], options=options
                 )
                 async_recognize = getattr(backend, "recognize_async", None)
-                regions = (
-                    await async_recognize(path)
-                    if async_recognize is not None
-                    else await run_in_threadpool(backend.recognize, path)
-                )
-                return OcrResponse(
-                    regions=[RegionResponse.model_validate(region.to_json()) for region in regions]
-                )
+                text_recognize = getattr(backend, "recognize_text_async", None)
+                regions = None
+                if output != OutputFormat.TEXT or text_recognize is None:
+                    regions = list(
+                        await async_recognize(path)
+                        if async_recognize is not None
+                        else await run_in_threadpool(backend.recognize, path)
+                    )
+                text = ""
+                if output != OutputFormat.PDF:
+                    text = (
+                        await text_recognize(path)
+                        if text_recognize is not None
+                        else "\n".join(region.text for region in regions)
+                    )
+                if output == OutputFormat.TEXT:
+                    return TextResponse(text=text)
+                pdf = await run_in_threadpool(_make_pdf, path, regions)
+                if output == OutputFormat.PDF:
+                    return PdfResponse(pdf_base64=pdf)
+                return PdfTextResponse(pdf_base64=pdf, text=text)
             except Exception as error:
                 logger.warning("OCR backend %s failed: %s", backend_name, type(error).__name__)
                 raise HTTPException(502, "OCR backend failed") from error

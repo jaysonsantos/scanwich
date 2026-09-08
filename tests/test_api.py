@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import io
 import json
 import os
@@ -11,6 +12,7 @@ from unittest.mock import AsyncMock, Mock, patch
 from fastapi.testclient import TestClient
 from PIL import Image
 from pydantic import ValidationError
+from pypdf import PdfReader
 
 from scanwich.api import ApiConfig, BackendConfig, create_app
 from scanwich.backends.openai_compatible import OpenAICompatibleBackend
@@ -74,13 +76,17 @@ class TestApi(TestCase):
             with self.assertRaises(ValidationError):
                 ApiConfig(config=path)
 
-    def test_response_schema_defines_regions(self):
+    def test_response_schema_defines_output_choices(self):
         with TestClient(create_app()) as api:
             schema = api.get("/openapi.json").json()
-        region = schema["components"]["schemas"]["RegionResponse"]
-        self.assertEqual(region["properties"]["polygon"]["minItems"], 4)
-        self.assertEqual(region["properties"]["polygon"]["maxItems"], 4)
-        self.assertEqual(region["required"], ["text", "polygon"])
+        self.assertEqual(
+            schema["components"]["schemas"]["OutputFormat"]["enum"], ["pdf", "text", "pdf+text"]
+        )
+        response = schema["paths"]["/ocr/{backend_name}"]["post"]["responses"]["200"]
+        self.assertEqual(
+            response["content"]["application/json"]["schema"]["discriminator"]["propertyName"],
+            "output",
+        )
 
     def test_loads_server_configuration_from_environment(self):
         with TemporaryDirectory() as directory:
@@ -150,7 +156,8 @@ class TestApi(TestCase):
                 files={"image": ("page.png", image_bytes())},
             )
         self.assertEqual(response.status_code, 200, response.text)
-        self.assertEqual(response.json()["regions"][0]["polygon"][2], [200, 100])
+        pdf = PdfReader(io.BytesIO(base64.b64decode(response.json()["pdf_base64"])))
+        self.assertIn("hello", pdf.pages[0].extract_text())
         self.assertEqual(
             client.chat.completions.create.call_args.kwargs["model"], "provider/real-glm-model"
         )
@@ -174,6 +181,68 @@ class TestApi(TestCase):
             response = api.post("/ocr/plugin", files={"image": ("../../page", image_bytes())})
         self.assertEqual(response.status_code, 200)
         self.assertFalse(paths[0].exists())
+
+    def test_all_output_modes(self):
+        regions = [
+            OcrRegion(
+                text="hello", polygon=(Point(10, 10), Point(100, 10), Point(100, 30), Point(10, 30))
+            )
+        ]
+        for mode in ("pdf", "text", "pdf+text"):
+            with self.subTest(mode=mode):
+                backend = SimpleNamespace(
+                    recognize_async=AsyncMock(return_value=regions),
+                    recognize_text_async=AsyncMock(return_value="hello\n\n  world\n"),
+                    aclose=AsyncMock(),
+                )
+                with (
+                    patch("scanwich.api.load_backend", return_value=backend),
+                    TestClient(create_app()) as api,
+                ):
+                    response = api.post(
+                        "/ocr/openai-compatible",
+                        data={"output": mode},
+                        files={"image": ("page.png", image_bytes())},
+                    )
+                self.assertEqual(response.status_code, 200, response.text)
+                data = response.json()
+                self.assertEqual(data["output"], mode)
+                if mode != "pdf":
+                    self.assertEqual(data["text"], "hello\n\n  world\n")
+                    backend.recognize_text_async.assert_awaited_once()
+                else:
+                    backend.recognize_text_async.assert_not_awaited()
+                    self.assertNotIn("text", data)
+                if mode != "text":
+                    reader = PdfReader(io.BytesIO(base64.b64decode(data["pdf_base64"])))
+                    self.assertIn("hello", reader.pages[0].extract_text())
+                    backend.recognize_async.assert_awaited_once()
+                else:
+                    backend.recognize_async.assert_not_awaited()
+                    self.assertNotIn("pdf_base64", data)
+                backend.aclose.assert_awaited_once()
+
+    def test_invalid_output_and_sync_text(self):
+        backend = SimpleNamespace(
+            recognize=Mock(return_value=[OcrRegion(text="hello", polygon=(Point(0, 0),) * 4)])
+        )
+        with (
+            patch("scanwich.api.load_backend", return_value=backend),
+            TestClient(create_app()) as api,
+        ):
+            response = api.post(
+                "/ocr/openai-compatible",
+                data={"output": "xml"},
+                files={"image": ("page.png", image_bytes())},
+            )
+            self.assertEqual(response.status_code, 422)
+            backend.recognize.assert_not_called()
+            response = api.post(
+                "/ocr/openai-compatible",
+                data={"output": "text"},
+                files={"image": ("page.png", image_bytes())},
+            )
+            self.assertEqual(response.json(), {"output": "text", "text": "hello"})
 
     def test_invalid_uploads_and_backend_errors(self):
         backend = SimpleNamespace(
@@ -200,6 +269,32 @@ class TestApi(TestCase):
 
 
 class TestAsyncBackend(IsolatedAsyncioTestCase):
+    async def test_plain_text_prompt_and_response(self):
+        for content in ("hello\n\n  world\n", ""):
+            create = AsyncMock(
+                return_value=SimpleNamespace(
+                    choices=[
+                        SimpleNamespace(
+                            finish_reason="stop", message=SimpleNamespace(content=content)
+                        )
+                    ]
+                )
+            )
+            backend = OpenAICompatibleBackend(languages=["pt"], options={})
+            backend._async_client = SimpleNamespace(
+                chat=SimpleNamespace(completions=SimpleNamespace(create=create))
+            )
+            with TemporaryDirectory() as directory:
+                path = Path(directory) / "page.png"
+                path.write_bytes(image_bytes())
+                self.assertEqual(await backend.recognize_text_async(path), content)
+            request = create.call_args.kwargs
+            self.assertNotIn("response_format", request)
+            prompt = request["messages"][1]["content"][0]["text"]
+            self.assertIn("plain text", prompt)
+            self.assertIn("line breaks", prompt)
+            self.assertIn("pt", prompt)
+
     def test_alias_validation_and_defaults(self):
         for alias, expected in (
             ("glm-ocr", "zai-org/GLM-OCR"),

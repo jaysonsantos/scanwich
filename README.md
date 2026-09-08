@@ -163,12 +163,27 @@ scanwich-api --config api.example.json
 The server listens on `127.0.0.1:8000`. Open `/docs` for the request schema.
 `GET /backends` lists installed backends that the configuration enables.
 `POST /ocr/{backend_name}` accepts an image in the `image` multipart field.
-It returns `regions` with text, confidence when available, and four pixel points per region.
+Set the typed `output` multipart field to `pdf`, `text`, or `pdf+text`. The default is `pdf`.
+The JSON response uses `output` to identify its Pydantic response model:
+
+| Output | Response fields |
+| --- | --- |
+| `pdf` | `output`, `pdf_base64` |
+| `text` | `output`, `text` |
+| `pdf+text` | `output`, `pdf_base64`, `text` |
+
+Decode `pdf_base64` to obtain a searchable PDF with the source image and invisible text.
+The API uses 300 DPI for the image's PDF page dimensions.
+Text output preserves the provider's line breaks and spacing.
+The OpenAI-compatible backend requests plain text without JSON or coordinates for text output.
+Combined output makes two provider calls: one for PDF polygons and one for plain text.
+Other plugins provide text from their regions, with one line per region.
+Invalid output choices return 422.
 The API processes one image per request.
 
 ```console
 curl http://127.0.0.1:8000/ocr/openai-compatible \
-  -F image=@page.png -F model=deepseek -F languages=en -F languages=pt
+  -F image=@page.png -F model=deepseek -F output=text -F languages=en -F languages=pt
 ```
 
 Set provider options in `backends.openai-compatible.options` in the JSON configuration.
@@ -176,7 +191,7 @@ Set `model_aliases` to map aliases such as `deepseek` and `glm-ocr` to exact pro
 The built-in `glm-ocr` alias uses `zai-org/GLM-OCR`.
 Select an endpoint that serves that model, or change the alias to your provider's model ID.
 The [GLM-OCR model card](https://huggingface.co/zai-org/GLM-OCR) describes its server setup and supported prompts.
-Alias resolution does not change the OCR response contract. The endpoint must return text polygons in the requested JSON format.
+For PDF output, the endpoint must return text polygons in the requested JSON format.
 Model IDs, including a leading `~`, pass to the provider unchanged.
 The built-in `deepseek` alias uses the existing default model. Configuration can replace that alias.
 Unknown aliases pass through as model IDs. Alias resolution uses one lookup.
@@ -184,6 +199,7 @@ The CLI also accepts `--backend-option 'model_aliases={"deepseek":"~deepseek/you
 Clients can select a model. Server configuration controls endpoint URLs and credential environment variables.
 
 The OpenAI-compatible backend exposes `await backend.recognize_async(path)` and `await backend.aclose()`.
+Use `await backend.recognize_text_async(path)` for plain text.
 It shares request construction and response checks with `recognize(path)`.
 The API uses native async calls when the backend provides them.
 It runs synchronous plugins in a worker thread. Each request creates its own backend instance.

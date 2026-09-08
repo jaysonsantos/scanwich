@@ -93,7 +93,9 @@ class OpenAICompatibleBackend:
                 **self._request(width, height, image_data_url)
             )
         except Exception as error:
-            raise RuntimeError(f"OpenAI-compatible request failed for model {self._model}") from error
+            raise RuntimeError(
+                f"OpenAI-compatible request failed for model {self._model}"
+            ) from error
         return self._parse_completion(completion, width, height)
 
     async def aclose(self) -> None:
@@ -101,14 +103,29 @@ class OpenAICompatibleBackend:
             await self._async_client.close()
             self._async_client = None
 
-    def _request(self, width: int, height: int, image_data_url: str) -> dict[str, Any]:
+    async def recognize_text_async(self, image_path: Path) -> str:
+        width, height, image_data_url = await asyncio.to_thread(_encode_image, image_path)
+        client = self._get_client(asynchronous=True)
+        try:
+            completion = await client.chat.completions.create(
+                **self._request(width, height, image_data_url, plain_text=True)
+            )
+        except Exception as error:
+            raise RuntimeError(
+                f"OpenAI-compatible request failed for model {self._model}"
+            ) from error
+        return self._completion_content(completion, allow_empty=True)
+
+    def _request(
+        self, width: int, height: int, image_data_url: str, *, plain_text: bool = False
+    ) -> dict[str, Any]:
         request: dict[str, Any] = {
             "model": self._model,
             "messages": [
                 {
                     "role": "system",
                     "content": (
-                        "You are a precise OCR engine. Return only the requested structured "
+                        "You are a precise OCR engine. Return only the requested "
                         "result and never translate, summarize, or infer missing text."
                     ),
                 },
@@ -129,10 +146,23 @@ class OpenAICompatibleBackend:
         }
         if self._reasoning_effort is not None:
             request["extra_body"] = {"reasoning_effort": self._reasoning_effort}
+        if plain_text:
+            request.pop("response_format")
+            request["messages"][1]["content"][0]["text"] = (
+                f"Transcribe this {width}x{height} pixel document image as plain text. "
+                f"Expected language codes: {', '.join(self._languages) or 'unknown'}. "
+                "Preserve reading order, line breaks, paragraphs, spacing, spelling, punctuation, "
+                "and diacritics. Return only the document text, without JSON, Markdown fences, "
+                "coordinates, or commentary. Return an empty string if no text is visible."
+            )
 
         return request
 
     def _parse_completion(self, completion: Any, width: int, height: int) -> list[OcrRegion]:
+        payload = _parse_json_payload(self._completion_content(completion))
+        return _parse_regions(payload, image_width=width, image_height=height)
+
+    def _completion_content(self, completion: Any, *, allow_empty: bool = False) -> str:
         choices = getattr(completion, "choices", None)
         if not choices:
             raise RuntimeError("OpenAI-compatible service returned no completion choices")
@@ -144,12 +174,11 @@ class OpenAICompatibleBackend:
                 f"finish_reason={finish_reason!r}"
             )
         content = getattr(getattr(choice, "message", None), "content", None)
-        if not isinstance(content, str) or not content.strip():
+        if not isinstance(content, str) or (not allow_empty and not content.strip()):
             raise RuntimeError(
                 "OpenAI-compatible service returned an empty or unsupported response"
             )
-        payload = _parse_json_payload(content)
-        return _parse_regions(payload, image_width=width, image_height=height)
+        return content
 
     def _get_client(self, *, asynchronous: bool = False) -> Any:
         cached = self._async_client if asynchronous else self._client
