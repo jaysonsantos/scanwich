@@ -32,6 +32,10 @@
                 with python.pkgs;
                 [
                   openai
+                  fastapi
+                  pydantic
+                  uvicorn
+                  python-multipart
                   pillow
                   pypdfium2
                   reportlab
@@ -44,6 +48,7 @@
               '';
               nativeCheckInputs = [
                 python.pkgs.pypdf
+                python.pkgs.httpx
               ];
 
               checkPhase = ''

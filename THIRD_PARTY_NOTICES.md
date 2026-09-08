@@ -9,6 +9,10 @@ The standard Nix package and container include these direct dependencies:
 | --- | --- |
 | EasyOCR | Apache-2.0 |
 | OpenAI Python SDK | Apache-2.0 |
+| FastAPI | MIT |
+| Pydantic | MIT |
+| Uvicorn | BSD-3-Clause |
+| python-multipart | Apache-2.0 |
 | Pillow | MIT-CMU |
 | pypdfium2 | Apache-2.0 OR BSD-3-Clause |
 | PDFium | Apache-2.0 AND BSD-3-Clause AND MIT |
@@ -20,3 +24,4 @@ They include the other direct dependencies in the table.
 
 The test-only pypdf dependency is BSD-3-Clause. Transitive dependencies retain their
 respective licenses as recorded by the pinned Nixpkgs revision in `flake.lock`.
+The test-only HTTPX dependency uses the BSD-3-Clause license.

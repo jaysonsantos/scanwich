@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import base64
 import json
 import logging
@@ -15,6 +16,7 @@ from PIL import Image
 from scanwich.models import OcrRegion, Point
 
 DEFAULT_MODEL = "deepseek/deepseek-v4-flash-vision-exp"
+DEFAULT_MODEL_ALIASES = {"deepseek": DEFAULT_MODEL, "glm-ocr": "zai-org/GLM-OCR"}
 DEFAULT_BASE_URL = "https://openrouter.ai/api/v1"
 DEFAULT_API_KEY_ENV = "OPENROUTER_API_KEY"
 DEFAULT_TIMEOUT_SECONDS = 180.0
@@ -36,6 +38,13 @@ class OpenAICompatibleBackend:
         option_values = dict(options)
         self._languages = tuple(languages)
         self._model = _pop_string(option_values, "model", DEFAULT_MODEL)
+        aliases = option_values.pop("model_aliases", {})
+        if not isinstance(aliases, Mapping) or not all(
+            isinstance(k, str) and k.strip() and isinstance(v, str) and v.strip()
+            for k, v in aliases.items()
+        ):
+            raise TypeError("model_aliases must map non-empty aliases to model names")
+        self._model = {**DEFAULT_MODEL_ALIASES, **aliases}.get(self._model, self._model)
         self._base_url = _pop_string(option_values, "base_url", DEFAULT_BASE_URL).rstrip("/")
         self._api_key_env = _pop_string(option_values, "api_key_env", DEFAULT_API_KEY_ENV)
         self._timeout = _pop_positive_number(
@@ -57,10 +66,42 @@ class OpenAICompatibleBackend:
             unsupported = ", ".join(sorted(option_values))
             raise TypeError(f"unsupported OpenAI-compatible backend option(s): {unsupported}")
         self._client: Any | None = None
+        self._async_client: Any | None = None
 
     def recognize(self, image_path: Path) -> list[OcrRegion]:
         width, height, image_data_url = _encode_image(image_path)
         client = self._get_client()
+        request = self._request(width, height, image_data_url)
+        logger.info("Sending page image to OpenAI-compatible model %s", self._model)
+        started_at = time.monotonic()
+        try:
+            completion = client.chat.completions.create(**request)
+        except Exception as error:
+            raise RuntimeError(
+                f"OpenAI-compatible request failed for model {self._model}: {error}"
+            ) from error
+        logger.info(
+            "OpenAI-compatible response received after %.1f seconds", time.monotonic() - started_at
+        )
+        return self._parse_completion(completion, width, height)
+
+    async def recognize_async(self, image_path: Path) -> list[OcrRegion]:
+        width, height, image_data_url = await asyncio.to_thread(_encode_image, image_path)
+        client = self._get_client(asynchronous=True)
+        try:
+            completion = await client.chat.completions.create(
+                **self._request(width, height, image_data_url)
+            )
+        except Exception as error:
+            raise RuntimeError(f"OpenAI-compatible request failed for model {self._model}") from error
+        return self._parse_completion(completion, width, height)
+
+    async def aclose(self) -> None:
+        if self._async_client is not None:
+            await self._async_client.close()
+            self._async_client = None
+
+    def _request(self, width: int, height: int, image_data_url: str) -> dict[str, Any]:
         request: dict[str, Any] = {
             "model": self._model,
             "messages": [
@@ -89,18 +130,9 @@ class OpenAICompatibleBackend:
         if self._reasoning_effort is not None:
             request["extra_body"] = {"reasoning_effort": self._reasoning_effort}
 
-        logger.info("Sending page image to OpenAI-compatible model %s", self._model)
-        started_at = time.monotonic()
-        try:
-            completion = client.chat.completions.create(**request)
-        except Exception as error:
-            raise RuntimeError(
-                f"OpenAI-compatible request failed for model {self._model}: {error}"
-            ) from error
-        logger.info(
-            "OpenAI-compatible response received after %.1f seconds", time.monotonic() - started_at
-        )
+        return request
 
+    def _parse_completion(self, completion: Any, width: int, height: int) -> list[OcrRegion]:
         choices = getattr(completion, "choices", None)
         if not choices:
             raise RuntimeError("OpenAI-compatible service returned no completion choices")
@@ -119,9 +151,10 @@ class OpenAICompatibleBackend:
         payload = _parse_json_payload(content)
         return _parse_regions(payload, image_width=width, image_height=height)
 
-    def _get_client(self) -> Any:
-        if self._client is not None:
-            return self._client
+    def _get_client(self, *, asynchronous: bool = False) -> Any:
+        cached = self._async_client if asynchronous else self._client
+        if cached is not None:
+            return cached
 
         api_key = os.environ.get(self._api_key_env)
         if not api_key:
@@ -130,7 +163,10 @@ class OpenAICompatibleBackend:
             )
         logger.info("Initializing OpenAI-compatible client for model %s", self._model)
         try:
-            from openai import OpenAI
+            if asynchronous:
+                from openai import AsyncOpenAI as Client
+            else:
+                from openai import OpenAI as Client
         except ImportError as error:
             raise RuntimeError(
                 "the OpenAI-compatible backend requires the 'openai' package"
@@ -146,8 +182,12 @@ class OpenAICompatibleBackend:
                 "HTTP-Referer": HTTP_REFERER,
                 "X-Title": APP_TITLE,
             }
-        self._client = OpenAI(**client_options)
-        return self._client
+        client = Client(**client_options)
+        if asynchronous:
+            self._async_client = client
+        else:
+            self._client = client
+        return client
 
     def _prompt(self, *, width: int, height: int) -> str:
         languages = ", ".join(self._languages) or "unknown"

@@ -151,7 +151,53 @@ scanwich input.pdf output.pdf \
 Page images are base64-encoded and sent to the configured service and its selected model
 provider. Do not use this backend for documents that must remain local.
 
-## Notes
+## HTTP API
+
+Install the API and a backend:
+
+```console
+pip install '.[api,openai-compatible]'
+scanwich-api --config api.example.json
+```
+
+The server listens on `127.0.0.1:8000`. Open `/docs` for the request schema.
+`GET /backends` lists installed backends that the configuration enables.
+`POST /ocr/{backend_name}` accepts an image in the `image` multipart field.
+It returns `regions` with text, confidence when available, and four pixel points per region.
+The API processes one image per request.
+
+```console
+curl http://127.0.0.1:8000/ocr/openai-compatible \
+  -F image=@page.png -F model=deepseek -F languages=en -F languages=pt
+```
+
+Set provider options in `backends.openai-compatible.options` in the JSON configuration.
+Set `model_aliases` to map aliases such as `deepseek` and `glm-ocr` to exact provider model IDs.
+The built-in `glm-ocr` alias uses `zai-org/GLM-OCR`.
+Select an endpoint that serves that model, or change the alias to your provider's model ID.
+The [GLM-OCR model card](https://huggingface.co/zai-org/GLM-OCR) describes its server setup and supported prompts.
+Alias resolution does not change the OCR response contract. The endpoint must return text polygons in the requested JSON format.
+Model IDs, including a leading `~`, pass to the provider unchanged.
+The built-in `deepseek` alias uses the existing default model. Configuration can replace that alias.
+Unknown aliases pass through as model IDs. Alias resolution uses one lookup.
+The CLI also accepts `--backend-option 'model_aliases={"deepseek":"~deepseek/your-model"}'`.
+Clients can select a model. Server configuration controls endpoint URLs and credential environment variables.
+
+The OpenAI-compatible backend exposes `await backend.recognize_async(path)` and `await backend.aclose()`.
+It shares request construction and response checks with `recognize(path)`.
+The API uses native async calls when the backend provides them.
+It runs synchronous plugins in a worker thread. Each request creates its own backend instance.
+The API closes async clients and removes temporary images after each request.
+
+The default upload limit is 20 MiB. Set `max_image_bytes` to change it.
+Invalid images return 422; excessive image sizes return 413; backend failures return 502.
+The server has no authentication. Keep the default local address or put an authenticated proxy before the server.
+Set `SCANWICH_API_CONFIG` to a JSON file path for `uvicorn scanwich.api:create_app --factory`.
+Both Nix packages and container targets include the API dependencies and `scanwich-api` command.
+Use `--entrypoint /opt/scanwich/bin/scanwich-api` to start the API in a container.
+Pass `--host 0.0.0.0` and publish port 8000 for container access.
+
+## PDF notes
 
 - By default, Scanwich infers each page's DPI from a full-page image. It falls back to 300 DPI
   for vector or ambiguous pages and caps inferred values at 300 DPI.
