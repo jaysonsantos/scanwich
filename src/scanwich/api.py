@@ -3,9 +3,7 @@
 from __future__ import annotations
 
 import argparse
-import json
 import logging
-import os
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import Annotated, Any
@@ -13,6 +11,12 @@ from typing import Annotated, Any
 from fastapi import FastAPI, Form, HTTPException, UploadFile
 from PIL import Image
 from pydantic import BaseModel, ConfigDict, Field
+from pydantic_settings import (
+    BaseSettings,
+    JsonConfigSettingsSource,
+    PydanticBaseSettingsSource,
+    SettingsConfigDict,
+)
 from starlette.concurrency import run_in_threadpool
 
 from scanwich.ocr import available_backends, load_backend
@@ -25,12 +29,59 @@ class BackendConfig(BaseModel):
     options: dict[str, Any] = Field(default_factory=dict)
 
 
-class ApiConfig(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+class ApiJsonSettingsSource(JsonConfigSettingsSource):
+    def __call__(self) -> dict[str, Any]:
+        path = self.current_state.get("config")
+        if path is None:
+            return {}
+        path = Path(path)
+        if not path.is_file():
+            raise FileNotFoundError(path)
+        return JsonConfigSettingsSource(self.settings_cls, json_file=path)()
+
+
+class ApiConfig(BaseSettings):
+    model_config = SettingsConfigDict(
+        extra="forbid", env_prefix="SCANWICH_API_", env_nested_delimiter="__"
+    )
+    config: Path | None = Field(default=None, exclude=True)
+    host: str = "127.0.0.1"
+    port: int = Field(default=8000, ge=1, le=65535)
     backends: dict[str, BackendConfig] = Field(
         default_factory=lambda: {"openai-compatible": BackendConfig()}
     )
     max_image_bytes: int = Field(default=20 * 1024 * 1024, gt=0)
+
+    @classmethod
+    def settings_customise_sources(
+        cls,
+        settings_cls: type[BaseSettings],
+        init_settings: PydanticBaseSettingsSource,
+        env_settings: PydanticBaseSettingsSource,
+        dotenv_settings: PydanticBaseSettingsSource,
+        file_secret_settings: PydanticBaseSettingsSource,
+    ) -> tuple[PydanticBaseSettingsSource, ...]:
+        return (
+            init_settings,
+            env_settings,
+            dotenv_settings,
+            ApiJsonSettingsSource(settings_cls),
+            file_secret_settings,
+        )
+
+
+class BackendsResponse(BaseModel):
+    backends: list[str]
+
+
+class RegionResponse(BaseModel):
+    text: str = Field(min_length=1)
+    polygon: list[tuple[float, float]] = Field(min_length=4, max_length=4)
+    confidence: float | None = None
+
+
+class OcrResponse(BaseModel):
+    regions: list[RegionResponse]
 
 
 def _check_image(path: Path) -> None:
@@ -40,26 +91,21 @@ def _check_image(path: Path) -> None:
 
 def create_app(config: ApiConfig | None = None) -> FastAPI:
     if config is None:
-        config_path = os.environ.get("SCANWICH_API_CONFIG")
-        config = (
-            ApiConfig.model_validate_json(Path(config_path).read_text())
-            if config_path
-            else ApiConfig()
-        )
+        config = ApiConfig()
     app = FastAPI(title="Scanwich OCR API")
 
     @app.get("/backends")
-    async def backends() -> dict[str, Any]:
+    async def backends() -> BackendsResponse:
         installed = available_backends()
-        return {"backends": sorted(set(config.backends).intersection(installed))}
+        return BackendsResponse(backends=sorted(set(config.backends).intersection(installed)))
 
-    @app.post("/ocr/{backend_name}")
+    @app.post("/ocr/{backend_name}", response_model_exclude_none=True)
     async def recognize(
         backend_name: str,
         image: UploadFile,
         model: Annotated[str | None, Form()] = None,
         languages: Annotated[list[str] | None, Form()] = None,
-    ) -> dict[str, Any]:
+    ) -> OcrResponse:
         settings = config.backends.get(backend_name)
         if settings is None or backend_name not in available_backends():
             raise HTTPException(404, "Unknown or disabled OCR backend")
@@ -94,7 +140,9 @@ def create_app(config: ApiConfig | None = None) -> FastAPI:
                     if async_recognize is not None
                     else await run_in_threadpool(backend.recognize, path)
                 )
-                return {"regions": [region.to_json() for region in regions]}
+                return OcrResponse(
+                    regions=[RegionResponse.model_validate(region.to_json()) for region in regions]
+                )
             except Exception as error:
                 logger.warning("OCR backend %s failed: %s", backend_name, type(error).__name__)
                 raise HTTPException(502, "OCR backend failed") from error
@@ -111,11 +159,11 @@ def main() -> None:
 
     parser = argparse.ArgumentParser(description="Serve configured OCR backends")
     parser.add_argument("--config", type=Path)
-    parser.add_argument("--host", default="127.0.0.1")
-    parser.add_argument("--port", type=int, default=8000)
+    parser.add_argument("--host")
+    parser.add_argument("--port", type=int)
     args = parser.parse_args()
-    config = ApiConfig.model_validate(json.loads(args.config.read_text())) if args.config else None
-    uvicorn.run(create_app(config), host=args.host, port=args.port)
+    config = ApiConfig(**{key: value for key, value in vars(args).items() if value is not None})
+    uvicorn.run(create_app(config), host=config.host, port=config.port)
 
 
 if __name__ == "__main__":

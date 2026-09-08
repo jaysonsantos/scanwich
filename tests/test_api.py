@@ -10,6 +10,7 @@ from unittest.mock import AsyncMock, Mock, patch
 
 from fastapi.testclient import TestClient
 from PIL import Image
+from pydantic import ValidationError
 
 from scanwich.api import ApiConfig, BackendConfig, create_app
 from scanwich.backends.openai_compatible import OpenAICompatibleBackend
@@ -23,6 +24,64 @@ def image_bytes() -> bytes:
 
 
 class TestApi(TestCase):
+    def test_settings_priority_and_nested_environment(self):
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "config.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "max_image_bytes": 100,
+                        "port": 9000,
+                        "backends": {
+                            "openai-compatible": {
+                                "options": {
+                                    "model": "deepseek",
+                                    "model_aliases": {"deepseek": "~deepseek/model"},
+                                }
+                            }
+                        },
+                    }
+                )
+            )
+            with patch.dict(
+                os.environ,
+                {
+                    "SCANWICH_API_CONFIG": str(path),
+                    "SCANWICH_API_MAX_IMAGE_BYTES": "200",
+                    "SCANWICH_API_BACKENDS__OPENAI-COMPATIBLE__OPTIONS__MODEL": "glm-ocr",
+                },
+                clear=True,
+            ):
+                settings = ApiConfig()
+                self.assertEqual(settings.max_image_bytes, 200)
+                self.assertEqual(settings.port, 9000)
+                options = settings.backends["openai-compatible"].options
+                self.assertEqual(options["model"], "glm-ocr")
+                self.assertEqual(options["model_aliases"], {"deepseek": "~deepseek/model"})
+                self.assertEqual(ApiConfig(max_image_bytes=300).max_image_bytes, 300)
+
+    def test_invalid_settings_fail_at_startup(self):
+        with (
+            patch.dict(os.environ, {"SCANWICH_API_MAX_IMAGE_BYTES": "0"}, clear=True),
+            self.assertRaises(ValidationError),
+        ):
+            create_app()
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "config.json"
+            with self.assertRaises(FileNotFoundError):
+                ApiConfig(config=path)
+            path.write_text('{"unknown_option":true}')
+            with self.assertRaises(ValidationError):
+                ApiConfig(config=path)
+
+    def test_response_schema_defines_regions(self):
+        with TestClient(create_app()) as api:
+            schema = api.get("/openapi.json").json()
+        region = schema["components"]["schemas"]["RegionResponse"]
+        self.assertEqual(region["properties"]["polygon"]["minItems"], 4)
+        self.assertEqual(region["properties"]["polygon"]["maxItems"], 4)
+        self.assertEqual(region["required"], ["text", "polygon"])
+
     def test_loads_server_configuration_from_environment(self):
         with TemporaryDirectory() as directory:
             path = Path(directory) / "config.json"

@@ -34,6 +34,7 @@
                   openai
                   fastapi
                   pydantic
+                  pydantic-settings
                   uvicorn
                   python-multipart
                   pillow

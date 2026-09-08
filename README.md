@@ -193,6 +193,12 @@ The default upload limit is 20 MiB. Set `max_image_bytes` to change it.
 Invalid images return 422; excessive image sizes return 413; backend failures return 502.
 The server has no authentication. Keep the default local address or put an authenticated proxy before the server.
 Set `SCANWICH_API_CONFIG` to a JSON file path for `uvicorn scanwich.api:create_app --factory`.
+Pydantic Settings loads and checks the configuration.
+Explicit arguments take priority over environment variables, then JSON file values, then defaults.
+Use `SCANWICH_API_MAX_IMAGE_BYTES`, `SCANWICH_API_HOST`, and `SCANWICH_API_PORT` for environment overrides.
+Host and port settings apply to `scanwich-api`. Uvicorn controls its own bind address when you run it directly.
+Use `__` for nested fields, such as `SCANWICH_API_BACKENDS__OPENAI-COMPATIBLE__OPTIONS__MODEL`.
+Pydantic models define the API response schemas in `/docs`.
 Both Nix packages and container targets include the API dependencies and `scanwich-api` command.
 Use `--entrypoint /opt/scanwich/bin/scanwich-api` to start the API in a container.
 Pass `--host 0.0.0.0` and publish port 8000 for container access.

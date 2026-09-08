@@ -11,6 +11,7 @@ The standard Nix package and container include these direct dependencies:
 | OpenAI Python SDK | Apache-2.0 |
 | FastAPI | MIT |
 | Pydantic | MIT |
+| Pydantic Settings | MIT |
 | Uvicorn | BSD-3-Clause |
 | python-multipart | Apache-2.0 |
 | Pillow | MIT-CMU |
