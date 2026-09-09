@@ -47,7 +47,7 @@ class OpenAICompatibleBackendTests(TestCase):
                         {"x": 100, "y": 400},
                     ],
                 }
-            ]
+            ],
         }
         completions = FakeCompletions(f"```json\n{json.dumps(payload)}\n```")
         fake_client = SimpleNamespace(chat=SimpleNamespace(completions=completions))
@@ -67,7 +67,9 @@ class OpenAICompatibleBackendTests(TestCase):
             with (
                 patch.dict(os.environ, {"OPENROUTER_API_KEY": "test-secret"}),
                 patch.dict(sys.modules, {"openai": fake_openai}),
-                self.assertLogs("scanwich.backends.openai_compatible", level="INFO") as captured_logs,
+                self.assertLogs(
+                    "scanwich.backends.openai_compatible", level="INFO"
+                ) as captured_logs,
             ):
                 regions = backend.recognize(image_path)
 
@@ -167,7 +169,7 @@ class OpenAICompatibleBackendTests(TestCase):
                         {"x": 0, "y": 1000},
                     ],
                 }
-            ]
+            ],
         }
         completions = FakeCompletions(json.dumps(payload))
         fake_client = SimpleNamespace(chat=SimpleNamespace(completions=completions))
@@ -197,7 +199,7 @@ class OpenAICompatibleBackendTests(TestCase):
                         {"x": 100, "y": 180},
                     ],
                 }
-            ]
+            ],
         }
         completions = FakeCompletions(json.dumps(payload))
         fake_client = SimpleNamespace(chat=SimpleNamespace(completions=completions))

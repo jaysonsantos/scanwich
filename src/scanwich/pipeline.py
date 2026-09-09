@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -59,7 +58,7 @@ def convert_pdf(
         temporary_pdf = work_directory / "result.pdf"
         logger.info("Assembling searchable PDF")
         assemble_searchable_pdf(pages, page_regions, temporary_pdf)
-        os.replace(temporary_pdf, output_pdf)
+        temporary_pdf.replace(output_pdf)
         logger.info("Wrote searchable PDF to %s", output_pdf)
 
 

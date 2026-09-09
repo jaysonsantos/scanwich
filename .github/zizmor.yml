@@ -1,0 +1,7 @@
+# Actions are referenced by version tag and updated by Renovate, so a tag pin
+# satisfies this repository's policy.
+rules:
+  unpinned-uses:
+    config:
+      policies:
+        "*": ref-pin
