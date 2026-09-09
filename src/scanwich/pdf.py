@@ -97,6 +97,18 @@ def rasterize_pdf(
     return pages
 
 
+def count_pdf_pages(input_pdf: Path) -> int:
+    """Count the pages of a PDF without rendering them."""
+    try:
+        document = pdfium.PdfDocument(input_pdf)
+    except (OSError, pdfium.PdfiumError) as error:
+        raise PdfPipelineError(f"PDFium could not open {input_pdf}: {error}") from error
+    try:
+        return len(document)
+    finally:
+        document.close()
+
+
 def _select_page_dpi(
     page: pdfium.PdfPage,
     *,

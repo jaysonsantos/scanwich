@@ -162,7 +162,9 @@ scanwich-api --config api.example.json
 
 The server listens on `127.0.0.1:8000`. Open `/docs` for the request schema.
 `GET /backends` lists installed backends that the configuration enables.
-`POST /ocr/{backend_name}` accepts an image in the `image` multipart field.
+`POST /ocr/{backend_name}` accepts a PDF or an image in the `file` multipart field.
+The API accepts PDFs with any number of pages. It makes one output page for each source page.
+The older `image` field name stays valid. Send only one of the two fields.
 Set the typed `output` multipart field to `pdf`, `text`, or `pdf+text`. The default is `pdf`.
 The JSON response uses `output` to identify its Pydantic response model:
 
@@ -172,18 +174,22 @@ The JSON response uses `output` to identify its Pydantic response model:
 | `text` | `output`, `text` |
 | `pdf+text` | `output`, `pdf_base64`, `text` |
 
-Decode `pdf_base64` to obtain a searchable PDF with the source image and invisible text.
-The API uses 300 DPI for the image's PDF page dimensions.
+Decode `pdf_base64` to obtain a searchable PDF with the source pages and invisible text.
+For a PDF upload, the API infers each page's DPI as the CLI does. Output pages keep the source
+page dimensions. For an image upload, the API uses 300 DPI for the PDF page dimensions.
+Set the optional `dpi` multipart field to override the DPI for every page.
+The API recognizes pages in order, one page at a time, and sends one backend request for each page.
+A document with many pages needs proportionally more time and provider quota.
 Text output preserves the provider's line breaks and spacing.
+Text output separates pages with a form feed (`\f`).
 The OpenAI-compatible backend requests plain text without JSON or coordinates for text output.
 Combined output makes two provider calls: one for PDF polygons and one for plain text.
 Other plugins provide text from their regions, with one line per region.
 Invalid output choices return 422.
-The API processes one image per request.
 
 ```console
 curl http://127.0.0.1:8000/ocr/openai-compatible \
-  -F image=@page.png -F model=deepseek -F output=text -F languages=en -F languages=pt
+  -F file=@document.pdf -F model=deepseek -F output=text -F languages=en -F languages=pt
 ```
 
 Set provider options in `backends.openai-compatible.options` in the JSON configuration.
@@ -207,16 +213,20 @@ The API uses native async calls when the backend provides them.
 It runs synchronous plugins in a worker thread. Each request creates its own backend instance.
 The API closes async clients and removes temporary images after each request.
 
-The default upload limit is 20 MiB. Set `max_image_bytes` to change it.
+The default upload limit is 20 MiB. Set `max_upload_bytes` to change it.
+The former name `max_image_bytes` still applies when `max_upload_bytes` is absent.
 Middleware rejects the request body before the multipart parser reads it.
-The body limit is `max_image_bytes` plus 64 KiB for multipart overhead.
-Invalid images return 422; excessive image sizes return 413; backend failures return 502.
+The body limit is `max_upload_bytes` plus 64 KiB for multipart overhead.
+The page count has no limit by default. Set `max_pages` to reject longer documents.
+Invalid images and PDFs return 422; oversized uploads and excessive page counts return 413;
+backend failures return 502.
 Backend cleanup errors are logged. They do not change the response.
 The server has no authentication. Keep the default local address or put an authenticated proxy before the server.
 Set `SCANWICH_API_CONFIG` to a JSON file path for `uvicorn scanwich.api:create_app --factory`.
 Pydantic Settings loads and checks the configuration.
 Explicit arguments take priority over environment variables, then JSON file values, then defaults.
-Use `SCANWICH_API_MAX_IMAGE_BYTES`, `SCANWICH_API_HOST`, and `SCANWICH_API_PORT` for environment overrides.
+Use `SCANWICH_API_MAX_UPLOAD_BYTES`, `SCANWICH_API_MAX_PAGES`, `SCANWICH_API_HOST`, and
+`SCANWICH_API_PORT` for environment overrides.
 Host and port settings apply to `scanwich-api`. Uvicorn controls its own bind address when you run it directly.
 Use `__` for nested fields, such as `SCANWICH_API_BACKENDS__OPENAI-COMPATIBLE__OPTIONS__MODEL`.
 Pydantic models define the API response schemas in `/docs`.

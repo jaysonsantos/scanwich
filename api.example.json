@@ -11,5 +11,5 @@
     },
     "easyocr": {"options": {"gpu": false}}
   },
-  "max_image_bytes": 20971520
+  "max_upload_bytes": 20971520
 }

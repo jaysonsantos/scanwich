@@ -13,9 +13,11 @@ from fastapi.testclient import TestClient
 from PIL import Image
 from pydantic import ValidationError
 from pypdf import PdfReader
+from reportlab.pdfgen import canvas
 
 from scanwich.api import (
     MULTIPART_OVERHEAD_BYTES,
+    PAGE_SEPARATOR,
     TOO_LARGE_DETAIL,
     ApiConfig,
     BackendConfig,
@@ -31,6 +33,26 @@ def image_bytes() -> bytes:
     return output.getvalue()
 
 
+def pdf_bytes(page_count: int) -> bytes:
+    output = io.BytesIO()
+    document = canvas.Canvas(output, pagesize=(144, 72))
+    for number in range(page_count):
+        document.drawString(10, 30, f"source page {number}")
+        document.showPage()
+    document.save()
+    return output.getvalue()
+
+
+def stem_regions(image_path: Path) -> list[OcrRegion]:
+    """Recognize the page image file name so tests can map pages to results."""
+    return [
+        OcrRegion(
+            text=image_path.stem,
+            polygon=(Point(10, 10), Point(100, 10), Point(100, 30), Point(10, 30)),
+        )
+    ]
+
+
 class TestApi(TestCase):
     def test_settings_priority_and_nested_environment(self):
         with TemporaryDirectory() as directory:
@@ -38,7 +60,7 @@ class TestApi(TestCase):
             path.write_text(
                 json.dumps(
                     {
-                        "max_image_bytes": 100,
+                        "max_upload_bytes": 100,
                         "port": 9000,
                         "backends": {
                             "openai-compatible": {
@@ -55,18 +77,24 @@ class TestApi(TestCase):
                 os.environ,
                 {
                     "SCANWICH_API_CONFIG": str(path),
-                    "SCANWICH_API_MAX_IMAGE_BYTES": "200",
+                    "SCANWICH_API_MAX_UPLOAD_BYTES": "200",
                     "SCANWICH_API_BACKENDS__OPENAI-COMPATIBLE__OPTIONS__MODEL": "glm-ocr",
                 },
                 clear=True,
             ):
                 settings = ApiConfig()
-                self.assertEqual(settings.max_image_bytes, 200)
+                self.assertEqual(settings.max_upload_bytes, 200)
                 self.assertEqual(settings.port, 9000)
                 options = settings.backends["openai-compatible"].options
                 self.assertEqual(options["model"], "glm-ocr")
                 self.assertEqual(options["model_aliases"], {"deepseek": "~deepseek/model"})
-                self.assertEqual(ApiConfig(max_image_bytes=300).max_image_bytes, 300)
+                self.assertEqual(ApiConfig(max_upload_bytes=300).max_upload_bytes, 300)
+
+    def test_legacy_upload_limit_name_still_applies(self):
+        self.assertEqual(ApiConfig(max_image_bytes=300).max_upload_bytes, 300)
+        self.assertEqual(ApiConfig(max_image_bytes=300, max_upload_bytes=400).max_upload_bytes, 400)
+        with patch.dict(os.environ, {"SCANWICH_API_MAX_IMAGE_BYTES": "500"}, clear=True):
+            self.assertEqual(ApiConfig().max_upload_bytes, 500)
 
     def test_invalid_settings_fail_at_startup(self):
         with (
@@ -105,7 +133,7 @@ class TestApi(TestCase):
                 self.assertEqual(api.get("/backends").json(), {"backends": []})
                 self.assertEqual(
                     api.post(
-                        "/ocr/openai-compatible", files={"image": ("page.png", image_bytes())}
+                        "/ocr/openai-compatible", files={"file": ("page.png", image_bytes())}
                     ).status_code,
                     404,
                 )
@@ -212,6 +240,105 @@ class TestApi(TestCase):
                     self.assertEqual(
                         load.call_args.kwargs["options"], {"model": "provider/plugin-model"}
                     )
+
+    def test_multi_page_pdf_keeps_every_page(self):
+        config = ApiConfig(backends={"plugin": BackendConfig()})
+        with (
+            patch("scanwich.api.available_backends", return_value=["plugin"]),
+            patch(
+                "scanwich.api.load_backend", return_value=SimpleNamespace(recognize=stem_regions)
+            ),
+            TestClient(create_app(config)) as api,
+        ):
+            response = api.post(
+                "/ocr/plugin",
+                data={"output": "pdf+text"},
+                files={"file": ("scan.pdf", pdf_bytes(3))},
+            )
+        self.assertEqual(response.status_code, 200, response.text)
+        data = response.json()
+        reader = PdfReader(io.BytesIO(base64.b64decode(data["pdf_base64"])))
+        self.assertEqual(len(reader.pages), 3)
+        for number, page in enumerate(reader.pages):
+            self.assertIn(f"page-{number:06d}", page.extract_text())
+            self.assertAlmostEqual(float(page.mediabox.width), 144.0)
+        self.assertEqual(
+            data["text"].split(PAGE_SEPARATOR), [f"page-{number:06d}" for number in range(3)]
+        )
+
+    def test_async_backend_recognizes_every_pdf_page(self):
+        backend = SimpleNamespace(
+            recognize_async=AsyncMock(
+                return_value=[OcrRegion(text="hello", polygon=(Point(0, 0),) * 4)]
+            ),
+            recognize_text_async=AsyncMock(return_value="hello"),
+            aclose=AsyncMock(),
+        )
+        with (
+            patch("scanwich.api.load_backend", return_value=backend),
+            TestClient(create_app()) as api,
+        ):
+            response = api.post(
+                "/ocr/openai-compatible",
+                data={"output": "text"},
+                files={"file": ("scan.pdf", pdf_bytes(4))},
+            )
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["text"], PAGE_SEPARATOR.join(["hello"] * 4))
+        self.assertEqual(backend.recognize_text_async.await_count, 4)
+        backend.recognize_async.assert_not_awaited()
+        backend.aclose.assert_awaited_once()
+
+    def test_page_limit_and_invalid_pdf(self):
+        load = Mock(return_value=SimpleNamespace(recognize=stem_regions))
+        with (
+            patch("scanwich.api.load_backend", load),
+            TestClient(create_app(ApiConfig(max_pages=2))) as api,
+        ):
+            limited = api.post("/ocr/openai-compatible", files={"file": ("scan.pdf", pdf_bytes(3))})
+            broken = api.post("/ocr/openai-compatible", files={"file": ("scan.pdf", b"%PDF-1.7\n")})
+            accepted = api.post(
+                "/ocr/openai-compatible", files={"file": ("scan.pdf", pdf_bytes(2))}
+            )
+        self.assertEqual(limited.status_code, 413, limited.text)
+        self.assertIn("3 pages", limited.json()["detail"])
+        self.assertEqual(broken.status_code, 422, broken.text)
+        self.assertEqual(broken.json()["detail"], "Invalid PDF")
+        self.assertEqual(accepted.status_code, 200, accepted.text)
+        self.assertEqual(
+            len(PdfReader(io.BytesIO(base64.b64decode(accepted.json()["pdf_base64"]))).pages), 2
+        )
+        load.assert_called_once()
+
+    def test_upload_field_choice_and_dpi(self):
+        config = ApiConfig(backends={"plugin": BackendConfig()})
+        with (
+            patch("scanwich.api.available_backends", return_value=["plugin"]),
+            patch(
+                "scanwich.api.load_backend", return_value=SimpleNamespace(recognize=stem_regions)
+            ),
+            TestClient(create_app(config)) as api,
+        ):
+            missing = api.post("/ocr/plugin", data={"output": "text"})
+            both = api.post(
+                "/ocr/plugin",
+                files=[
+                    ("file", ("page.png", image_bytes())),
+                    ("image", ("page.png", image_bytes())),
+                ],
+            )
+            scaled = api.post(
+                "/ocr/plugin", data={"dpi": "72"}, files={"image": ("page.png", image_bytes())}
+            )
+        for response in (missing, both):
+            self.assertEqual(response.status_code, 422, response.text)
+            self.assertEqual(
+                response.json()["detail"], "Provide one PDF or image in the file field"
+            )
+        self.assertEqual(scaled.status_code, 200, scaled.text)
+        page = PdfReader(io.BytesIO(base64.b64decode(scaled.json()["pdf_base64"]))).pages[0]
+        self.assertAlmostEqual(float(page.mediabox.width), 200.0)
+        self.assertAlmostEqual(float(page.mediabox.height), 100.0)
 
     def test_oversized_body_is_rejected_before_parsing(self):
         payload = b"x" * (2 * MULTIPART_OVERHEAD_BYTES)

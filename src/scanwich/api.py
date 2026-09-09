@@ -11,9 +11,9 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import Annotated, Any, Literal
 
-from fastapi import FastAPI, Form, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from PIL import Image
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 from pydantic_settings import (
     BaseSettings,
     JsonConfigSettingsSource,
@@ -27,13 +27,27 @@ from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from scanwich.models import OcrRegion
 from scanwich.ocr import available_backends, backend_request_options, load_backend
-from scanwich.pdf import DEFAULT_DPI, RasterizedPage, assemble_searchable_pdf
+from scanwich.pdf import (
+    DEFAULT_DPI,
+    PdfPipelineError,
+    RasterizedPage,
+    assemble_searchable_pdf,
+    count_pdf_pages,
+    rasterize_pdf,
+)
 
 logger = logging.getLogger(__name__)
 
-# Multipart boundaries, headers, and form fields travel with the image.
+# Multipart boundaries, headers, and form fields travel with the upload.
 MULTIPART_OVERHEAD_BYTES = 64 * 1024
 TOO_LARGE_DETAIL = "Request exceeds the configured size limit"
+PDF_MAGIC = b"%PDF-"
+# Plain text output separates pages with a form feed, as PDF text extractors do.
+PAGE_SEPARATOR = "\f"
+
+
+class TooManyPagesError(Exception):
+    """The upload has more pages than the configuration allows."""
 
 
 class BackendConfig(BaseModel):
@@ -62,7 +76,16 @@ class ApiConfig(BaseSettings):
     backends: dict[str, BackendConfig] = Field(
         default_factory=lambda: {"openai-compatible": BackendConfig()}
     )
-    max_image_bytes: int = Field(default=20 * 1024 * 1024, gt=0)
+    max_upload_bytes: int = Field(default=20 * 1024 * 1024, gt=0)
+    max_pages: int | None = Field(default=None, gt=0)
+    # The name used before the API accepted PDF uploads.
+    max_image_bytes: int | None = Field(default=None, gt=0, exclude=True)
+
+    @model_validator(mode="after")
+    def _apply_legacy_names(self) -> ApiConfig:
+        if self.max_image_bytes is not None and "max_upload_bytes" not in self.model_fields_set:
+            self.max_upload_bytes = self.max_image_bytes
+        return self
 
     @classmethod
     def settings_customise_sources(
@@ -111,23 +134,49 @@ class PdfTextResponse(BaseModel):
 OcrResponse = Annotated[PdfResponse | TextResponse | PdfTextResponse, Field(discriminator="output")]
 
 
-def _make_pdf(path: Path, regions: Sequence[OcrRegion]) -> str:
-    with Image.open(path) as image:
-        width, height = image.size
-    page = RasterizedPage(
-        image_path=path,
-        width_points=width * 72 / DEFAULT_DPI,
-        height_points=height * 72 / DEFAULT_DPI,
-        dpi=DEFAULT_DPI,
-    )
-    output_path = path.parent / "result.pdf"
-    assemble_searchable_pdf([page], [regions], output_path)
+def _make_pdf(
+    pages: Sequence[RasterizedPage],
+    page_regions: Sequence[Sequence[OcrRegion]],
+    output_path: Path,
+) -> str:
+    assemble_searchable_pdf(pages, page_regions, output_path)
     return base64.b64encode(output_path.read_bytes()).decode("ascii")
 
 
 def _check_image(path: Path) -> None:
     with Image.open(path) as image:
         image.verify()
+
+
+def _prepare_pages(
+    upload_path: Path,
+    pages_directory: Path,
+    *,
+    dpi: int | None,
+    max_pages: int | None,
+) -> list[RasterizedPage]:
+    """Return one page per PDF page, or a single page for an image upload."""
+    with upload_path.open("rb") as upload_file:
+        header = upload_file.read(len(PDF_MAGIC))
+    if header == PDF_MAGIC:
+        if max_pages is not None:
+            page_count = count_pdf_pages(upload_path)
+            if page_count > max_pages:
+                raise TooManyPagesError(f"PDF has {page_count} pages; the limit is {max_pages}")
+        return rasterize_pdf(upload_path, pages_directory, dpi=dpi)
+
+    _check_image(upload_path)
+    with Image.open(upload_path) as image:
+        width, height = image.size
+    page_dpi = float(dpi) if dpi is not None else DEFAULT_DPI
+    return [
+        RasterizedPage(
+            image_path=upload_path,
+            width_points=width * 72 / page_dpi,
+            height_points=height * 72 / page_dpi,
+            dpi=page_dpi,
+        )
+    ]
 
 
 class MaxBodySizeMiddleware:
@@ -166,7 +215,7 @@ def create_app(config: ApiConfig | None = None) -> FastAPI:
     app = FastAPI(title="Scanwich OCR API")
     app.add_middleware(
         MaxBodySizeMiddleware,
-        max_body_bytes=config.max_image_bytes + MULTIPART_OVERHEAD_BYTES,
+        max_body_bytes=config.max_upload_bytes + MULTIPART_OVERHEAD_BYTES,
     )
 
     @app.get("/backends")
@@ -177,11 +226,16 @@ def create_app(config: ApiConfig | None = None) -> FastAPI:
     @app.post("/ocr/{backend_name}", response_model_exclude_none=True)
     async def recognize(
         backend_name: str,
-        image: UploadFile,
+        file: Annotated[UploadFile | None, File()] = None,
+        image: Annotated[UploadFile | None, File()] = None,
         output: Annotated[OutputFormat, Form()] = OutputFormat.PDF,
         model: Annotated[str | None, Form()] = None,
         languages: Annotated[list[str] | None, Form()] = None,
+        dpi: Annotated[int | None, Form(gt=0)] = None,
     ) -> OcrResponse:
+        if (file is None) == (image is None):
+            raise HTTPException(422, "Provide one PDF or image in the file field")
+        upload = file if file is not None else image
         settings = config.backends.get(backend_name)
         if settings is None or backend_name not in available_backends():
             raise HTTPException(404, "Unknown or disabled OCR backend")
@@ -192,20 +246,32 @@ def create_app(config: ApiConfig | None = None) -> FastAPI:
                 raise HTTPException(422, "This OCR backend does not accept a model option")
             options["model"] = model
         with TemporaryDirectory(prefix="scanwich-api-") as directory:
-            path = Path(directory) / "page"
+            work_directory = Path(directory)
+            upload_path = work_directory / "upload"
             size = 0
             try:
-                with path.open("wb") as image_file:
-                    while chunk := await image.read(1024 * 1024):
+                with upload_path.open("wb") as upload_file:
+                    while chunk := await upload.read(1024 * 1024):
                         size += len(chunk)
-                        if size > config.max_image_bytes:
-                            raise HTTPException(413, "Image exceeds the configured size limit")
-                        await run_in_threadpool(image_file.write, chunk)
-                await run_in_threadpool(_check_image, path)
+                        if size > config.max_upload_bytes:
+                            raise HTTPException(413, "Upload exceeds the configured size limit")
+                        await run_in_threadpool(upload_file.write, chunk)
+            finally:
+                await upload.close()
+            try:
+                pages = await run_in_threadpool(
+                    _prepare_pages,
+                    upload_path,
+                    work_directory / "pages",
+                    dpi=dpi,
+                    max_pages=config.max_pages,
+                )
+            except TooManyPagesError as error:
+                raise HTTPException(413, str(error)) from error
+            except PdfPipelineError as error:
+                raise HTTPException(422, "Invalid PDF") from error
             except (OSError, ValueError, Image.DecompressionBombError) as error:
                 raise HTTPException(422, "Invalid image") from error
-            finally:
-                await image.close()
             backend = None
             try:
                 backend = await run_in_threadpool(
@@ -213,23 +279,32 @@ def create_app(config: ApiConfig | None = None) -> FastAPI:
                 )
                 async_recognize = getattr(backend, "recognize_async", None)
                 text_recognize = getattr(backend, "recognize_text_async", None)
-                regions = None
-                if output != OutputFormat.TEXT or text_recognize is None:
-                    regions = list(
-                        await async_recognize(path)
-                        if async_recognize is not None
-                        else await run_in_threadpool(backend.recognize, path)
+                page_regions: list[Sequence[OcrRegion]] = []
+                texts: list[str] = []
+                for page_number, page in enumerate(pages, start=1):
+                    logger.info(
+                        "Recognizing page %d/%d with %s", page_number, len(pages), backend_name
                     )
-                text = ""
-                if output != OutputFormat.PDF:
-                    text = (
-                        await text_recognize(path)
-                        if text_recognize is not None
-                        else "\n".join(region.text for region in regions)
-                    )
+                    regions: list[OcrRegion] | None = None
+                    if output != OutputFormat.TEXT or text_recognize is None:
+                        regions = list(
+                            await async_recognize(page.image_path)
+                            if async_recognize is not None
+                            else await run_in_threadpool(backend.recognize, page.image_path)
+                        )
+                        page_regions.append(regions)
+                    if output != OutputFormat.PDF:
+                        texts.append(
+                            await text_recognize(page.image_path)
+                            if text_recognize is not None
+                            else "\n".join(region.text for region in regions)
+                        )
+                text = PAGE_SEPARATOR.join(texts)
                 if output == OutputFormat.TEXT:
                     return TextResponse(text=text)
-                pdf = await run_in_threadpool(_make_pdf, path, regions)
+                pdf = await run_in_threadpool(
+                    _make_pdf, pages, page_regions, work_directory / "result.pdf"
+                )
                 if output == OutputFormat.PDF:
                     return PdfResponse(pdf_base64=pdf)
                 return PdfTextResponse(pdf_base64=pdf, text=text)
