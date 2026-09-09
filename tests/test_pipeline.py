@@ -1,6 +1,8 @@
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from types import SimpleNamespace
 from unittest import TestCase
+from unittest.mock import patch
 
 from pypdf import PdfReader
 from reportlab.pdfgen import canvas
@@ -45,9 +47,18 @@ class BackendProtocolTests(TestCase):
 
     def test_backends_declare_their_own_request_options(self) -> None:
         self.assertEqual(backend_request_options("openai-compatible"), frozenset({"model"}))
-        self.assertEqual(backend_request_options("easyocr"), frozenset())
         with self.assertRaisesRegex(ValueError, "unknown OCR backend"):
             backend_request_options("missing")
+
+    def test_backends_without_a_declaration_take_no_request_options(self) -> None:
+        def plugin_factory(*, languages: list[str], options: dict[str, object]) -> FakeBackend:
+            return FakeBackend()
+
+        entry_point = SimpleNamespace(
+            name="plugin", value="plugin:factory", load=lambda: plugin_factory
+        )
+        with patch("scanwich.ocr.entry_points", return_value=[entry_point]):
+            self.assertEqual(backend_request_options("plugin"), frozenset())
 
 
 class ConversionTests(TestCase):
