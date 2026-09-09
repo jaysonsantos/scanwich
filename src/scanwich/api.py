@@ -78,6 +78,8 @@ class ApiConfig(BaseSettings):
     )
     max_upload_bytes: int = Field(default=20 * 1024 * 1024, gt=0)
     max_pages: int | None = Field(default=None, gt=0)
+    # A page rendered above this DPI can exhaust the worker's memory.
+    max_dpi: int = Field(default=600, gt=0)
     # The name used before the API accepted PDF uploads.
     max_image_bytes: int | None = Field(default=None, gt=0, exclude=True)
 
@@ -236,6 +238,8 @@ def create_app(config: ApiConfig | None = None) -> FastAPI:
         if (file is None) == (image is None):
             raise HTTPException(422, "Provide one PDF or image in the file field")
         upload = file if file is not None else image
+        if dpi is not None and dpi > config.max_dpi:
+            raise HTTPException(422, f"The dpi field must not exceed {config.max_dpi}")
         settings = config.backends.get(backend_name)
         if settings is None or backend_name not in available_backends():
             raise HTTPException(404, "Unknown or disabled OCR backend")
