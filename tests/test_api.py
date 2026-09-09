@@ -310,6 +310,27 @@ class TestApi(TestCase):
         )
         load.assert_called_once()
 
+    def test_dpi_field_stays_within_the_configured_ceiling(self):
+        load = Mock(return_value=SimpleNamespace(recognize=stem_regions))
+        with (
+            patch("scanwich.api.load_backend", load),
+            TestClient(create_app(ApiConfig(max_dpi=150))) as api,
+        ):
+            rejected = api.post(
+                "/ocr/openai-compatible",
+                data={"dpi": "10000"},
+                files={"file": ("scan.pdf", pdf_bytes(1))},
+            )
+            accepted = api.post(
+                "/ocr/openai-compatible",
+                data={"dpi": "150"},
+                files={"file": ("scan.pdf", pdf_bytes(1))},
+            )
+        self.assertEqual(rejected.status_code, 422, rejected.text)
+        self.assertEqual(rejected.json()["detail"], "The dpi field must not exceed 150")
+        load.assert_called_once()
+        self.assertEqual(accepted.status_code, 200, accepted.text)
+
     def test_upload_field_choice_and_dpi(self):
         config = ApiConfig(backends={"plugin": BackendConfig()})
         with (

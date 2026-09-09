@@ -178,6 +178,8 @@ Decode `pdf_base64` to obtain a searchable PDF with the source pages and invisib
 For a PDF upload, the API infers each page's DPI as the CLI does. Output pages keep the source
 page dimensions. For an image upload, the API uses 300 DPI for the PDF page dimensions.
 Set the optional `dpi` multipart field to override the DPI for every page.
+The server limits that field to `max_dpi`, which is 600 by default. Higher values return 422.
+This limit bounds the rendered page size, and with it the memory of one request.
 The API recognizes pages in order, one page at a time, and sends one backend request for each page.
 A document with many pages needs proportionally more time and provider quota.
 Text output preserves the provider's line breaks and spacing.
@@ -218,6 +220,7 @@ The former name `max_image_bytes` still applies when `max_upload_bytes` is absen
 Middleware rejects the request body before the multipart parser reads it.
 The body limit is `max_upload_bytes` plus 64 KiB for multipart overhead.
 The page count has no limit by default. Set `max_pages` to reject longer documents.
+Set `max_dpi` to change the DPI ceiling for the `dpi` field.
 Invalid images and PDFs return 422; oversized uploads and excessive page counts return 413;
 backend failures return 502.
 Backend cleanup errors are logged. They do not change the response.
@@ -225,8 +228,8 @@ The server has no authentication. Keep the default local address or put an authe
 Set `SCANWICH_API_CONFIG` to a JSON file path for `uvicorn scanwich.api:create_app --factory`.
 Pydantic Settings loads and checks the configuration.
 Explicit arguments take priority over environment variables, then JSON file values, then defaults.
-Use `SCANWICH_API_MAX_UPLOAD_BYTES`, `SCANWICH_API_MAX_PAGES`, `SCANWICH_API_HOST`, and
-`SCANWICH_API_PORT` for environment overrides.
+Use `SCANWICH_API_MAX_UPLOAD_BYTES`, `SCANWICH_API_MAX_PAGES`, `SCANWICH_API_MAX_DPI`,
+`SCANWICH_API_HOST`, and `SCANWICH_API_PORT` for environment overrides.
 Host and port settings apply to `scanwich-api`. Uvicorn controls its own bind address when you run it directly.
 Use `__` for nested fields, such as `SCANWICH_API_BACKENDS__OPENAI-COMPATIBLE__OPTIONS__MODEL`.
 Pydantic models define the API response schemas in `/docs`.
