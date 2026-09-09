@@ -196,7 +196,9 @@ Model IDs, including a leading `~`, pass to the provider unchanged.
 The built-in `deepseek` alias uses the existing default model. Configuration can replace that alias.
 Unknown aliases pass through as model IDs. Alias resolution uses one lookup.
 The CLI also accepts `--backend-option 'model_aliases={"deepseek":"~deepseek/your-model"}'`.
-Clients can select a model. Server configuration controls endpoint URLs and credential environment variables.
+Clients can select a model on backends that allow it. Server configuration controls endpoint URLs and credential environment variables.
+A backend allows the `model` field when its entry-point factory declares `request_options = frozenset({"model"})`.
+The `openai-compatible` backend declares it. Other backends reject the `model` field with 422.
 
 The OpenAI-compatible backend exposes `await backend.recognize_async(path)` and `await backend.aclose()`.
 Use `await backend.recognize_text_async(path)` for plain text.
@@ -206,7 +208,10 @@ It runs synchronous plugins in a worker thread. Each request creates its own bac
 The API closes async clients and removes temporary images after each request.
 
 The default upload limit is 20 MiB. Set `max_image_bytes` to change it.
+Middleware rejects the request body before the multipart parser reads it.
+The body limit is `max_image_bytes` plus 64 KiB for multipart overhead.
 Invalid images return 422; excessive image sizes return 413; backend failures return 502.
+Backend cleanup errors are logged. They do not change the response.
 The server has no authentication. Keep the default local address or put an authenticated proxy before the server.
 Set `SCANWICH_API_CONFIG` to a JSON file path for `uvicorn scanwich.api:create_app --factory`.
 Pydantic Settings loads and checks the configuration.

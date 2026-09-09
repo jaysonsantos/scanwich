@@ -21,12 +21,19 @@ from pydantic_settings import (
     SettingsConfigDict,
 )
 from starlette.concurrency import run_in_threadpool
+from starlette.datastructures import Headers
+from starlette.responses import JSONResponse
+from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from scanwich.models import OcrRegion
-from scanwich.ocr import available_backends, load_backend
+from scanwich.ocr import available_backends, backend_request_options, load_backend
 from scanwich.pdf import DEFAULT_DPI, RasterizedPage, assemble_searchable_pdf
 
 logger = logging.getLogger(__name__)
+
+# Multipart boundaries, headers, and form fields travel with the image.
+MULTIPART_OVERHEAD_BYTES = 64 * 1024
+TOO_LARGE_DETAIL = "Request exceeds the configured size limit"
 
 
 class BackendConfig(BaseModel):
@@ -123,10 +130,44 @@ def _check_image(path: Path) -> None:
         image.verify()
 
 
+class MaxBodySizeMiddleware:
+    """Reject oversized request bodies before the multipart parser reads them."""
+
+    def __init__(self, app: ASGIApp, max_body_bytes: int) -> None:
+        self.app = app
+        self.max_body_bytes = max_body_bytes
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+        declared = Headers(scope=scope).get("content-length")
+        if declared is not None and declared.isdigit() and int(declared) > self.max_body_bytes:
+            response = JSONResponse({"detail": TOO_LARGE_DETAIL}, status_code=413)
+            await response(scope, receive, send)
+            return
+        received = 0
+
+        async def limited_receive() -> Message:
+            nonlocal received
+            message = await receive()
+            if message["type"] == "http.request":
+                received += len(message.get("body", b""))
+                if received > self.max_body_bytes:
+                    raise HTTPException(413, TOO_LARGE_DETAIL)
+            return message
+
+        await self.app(scope, limited_receive, send)
+
+
 def create_app(config: ApiConfig | None = None) -> FastAPI:
     if config is None:
         config = ApiConfig()
     app = FastAPI(title="Scanwich OCR API")
+    app.add_middleware(
+        MaxBodySizeMiddleware,
+        max_body_bytes=config.max_image_bytes + MULTIPART_OVERHEAD_BYTES,
+    )
 
     @app.get("/backends")
     async def backends() -> BackendsResponse:
@@ -146,8 +187,9 @@ def create_app(config: ApiConfig | None = None) -> FastAPI:
             raise HTTPException(404, "Unknown or disabled OCR backend")
         options = dict(settings.options)
         if model is not None:
-            if backend_name != "openai-compatible":
-                raise HTTPException(422, "Model selection requires openai-compatible")
+            supported = await run_in_threadpool(backend_request_options, backend_name)
+            if "model" not in supported:
+                raise HTTPException(422, "This OCR backend does not accept a model option")
             options["model"] = model
         with TemporaryDirectory(prefix="scanwich-api-") as directory:
             path = Path(directory) / "page"
@@ -197,7 +239,10 @@ def create_app(config: ApiConfig | None = None) -> FastAPI:
             finally:
                 close = getattr(backend, "aclose", None)
                 if close is not None:
-                    await close()
+                    try:
+                        await close()
+                    except Exception:
+                        logger.warning("Closing OCR backend %s failed", backend_name, exc_info=True)
 
     return app
 

@@ -29,6 +29,7 @@ DEFAULT_REASONING_EFFORT = "low"
 NORMALIZED_COORDINATE_MAX = 1000.0
 NORMALIZED_COORDINATE_TOLERANCE = 50.0
 PIXEL_COORDINATE_TOLERANCE_RATIO = 0.05
+REQUEST_OPTIONS = frozenset({"model"})
 HTTP_REFERER = "https://github.com/jaysonsantos/scanwich"
 APP_TITLE = "Scanwich"
 
@@ -533,3 +534,7 @@ def factory(
     options: Mapping[str, Any],
 ) -> OpenAICompatibleBackend:
     return OpenAICompatibleBackend(languages=languages, options=options)
+
+
+# HTTP API clients may override the model for one request.
+factory.request_options = REQUEST_OPTIONS

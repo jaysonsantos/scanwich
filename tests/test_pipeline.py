@@ -6,6 +6,7 @@ from pypdf import PdfReader
 from reportlab.pdfgen import canvas
 
 from scanwich.models import OcrRegion, Point
+from scanwich.ocr import backend_request_options
 from scanwich.pipeline import convert_pdf, parse_backend_options
 
 
@@ -41,6 +42,12 @@ class BackendProtocolTests(TestCase):
     def test_backend_contract_is_provider_neutral(self) -> None:
         result = FakeBackend().recognize(Path("page-000001.png"))
         self.assertEqual(result[0].text, "page-000001")
+
+    def test_backends_declare_their_own_request_options(self) -> None:
+        self.assertEqual(backend_request_options("openai-compatible"), frozenset({"model"}))
+        self.assertEqual(backend_request_options("easyocr"), frozenset())
+        with self.assertRaisesRegex(ValueError, "unknown OCR backend"):
+            backend_request_options("missing")
 
 
 class ConversionTests(TestCase):

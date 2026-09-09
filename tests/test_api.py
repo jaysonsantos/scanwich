@@ -14,7 +14,13 @@ from PIL import Image
 from pydantic import ValidationError
 from pypdf import PdfReader
 
-from scanwich.api import ApiConfig, BackendConfig, create_app
+from scanwich.api import (
+    MULTIPART_OVERHEAD_BYTES,
+    TOO_LARGE_DETAIL,
+    ApiConfig,
+    BackendConfig,
+    create_app,
+)
 from scanwich.backends.openai_compatible import OpenAICompatibleBackend
 from scanwich.models import OcrRegion, Point
 
@@ -181,6 +187,69 @@ class TestApi(TestCase):
             response = api.post("/ocr/plugin", files={"image": ("../../page", image_bytes())})
         self.assertEqual(response.status_code, 200)
         self.assertFalse(paths[0].exists())
+
+    def test_model_option_follows_backend_capability(self):
+        regions = [OcrRegion(text="hello", polygon=(Point(0, 0),) * 4)]
+        config = ApiConfig(backends={"plugin": BackendConfig()})
+        for supported, status in ((frozenset(), 422), (frozenset({"model"}), 200)):
+            with self.subTest(supported=sorted(supported)):
+                load = Mock(return_value=SimpleNamespace(recognize=Mock(return_value=regions)))
+                with (
+                    patch("scanwich.api.available_backends", return_value=["plugin"]),
+                    patch("scanwich.api.backend_request_options", return_value=supported),
+                    patch("scanwich.api.load_backend", load),
+                    TestClient(create_app(config)) as api,
+                ):
+                    response = api.post(
+                        "/ocr/plugin",
+                        data={"model": "provider/plugin-model"},
+                        files={"image": ("page.png", image_bytes())},
+                    )
+                self.assertEqual(response.status_code, status, response.text)
+                if status == 422:
+                    load.assert_not_called()
+                else:
+                    self.assertEqual(
+                        load.call_args.kwargs["options"], {"model": "provider/plugin-model"}
+                    )
+
+    def test_oversized_body_is_rejected_before_parsing(self):
+        payload = b"x" * (2 * MULTIPART_OVERHEAD_BYTES)
+        load = Mock()
+        with (
+            patch("scanwich.api.load_backend", load),
+            TestClient(create_app(ApiConfig(max_image_bytes=1))) as api,
+        ):
+            declared = api.post("/ocr/openai-compatible", files={"image": ("page.png", payload)})
+            streamed = api.post(
+                "/ocr/openai-compatible",
+                headers={"content-type": "multipart/form-data; boundary=test"},
+                content=iter([b"--test\r\n", payload, b"\r\n--test--\r\n"]),
+            )
+        for response in (declared, streamed):
+            self.assertEqual(response.status_code, 413, response.text)
+            self.assertEqual(response.json(), {"detail": TOO_LARGE_DETAIL})
+        load.assert_not_called()
+
+    def test_cleanup_failure_keeps_the_request_outcome(self):
+        backend = SimpleNamespace(
+            recognize_async=AsyncMock(
+                return_value=[OcrRegion(text="hello", polygon=(Point(0, 0),) * 4)]
+            ),
+            aclose=AsyncMock(side_effect=RuntimeError("close failed")),
+        )
+        with (
+            patch("scanwich.api.load_backend", return_value=backend),
+            TestClient(create_app()) as api,
+            self.assertLogs("scanwich.api", level="WARNING") as logs,
+        ):
+            response = api.post(
+                "/ocr/openai-compatible", files={"image": ("page.png", image_bytes())}
+            )
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["output"], "pdf")
+        backend.aclose.assert_awaited_once()
+        self.assertIn("Closing OCR backend openai-compatible failed", "\n".join(logs.output))
 
     def test_all_output_modes(self):
         regions = [
