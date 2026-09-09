@@ -18,12 +18,18 @@ Container model warm-up code is in `docker/`, while Nix packaging is defined by 
 - `nix run . -- input.pdf output.pdf -l de pt en` builds and runs Scanwich locally.
 - `nix flake check "path:$PWD"` builds the package and runs the complete unit test suite.
 - `nix develop "path:$PWD" -c ruff check src tests docker` checks Python style.
+- `uv run --frozen --only-group dev ruff format src tests docker` applies the formatter.
+- `uv run --frozen --only-group dev zizmor .github/workflows` audits the workflows.
 - `podman build --tag localhost/scanwich:dev .` builds the release-like container image.
+
+GitHub Actions runs the same checks in `.github/workflows/ci.yml`: Ruff lint, Ruff format,
+the workflow audit, and the unit tests on Python 3.11, 3.12, and 3.13. The pinned Ruff and
+zizmor versions are in the `dev` dependency group of `pyproject.toml`.
 
 ## Coding Style & Naming Conventions
 
 Use Python 3.11 or newer, four-space indentation, type hints for public interfaces, and Ruff's
-100-character line limit. Name modules and functions with `snake_case`, classes with
+100-character line limit. `ruff format` owns the layout; run it before you commit. Name modules and functions with `snake_case`, classes with
 `PascalCase`, and constants with `UPPER_SNAKE_CASE`. Keep OCR-specific behavior behind the
 backend protocol; pipeline and PDF code must remain provider-neutral. Send operational progress
 through Python logging (stderr), not stdout or generated OCR results.

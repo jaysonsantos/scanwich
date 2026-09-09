@@ -113,7 +113,9 @@ class OpenAICompatibleBackend:
             )
         content = getattr(getattr(choice, "message", None), "content", None)
         if not isinstance(content, str) or not content.strip():
-            raise RuntimeError("OpenAI-compatible service returned an empty or unsupported response")
+            raise RuntimeError(
+                "OpenAI-compatible service returned an empty or unsupported response"
+            )
         payload = _parse_json_payload(content)
         return _parse_regions(payload, image_width=width, image_height=height)
 
@@ -123,12 +125,16 @@ class OpenAICompatibleBackend:
 
         api_key = os.environ.get(self._api_key_env)
         if not api_key:
-            raise RuntimeError(f"the OpenAI-compatible backend requires {self._api_key_env} to be set")
+            raise RuntimeError(
+                f"the OpenAI-compatible backend requires {self._api_key_env} to be set"
+            )
         logger.info("Initializing OpenAI-compatible client for model %s", self._model)
         try:
             from openai import OpenAI
         except ImportError as error:
-            raise RuntimeError("the OpenAI-compatible backend requires the 'openai' package") from error
+            raise RuntimeError(
+                "the OpenAI-compatible backend requires the 'openai' package"
+            ) from error
 
         client_options: dict[str, Any] = {
             "api_key": api_key,
