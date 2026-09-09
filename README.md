@@ -151,7 +151,111 @@ scanwich input.pdf output.pdf \
 Page images are base64-encoded and sent to the configured service and its selected model
 provider. Do not use this backend for documents that must remain local.
 
-## Notes
+## HTTP API
+
+Install the API and a backend:
+
+```console
+pip install '.[api,openai-compatible]'
+scanwich-api --config api.example.json
+```
+
+The server listens on `127.0.0.1:8000`. Open `/docs` for the request schema.
+`GET /backends` lists installed backends that the configuration enables.
+`POST /ocr/{backend_name}` accepts an image in the `image` multipart field.
+Set the typed `output` multipart field to `pdf`, `text`, or `pdf+text`. The default is `pdf`.
+The JSON response uses `output` to identify its Pydantic response model:
+
+| Output | Response fields |
+| --- | --- |
+| `pdf` | `output`, `pdf_base64` |
+| `text` | `output`, `text` |
+| `pdf+text` | `output`, `pdf_base64`, `text` |
+
+Decode `pdf_base64` to obtain a searchable PDF with the source image and invisible text.
+The API uses 300 DPI for the image's PDF page dimensions.
+Text output preserves the provider's line breaks and spacing.
+The OpenAI-compatible backend requests plain text without JSON or coordinates for text output.
+Combined output makes two provider calls: one for PDF polygons and one for plain text.
+Other plugins provide text from their regions, with one line per region.
+Invalid output choices return 422.
+The API processes one image per request.
+
+```console
+curl http://127.0.0.1:8000/ocr/openai-compatible \
+  -F image=@page.png -F model=deepseek -F output=text -F languages=en -F languages=pt
+```
+
+Set provider options in `backends.openai-compatible.options` in the JSON configuration.
+Set `model_aliases` to map aliases such as `deepseek` and `glm-ocr` to exact provider model IDs.
+The built-in `glm-ocr` alias uses `zai-org/GLM-OCR`.
+Select an endpoint that serves that model, or change the alias to your provider's model ID.
+The [GLM-OCR model card](https://huggingface.co/zai-org/GLM-OCR) describes its server setup and supported prompts.
+For PDF output, the endpoint must return text polygons in the requested JSON format.
+Model IDs, including a leading `~`, pass to the provider unchanged.
+The built-in `deepseek` alias uses the existing default model. Configuration can replace that alias.
+Unknown aliases pass through as model IDs. Alias resolution uses one lookup.
+The CLI also accepts `--backend-option 'model_aliases={"deepseek":"~deepseek/your-model"}'`.
+Clients can select a model on backends that allow it. Server configuration controls endpoint URLs and credential environment variables.
+A backend allows the `model` field when its entry-point factory declares `request_options = frozenset({"model"})`.
+The `openai-compatible` backend declares it. Other backends reject the `model` field with 422.
+
+The OpenAI-compatible backend exposes `await backend.recognize_async(path)` and `await backend.aclose()`.
+Use `await backend.recognize_text_async(path)` for plain text.
+It shares request construction and response checks with `recognize(path)`.
+The API uses native async calls when the backend provides them.
+It runs synchronous plugins in a worker thread. Each request creates its own backend instance.
+The API closes async clients and removes temporary images after each request.
+
+The default upload limit is 20 MiB. Set `max_image_bytes` to change it.
+Middleware rejects the request body before the multipart parser reads it.
+The body limit is `max_image_bytes` plus 64 KiB for multipart overhead.
+Invalid images return 422; excessive image sizes return 413; backend failures return 502.
+Backend cleanup errors are logged. They do not change the response.
+The server has no authentication. Keep the default local address or put an authenticated proxy before the server.
+Set `SCANWICH_API_CONFIG` to a JSON file path for `uvicorn scanwich.api:create_app --factory`.
+Pydantic Settings loads and checks the configuration.
+Explicit arguments take priority over environment variables, then JSON file values, then defaults.
+Use `SCANWICH_API_MAX_IMAGE_BYTES`, `SCANWICH_API_HOST`, and `SCANWICH_API_PORT` for environment overrides.
+Host and port settings apply to `scanwich-api`. Uvicorn controls its own bind address when you run it directly.
+Use `__` for nested fields, such as `SCANWICH_API_BACKENDS__OPENAI-COMPATIBLE__OPTIONS__MODEL`.
+Pydantic models define the API response schemas in `/docs`.
+Both Nix packages and container targets include the API dependencies and `scanwich-api` command.
+Use `--entrypoint /opt/scanwich/bin/scanwich-api` to start the API in a container.
+Pass `--host 0.0.0.0` and publish port 8000 for container access.
+
+### Hermes and Luna
+
+The `luna` alias resolves to `gpt-5.6-luna`.
+Hermes can route this model through its authenticated `openai-codex` provider.
+Its API runs locally; the model runs through the upstream provider.
+
+Add these routes under `platforms.api_server.extra` in your Hermes configuration:
+
+```yaml
+model_routes:
+  luna:
+    model: gpt-5.6-luna
+    provider: openai-codex
+  gpt-5.6-luna:
+    model: gpt-5.6-luna
+    provider: openai-codex
+```
+
+Enable the Hermes API server and set its `API_SERVER_KEY`.
+Restart the Hermes gateway after the configuration change.
+Set `base_url` in `api.hermes.example.json` to the address of your Hermes API.
+Export the same `API_SERVER_KEY` in the Scanwich environment, then start the API:
+
+```console
+scanwich-api --config api.hermes.example.json
+```
+
+A generated invoice image passed live Luna tests for `text`, `pdf`, and `pdf+text` through Hermes.
+The checks confirmed the invoice number and amount in plain text and searchable PDF text.
+These checks used no private documents.
+
+## PDF notes
 
 - By default, Scanwich infers each page's DPI from a full-page image. It falls back to 300 DPI
   for vector or ambiguous pages and caps inferred values at 300 DPI.

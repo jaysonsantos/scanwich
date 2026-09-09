@@ -1,0 +1,14 @@
+{
+  "backends": {
+    "openai-compatible": {
+      "options": {
+        "base_url": "http://127.0.0.1:8642/v1",
+        "api_key_env": "API_SERVER_KEY",
+        "model": "luna",
+        "timeout": 180,
+        "max_tokens": 4096,
+        "reasoning_effort": null
+      }
+    }
+  }
+}
