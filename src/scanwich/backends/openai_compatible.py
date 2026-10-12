@@ -32,6 +32,8 @@ PIXEL_COORDINATE_TOLERANCE_RATIO = 0.05
 # The provider controls this text, so an error message keeps only a bounded part of it.
 PROVIDER_DETAIL_MAX_CHARACTERS = 500
 TRUNCATION_MARK = "..."
+# Other metadata fields can repeat the request input, so an error message does not have them.
+PROVIDER_ERROR_METADATA_FIELDS = ("error_type", "provider_name", "provider_code", "raw")
 REQUEST_OPTIONS = frozenset({"model"})
 HTTP_REFERER = "https://github.com/jaysonsantos/scanwich"
 APP_TITLE = "Scanwich"
@@ -270,7 +272,7 @@ def _encode_image(image_path: Path) -> tuple[int, int, str]:
 
 
 def _provider_error_detail(error: Any) -> str:
-    """Describe a provider error object by its code and its message only."""
+    """Describe a provider error object by its code, its message, and named metadata fields."""
     if not isinstance(error, Mapping):
         return ""
     details: list[str] = []
@@ -280,6 +282,13 @@ def _provider_error_detail(error: Any) -> str:
     message = error.get("message")
     if isinstance(message, str):
         details.append(f"message={message!r}")
+    metadata = error.get("metadata")
+    if isinstance(metadata, Mapping):
+        details.extend(
+            f"{name}={metadata[name]!r}"
+            for name in PROVIDER_ERROR_METADATA_FIELDS
+            if metadata.get(name) is not None
+        )
     if not details:
         return ""
     return _limit_provider_detail(": provider error " + ", ".join(details))

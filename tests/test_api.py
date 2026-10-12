@@ -516,8 +516,14 @@ class TestApi(TestCase):
             (200, completion, ("service returned invalid JSON", "JSONDecodeError")),
             (
                 200,
-                {"error": {"code": 502, "message": "Provider returned error"}},
-                ("no completion choices: provider error code=502", "Provider returned error"),
+                {
+                    "error": {
+                        "code": 502,
+                        "message": "Provider returned error",
+                        "metadata": {"error_type": "server", "flagged_input": ocr_text},
+                    }
+                },
+                ("no completion choices: provider error code=502", "error_type='server'"),
             ),
             (
                 200,
