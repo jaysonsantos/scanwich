@@ -313,7 +313,13 @@ def create_app(config: ApiConfig | None = None) -> FastAPI:
                     return PdfResponse(pdf_base64=pdf)
                 return PdfTextResponse(pdf_base64=pdf, text=text)
             except Exception as error:
-                logger.warning("OCR backend %s failed: %s", backend_name, type(error).__name__)
+                logger.warning(
+                    "OCR backend %s failed: %s: %s",
+                    backend_name,
+                    type(error).__name__,
+                    error,
+                    exc_info=True,
+                )
                 raise HTTPException(502, "OCR backend failed") from error
             finally:
                 close = getattr(backend, "aclose", None)

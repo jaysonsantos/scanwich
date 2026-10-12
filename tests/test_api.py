@@ -9,7 +9,9 @@ from types import SimpleNamespace
 from unittest import IsolatedAsyncioTestCase, TestCase
 from unittest.mock import AsyncMock, Mock, patch
 
+import httpx
 from fastapi.testclient import TestClient
+from openai import AsyncOpenAI
 from PIL import Image
 from pydantic import ValidationError
 from pypdf import PdfReader
@@ -41,6 +43,20 @@ def pdf_bytes(page_count: int) -> bytes:
         document.showPage()
     document.save()
     return output.getvalue()
+
+
+def provider_client(status_code: int, body: dict, requests: list[httpx.Request]):
+    """Return an AsyncOpenAI factory whose provider answers every request with one response."""
+
+    def provider(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(status_code, json=body)
+
+    def client(**options) -> AsyncOpenAI:
+        transport = httpx.MockTransport(provider)
+        return AsyncOpenAI(**options, http_client=httpx.AsyncClient(transport=transport))
+
+    return client
 
 
 def stem_regions(image_path: Path) -> list[OcrRegion]:
@@ -483,6 +499,53 @@ class TestApi(TestCase):
             self.assertEqual(
                 api.post("/ocr/openai-compatible", files={"image": ("x", b"xx")}).status_code, 413
             )
+
+    def test_backend_failure_log_explains_the_cause(self):
+        api_key = "sk-private-key"
+        ocr_text = "private letter"
+        encoded_page = base64.b64encode(image_bytes()).decode("ascii")
+        regions = {"coordinate_system": "normalized", "regions": [{"text": ocr_text}]}
+        completion = {
+            "choices": [{"finish_reason": "stop", "message": {"content": json.dumps(regions)[:-3]}}]
+        }
+        cases = (
+            (
+                400,
+                {"error": {"message": "image is too large"}},
+                ("request failed for model provider/model", "BadRequestError", "too large"),
+            ),
+            (200, completion, ("service returned invalid JSON", "JSONDecodeError")),
+        )
+        for status_code, body, expected in cases:
+            with self.subTest(status_code=status_code):
+                provider_requests: list[httpx.Request] = []
+                client = provider_client(status_code, body, provider_requests)
+                backend = OpenAICompatibleBackend(
+                    languages=["de"], options={"model": "provider/model"}
+                )
+                with (
+                    patch("scanwich.api.load_backend", return_value=backend),
+                    patch.dict(os.environ, {"OPENROUTER_API_KEY": api_key}),
+                    patch("openai.AsyncOpenAI", client),
+                    TestClient(create_app()) as api,
+                    self.assertLogs("scanwich.api", level="WARNING") as logs,
+                ):
+                    response = api.post(
+                        "/ocr/openai-compatible", files={"image": ("page.png", image_bytes())}
+                    )
+                self.assertEqual(response.status_code, 502)
+                self.assertEqual(response.json(), {"detail": "OCR backend failed"})
+                (record,) = logs.output
+                self.assertIn("OCR backend openai-compatible failed: RuntimeError: ", record)
+                self.assertIn("Traceback (most recent call last)", record)
+                for fragment in expected:
+                    self.assertIn(fragment, record)
+                # The provider received the key and the page, but the log must not repeat them.
+                (request,) = provider_requests
+                self.assertEqual(request.headers["authorization"], f"Bearer {api_key}")
+                self.assertIn(encoded_page, request.content.decode())
+                for private in (api_key, encoded_page, ocr_text):
+                    self.assertNotIn(private, record)
 
 
 class TestAsyncBackend(IsolatedAsyncioTestCase):
