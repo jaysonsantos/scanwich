@@ -184,6 +184,7 @@ class OpenAICompatibleBackend:
                 "OpenAI-compatible completion ended before OCR was complete: "
                 f"finish_reason={finish_reason!r}"
                 + _native_finish_reason_detail(getattr(choice, "native_finish_reason", None))
+                + _provider_error_detail(getattr(choice, "error", None))
             )
         content = getattr(getattr(choice, "message", None), "content", None)
         if not isinstance(content, str) or (not allow_empty and not content.strip()):

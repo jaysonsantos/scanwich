@@ -524,6 +524,11 @@ class TestApi(TestCase):
                 {"choices": [{**choice, "finish_reason": "length", "native_finish_reason": "MAX"}]},
                 ("finish_reason='length', native_finish_reason='MAX'",),
             ),
+            (
+                200,
+                {"choices": [{**choice, "finish_reason": "error", "error": {"code": 502}}]},
+                ("finish_reason='error': provider error code=502",),
+            ),
         )
         for status_code, body, expected in cases:
             with self.subTest(expected=expected):

@@ -201,6 +201,32 @@ class OpenAICompatibleBackendTests(TestCase):
             f"{incomplete}finish_reason='length'",
         )
 
+    def test_reports_provider_error_of_a_choice(self) -> None:
+        stopped = (
+            "OpenAI-compatible completion ended before OCR was complete: "
+            "finish_reason='error', native_finish_reason='error'"
+        )
+        provider_error = {
+            "code": 502,
+            "message": "Upstream timeout",
+            "metadata": {"error_type": "provider_unavailable"},
+        }
+        choice = SimpleNamespace(
+            finish_reason="error",
+            native_finish_reason="error",
+            error=provider_error,
+            message=SimpleNamespace(content="private letter"),
+        )
+        self.assertEqual(
+            str(self.recognition_error(SimpleNamespace(choices=[choice]))),
+            f"{stopped}: provider error code=502, message='Upstream timeout'",
+        )
+        choice.error = {"code": 502, "message": "m" * 2 * PROVIDER_DETAIL_MAX_CHARACTERS}
+        message = str(self.recognition_error(SimpleNamespace(choices=[choice])))
+        self.assertTrue(message.startswith(f"{stopped}: provider error code=502"))
+        self.assertTrue(message.endswith("m..."))
+        self.assertEqual(len(message) - len(stopped), PROVIDER_DETAIL_MAX_CHARACTERS)
+
     def test_requires_api_key_environment_variable(self) -> None:
         with TemporaryDirectory() as temporary_directory:
             image_path = Path(temporary_directory) / "page.png"
