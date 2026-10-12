@@ -29,8 +29,9 @@ DEFAULT_REASONING_EFFORT = "low"
 NORMALIZED_COORDINATE_MAX = 1000.0
 NORMALIZED_COORDINATE_TOLERANCE = 50.0
 PIXEL_COORDINATE_TOLERANCE_RATIO = 0.05
-# One stray point outside the normalized grid also fits a large image. Thus the points are
-# read as pixels only when more than this share of the regions is outside the grid.
+# Points a small distance outside the normalized grid also fit a large image, but they cannot
+# move the middle of a region outside the grid. Thus the points are read as pixels only when
+# the middle of more than this share of the regions is outside the grid.
 PIXEL_FALLBACK_MIN_REGION_SHARE = 0.5
 # The provider controls this text, so an error message keeps only a bounded part of it.
 PROVIDER_DETAIL_MAX_CHARACTERS = 500
@@ -450,7 +451,7 @@ def _select_coordinate_system(
     polygons = [polygon for _, polygon in regions]
     regions_outside_grid = sum(
         not _points_fit(
-            polygon,
+            [_middle(polygon)],
             maximum_x=NORMALIZED_COORDINATE_MAX,
             maximum_y=NORMALIZED_COORDINATE_MAX,
             tolerance_x=NORMALIZED_COORDINATE_TOLERANCE,
@@ -469,8 +470,8 @@ def _select_coordinate_system(
     ):
         return declared
     logger.warning(
-        "OpenAI-compatible service declared normalized coordinates, but %d of %d regions are "
-        "outside the 0-to-%d grid and all points fit the %dx%d pixel image; "
+        "OpenAI-compatible service declared normalized coordinates, but the middle of "
+        "%d of %d regions is outside the 0-to-%d grid and all points fit the %dx%d pixel image; "
         "using the coordinates as pixels",
         regions_outside_grid,
         len(polygons),
@@ -479,6 +480,13 @@ def _select_coordinate_system(
         image_height,
     )
     return "pixels"
+
+
+def _middle(polygon: Sequence[Point]) -> Point:
+    return Point(
+        x=sum(point.x for point in polygon) / len(polygon),
+        y=sum(point.y for point in polygon) / len(polygon),
+    )
 
 
 def _log_points_outside_bounds(

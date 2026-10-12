@@ -317,7 +317,7 @@ class OpenAICompatibleBackendTests(TestCase):
             "regions": [
                 box("private line one", 300, 300, 1800, 360),
                 box("private line two", 300, 1700, 1800, 1760),
-                box("short", 300, 500, 800, 560),
+                box("private line three", 300, 2400, 1800, 2460),
             ],
         }
         with self.assertLogs(LOGGER_NAME, level="WARNING") as logs:
@@ -327,16 +327,39 @@ class OpenAICompatibleBackendTests(TestCase):
             [
                 corners(300, 300, 1800, 360),
                 corners(300, 1700, 1800, 1760),
-                corners(300, 500, 800, 560),
+                corners(300, 2400, 1800, 2460),
             ],
         )
         (record,) = logs.output
         self.assertIn(
-            "declared normalized coordinates, but 2 of 3 regions are outside the 0-to-1000 grid "
-            "and all points fit the 2000x3000 pixel image; using the coordinates as pixels",
+            "declared normalized coordinates, but the middle of 2 of 3 regions is outside the "
+            "0-to-1000 grid and all points fit the 2000x3000 pixel image; "
+            "using the coordinates as pixels",
             record,
         )
         self.assertNotIn("private", record)
+
+    def test_keeps_normalized_scaling_when_regions_are_partly_outside_the_grid(self) -> None:
+        # All these points also fit the image, so only the middle of a region shows pixels.
+        pages = (
+            [box("private text", 100, 100, 1051, 130)],
+            [box("private text", 100, 100 * row, 1060, 100 * row + 30) for row in range(1, 9)],
+        )
+        for page in pages:
+            with self.subTest(regions=len(page)):
+                payload = {"coordinate_system": "normalized", "regions": page}
+                with self.assertLogs(LOGGER_NAME, level="WARNING") as logs:
+                    regions = self.recognize_payload(payload, (2000, 3000))
+                self.assertEqual(
+                    [region.polygon for region in regions],
+                    [
+                        corners(200, 300 * row, 2000, 300 * row + 90)
+                        for row in range(1, len(page) + 1)
+                    ],
+                )
+                (record,) = logs.output
+                self.assertIn("used coordinate_system=normalized", record)
+                self.assertIn(f"{2 * len(page)} of {4 * len(page)} points outside", record)
 
     def test_keeps_good_regions_of_a_page_with_out_of_bounds_regions(self) -> None:
         payload = {
