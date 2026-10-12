@@ -339,27 +339,41 @@ class OpenAICompatibleBackendTests(TestCase):
         )
         self.assertNotIn("private", record)
 
-    def test_keeps_normalized_scaling_when_regions_are_partly_outside_the_grid(self) -> None:
-        # All these points also fit the image, so only the middle of a region shows pixels.
-        pages = (
-            [box("private text", 100, 100, 1051, 130)],
-            [box("private text", 100, 100 * row, 1060, 100 * row + 30) for row in range(1, 9)],
+    def test_keeps_normalized_scaling_without_clear_evidence_of_pixels(self) -> None:
+        # All these points also fit the image, so only the middle of the regions shows pixels.
+        rows = range(1, 9)
+        cases = (
+            ("one region partly outside", [box("private text", 100, 100, 1051, 130)], 2),
+            (
+                "all regions partly outside",
+                [box("private text", 100, 100 * row, 1060, 100 * row + 30) for row in rows],
+                16,
+            ),
         )
-        for page in pages:
-            with self.subTest(regions=len(page)):
+        for name, page, points_outside in cases:
+            with self.subTest(name):
                 payload = {"coordinate_system": "normalized", "regions": page}
                 with self.assertLogs(LOGGER_NAME, level="WARNING") as logs:
                     regions = self.recognize_payload(payload, (2000, 3000))
                 self.assertEqual(
                     [region.polygon for region in regions],
-                    [
-                        corners(200, 300 * row, 2000, 300 * row + 90)
-                        for row in range(1, len(page) + 1)
-                    ],
+                    [corners(200, 300 * row, 2000, 300 * row + 90) for row in rows][: len(page)],
                 )
                 (record,) = logs.output
                 self.assertIn("used coordinate_system=normalized", record)
-                self.assertIn(f"{2 * len(page)} of {4 * len(page)} points outside", record)
+                self.assertIn(f"{points_outside} of {4 * len(page)} points outside", record)
+
+    def test_keeps_normalized_scaling_for_one_region_with_its_middle_outside(self) -> None:
+        payload = {
+            "coordinate_system": "normalized",
+            "regions": [box("private text", 100, 950, 900, 1200)],
+        }
+        with self.assertLogs(LOGGER_NAME, level="WARNING") as logs:
+            regions = self.recognize_payload(payload, (2000, 3000))
+        self.assertEqual([region.polygon for region in regions], [corners(200, 2850, 1800, 3000)])
+        (record,) = logs.output
+        self.assertIn("used coordinate_system=normalized", record)
+        self.assertIn("2 of 4 points outside, largest distance 200.0", record)
 
     def test_keeps_good_regions_of_a_page_with_out_of_bounds_regions(self) -> None:
         payload = {

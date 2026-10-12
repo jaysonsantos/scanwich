@@ -33,6 +33,8 @@ PIXEL_COORDINATE_TOLERANCE_RATIO = 0.05
 # move the middle of a region outside the grid. Thus the points are read as pixels only when
 # the middle of more than this share of the regions is outside the grid.
 PIXEL_FALLBACK_MIN_REGION_SHARE = 0.5
+# One region is not sufficient evidence against the declared coordinate system.
+PIXEL_FALLBACK_MIN_REGIONS = 2
 # The provider controls this text, so an error message keeps only a bounded part of it.
 PROVIDER_DETAIL_MAX_CHARACTERS = 500
 TRUNCATION_MARK = "..."
@@ -459,7 +461,10 @@ def _select_coordinate_system(
         )
         for polygon in polygons
     )
-    if regions_outside_grid <= len(polygons) * PIXEL_FALLBACK_MIN_REGION_SHARE:
+    if (
+        regions_outside_grid < PIXEL_FALLBACK_MIN_REGIONS
+        or regions_outside_grid <= len(polygons) * PIXEL_FALLBACK_MIN_REGION_SHARE
+    ):
         return declared
     if not _points_fit(
         [point for polygon in polygons for point in polygon],
