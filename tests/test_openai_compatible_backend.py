@@ -311,36 +311,43 @@ class OpenAICompatibleBackendTests(TestCase):
                 self.assertIn(summary, clamped[0])
                 self.assertNotIn("private", "\n".join(logs.output))
 
-    def test_uses_pixels_when_most_regions_only_fit_the_image(self) -> None:
-        payload = {
-            "coordinate_system": "normalized",
-            "regions": [
-                box("private line one", 300, 300, 1800, 360),
-                box("private line two", 300, 1700, 1800, 1760),
-                box("private line three", 300, 2400, 1800, 2460),
-            ],
-        }
-        with self.assertLogs(LOGGER_NAME, level="WARNING") as logs:
-            regions = self.recognize_payload(payload, (2000, 3000))
-        self.assertEqual(
-            [region.polygon for region in regions],
-            [
-                corners(300, 300, 1800, 360),
-                corners(300, 1700, 1800, 1760),
-                corners(300, 2400, 1800, 2460),
-            ],
+    def test_uses_pixels_when_most_regions_are_far_outside_the_grid(self) -> None:
+        cases = (
+            (
+                "portrait page",
+                (2000, 3000),
+                [(300, 300, 1800, 360), (300, 1700, 1800, 1760), (300, 500, 800, 560)],
+                "2 of 3 regions",
+            ),
+            (
+                "landscape page",
+                (2000, 1000),
+                [(100, 100, 1800, 160), (100, 400, 1800, 460), (100, 700, 1800, 760)],
+                "3 of 3 regions",
+            ),
         )
-        (record,) = logs.output
-        self.assertIn(
-            "declared normalized coordinates, but the middle of 2 of 3 regions is outside the "
-            "0-to-1000 grid and all points fit the 2000x3000 pixel image; "
-            "using the coordinates as pixels",
-            record,
-        )
-        self.assertNotIn("private", record)
+        for name, image_size, boxes, share in cases:
+            with self.subTest(name):
+                payload = {
+                    "coordinate_system": "normalized",
+                    "regions": [box("private text", *edges) for edges in boxes],
+                }
+                with self.assertLogs(LOGGER_NAME, level="WARNING") as logs:
+                    regions = self.recognize_payload(payload, image_size)
+                self.assertEqual(
+                    [region.polygon for region in regions], [corners(*edges) for edges in boxes]
+                )
+                (record,) = logs.output
+                self.assertIn(
+                    f"declared normalized coordinates, but {share} are more than 250 units "
+                    f"outside the 0-to-1000 grid and all points fit the "
+                    f"{image_size[0]}x{image_size[1]} pixel image; using the coordinates as pixels",
+                    record,
+                )
+                self.assertNotIn("private", record)
 
     def test_keeps_normalized_scaling_without_clear_evidence_of_pixels(self) -> None:
-        # All these points also fit the image, so only the middle of the regions shows pixels.
+        # All these points also fit the image, but no point is far outside the grid.
         rows = range(1, 9)
         cases = (
             ("one region partly outside", [box("private text", 100, 100, 1051, 130)], 2),
@@ -363,17 +370,23 @@ class OpenAICompatibleBackendTests(TestCase):
                 self.assertIn("used coordinate_system=normalized", record)
                 self.assertIn(f"{points_outside} of {4 * len(page)} points outside", record)
 
-    def test_keeps_normalized_scaling_for_one_region_with_its_middle_outside(self) -> None:
-        payload = {
-            "coordinate_system": "normalized",
-            "regions": [box("private text", 100, 950, 900, 1200)],
-        }
-        with self.assertLogs(LOGGER_NAME, level="WARNING") as logs:
-            regions = self.recognize_payload(payload, (2000, 3000))
-        self.assertEqual([region.polygon for region in regions], [corners(200, 2850, 1800, 3000)])
-        (record,) = logs.output
-        self.assertIn("used coordinate_system=normalized", record)
-        self.assertIn("2 of 4 points outside, largest distance 200.0", record)
+    def test_keeps_normalized_scaling_for_a_page_with_one_region(self) -> None:
+        for bottom in (1200, 1400):
+            with self.subTest(bottom=bottom):
+                payload = {
+                    "coordinate_system": "normalized",
+                    "regions": [box("private text", 100, 950, 900, bottom)],
+                }
+                with self.assertLogs(LOGGER_NAME, level="WARNING") as logs:
+                    regions = self.recognize_payload(payload, (2000, 3000))
+                self.assertEqual(
+                    [region.polygon for region in regions], [corners(200, 2850, 1800, 3000)]
+                )
+                (record,) = logs.output
+                self.assertIn("used coordinate_system=normalized", record)
+                self.assertIn(
+                    f"2 of 4 points outside, largest distance {bottom - 1000:.1f}", record
+                )
 
     def test_keeps_good_regions_of_a_page_with_out_of_bounds_regions(self) -> None:
         payload = {
@@ -382,7 +395,7 @@ class OpenAICompatibleBackendTests(TestCase):
                 box("private good line one", 100, 100, 900, 130),
                 box("private good line two", 100, 200, 900, 230),
                 box("private good line three", 100, 300, 900, 330),
-                box("private bad bottom line", 100, 960, 900, 1200),
+                box("private bad bottom line", 100, 960, 900, 1500),
             ],
         }
         with self.assertLogs(LOGGER_NAME, level="WARNING") as logs:
@@ -408,7 +421,7 @@ class OpenAICompatibleBackendTests(TestCase):
         (record,) = logs.output
         self.assertIn(
             "declared coordinate_system=normalized, used coordinate_system=normalized, "
-            "image=2000x3000 pixels, 2 of 16 points outside, largest distance 200.0",
+            "image=2000x3000 pixels, 2 of 16 points outside, largest distance 500.0",
             record,
         )
         self.assertNotIn("private", record)
