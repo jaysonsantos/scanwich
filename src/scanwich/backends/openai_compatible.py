@@ -29,6 +29,9 @@ DEFAULT_REASONING_EFFORT = "low"
 NORMALIZED_COORDINATE_MAX = 1000.0
 NORMALIZED_COORDINATE_TOLERANCE = 50.0
 PIXEL_COORDINATE_TOLERANCE_RATIO = 0.05
+# One stray point outside the normalized grid also fits a large image. Thus the points are
+# read as pixels only when more than this share of the regions is outside the grid.
+PIXEL_FALLBACK_MIN_REGION_SHARE = 0.5
 # The provider controls this text, so an error message keeps only a bounded part of it.
 PROVIDER_DETAIL_MAX_CHARACTERS = 500
 TRUNCATION_MARK = "..."
@@ -367,9 +370,16 @@ def _parse_regions(payload: Any, *, image_width: int, image_height: int) -> list
         )
         raw_parsed_regions.append((text.strip(), points))
 
-    _validate_coordinate_system(
+    used_coordinate_system = _select_coordinate_system(
         raw_parsed_regions,
-        coordinate_system=coordinate_system,
+        declared=coordinate_system,
+        image_width=image_width,
+        image_height=image_height,
+    )
+    _log_points_outside_bounds(
+        raw_parsed_regions,
+        declared=coordinate_system,
+        coordinate_system=used_coordinate_system,
         image_width=image_width,
         image_height=image_height,
     )
@@ -378,7 +388,7 @@ def _parse_regions(payload: Any, *, image_width: int, image_height: int) -> list
         points = tuple(
             _convert_point(
                 point,
-                coordinate_system=coordinate_system,
+                coordinate_system=used_coordinate_system,
                 region_index=region_index,
                 point_index=point_index,
                 image_width=image_width,
@@ -423,37 +433,93 @@ def _parse_coordinate(value: Any, *, region_index: int, point_index: int) -> flo
     return coordinate
 
 
-def _validate_coordinate_system(
+def _select_coordinate_system(
     regions: Sequence[tuple[str, tuple[Point, ...]]],
     *,
-    coordinate_system: str,
+    declared: str,
     image_width: int,
     image_height: int,
-) -> None:
-    points = [point for _, polygon in regions for point in polygon]
-    if coordinate_system == "normalized":
-        fits = _points_fit(
-            points,
+) -> str:
+    """Return the coordinate system of the points, which can differ from the declared one."""
+    if declared == "pixels":
+        logger.warning(
+            "OpenAI-compatible service returned native pixel coordinates; using them directly"
+        )
+        return declared
+
+    polygons = [polygon for _, polygon in regions]
+    regions_outside_grid = sum(
+        not _points_fit(
+            polygon,
             maximum_x=NORMALIZED_COORDINATE_MAX,
             maximum_y=NORMALIZED_COORDINATE_MAX,
             tolerance_x=NORMALIZED_COORDINATE_TOLERANCE,
             tolerance_y=NORMALIZED_COORDINATE_TOLERANCE,
         )
-    else:
-        fits = _points_fit(
-            points,
-            maximum_x=float(image_width),
-            maximum_y=float(image_height),
-            tolerance_x=image_width * PIXEL_COORDINATE_TOLERANCE_RATIO,
-            tolerance_y=image_height * PIXEL_COORDINATE_TOLERANCE_RATIO,
+        for polygon in polygons
+    )
+    if regions_outside_grid <= len(polygons) * PIXEL_FALLBACK_MIN_REGION_SHARE:
+        return declared
+    if not _points_fit(
+        [point for polygon in polygons for point in polygon],
+        maximum_x=float(image_width),
+        maximum_y=float(image_height),
+        tolerance_x=image_width * PIXEL_COORDINATE_TOLERANCE_RATIO,
+        tolerance_y=image_height * PIXEL_COORDINATE_TOLERANCE_RATIO,
+    ):
+        return declared
+    logger.warning(
+        "OpenAI-compatible service declared normalized coordinates, but %d of %d regions are "
+        "outside the 0-to-%d grid and all points fit the %dx%d pixel image; "
+        "using the coordinates as pixels",
+        regions_outside_grid,
+        len(polygons),
+        NORMALIZED_COORDINATE_MAX,
+        image_width,
+        image_height,
+    )
+    return "pixels"
+
+
+def _log_points_outside_bounds(
+    regions: Sequence[tuple[str, tuple[Point, ...]]],
+    *,
+    declared: str,
+    coordinate_system: str,
+    image_width: int,
+    image_height: int,
+) -> None:
+    """Write one warning for a page that has points outside the bounds of its coordinates."""
+    maximum_x, maximum_y = _coordinate_bounds(
+        coordinate_system, image_width=image_width, image_height=image_height
+    )
+    points = [point for _, polygon in regions for point in polygon]
+    distances = [
+        distance
+        for point in points
+        if (distance := max(-point.x, point.x - maximum_x, -point.y, point.y - maximum_y)) > 0
+    ]
+    if distances:
+        logger.warning(
+            "OpenAI-compatible OCR coordinates are outside their bounds and were clamped: "
+            "declared coordinate_system=%s, used coordinate_system=%s, image=%dx%d pixels, "
+            "%d of %d points outside, largest distance %.1f",
+            declared,
+            coordinate_system,
+            image_width,
+            image_height,
+            len(distances),
+            len(points),
+            max(distances),
         )
 
-    if not fits:
-        raise RuntimeError("OpenAI-compatible OCR coordinates exceed their declared bounds")
-    if coordinate_system == "pixels":
-        logger.warning(
-            "OpenAI-compatible service returned native pixel coordinates; using them directly"
-        )
+
+def _coordinate_bounds(
+    coordinate_system: str, *, image_width: int, image_height: int
+) -> tuple[float, float]:
+    if coordinate_system == "normalized":
+        return NORMALIZED_COORDINATE_MAX, NORMALIZED_COORDINATE_MAX
+    return float(image_width), float(image_height)
 
 
 def _points_fit(
@@ -480,17 +546,9 @@ def _convert_point(
     image_width: int,
     image_height: int,
 ) -> Point:
-    if coordinate_system == "normalized":
-        maximum_x = NORMALIZED_COORDINATE_MAX
-        maximum_y = NORMALIZED_COORDINATE_MAX
-        scale_x = image_width / NORMALIZED_COORDINATE_MAX
-        scale_y = image_height / NORMALIZED_COORDINATE_MAX
-    else:
-        maximum_x = float(image_width)
-        maximum_y = float(image_height)
-        scale_x = 1.0
-        scale_y = 1.0
-
+    maximum_x, maximum_y = _coordinate_bounds(
+        coordinate_system, image_width=image_width, image_height=image_height
+    )
     x = _clamp_coordinate(
         point.x,
         maximum=maximum_x,
@@ -505,7 +563,7 @@ def _convert_point(
         point_index=point_index,
         axis="y",
     )
-    return Point(x=x * scale_x, y=y * scale_y)
+    return Point(x=x * (image_width / maximum_x), y=y * (image_height / maximum_y))
 
 
 def _clamp_coordinate(
@@ -518,7 +576,7 @@ def _clamp_coordinate(
 ) -> float:
     clamped = min(max(coordinate, 0.0), maximum)
     if clamped != coordinate:
-        logger.warning(
+        logger.debug(
             "Clamping OpenAI-compatible OCR region %d point %d %s coordinate %.1f to %.1f",
             region_index,
             point_index,
