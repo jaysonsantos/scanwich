@@ -29,6 +29,9 @@ DEFAULT_REASONING_EFFORT = "low"
 NORMALIZED_COORDINATE_MAX = 1000.0
 NORMALIZED_COORDINATE_TOLERANCE = 50.0
 PIXEL_COORDINATE_TOLERANCE_RATIO = 0.05
+# The provider controls this text, so an error message keeps only a bounded part of it.
+PROVIDER_DETAIL_MAX_CHARACTERS = 500
+TRUNCATION_MARK = "..."
 REQUEST_OPTIONS = frozenset({"model"})
 HTTP_REFERER = "https://github.com/jaysonsantos/scanwich"
 APP_TITLE = "Scanwich"
@@ -170,13 +173,17 @@ class OpenAICompatibleBackend:
     def _completion_content(self, completion: Any, *, allow_empty: bool = False) -> str:
         choices = getattr(completion, "choices", None)
         if not choices:
-            raise RuntimeError("OpenAI-compatible service returned no completion choices")
+            raise RuntimeError(
+                "OpenAI-compatible service returned no completion choices"
+                + _provider_error_detail(getattr(completion, "error", None))
+            )
         choice = choices[0]
         finish_reason = getattr(choice, "finish_reason", None)
         if finish_reason not in {None, "stop"}:
             raise RuntimeError(
                 "OpenAI-compatible completion ended before OCR was complete: "
                 f"finish_reason={finish_reason!r}"
+                + _native_finish_reason_detail(getattr(choice, "native_finish_reason", None))
             )
         content = getattr(getattr(choice, "message", None), "content", None)
         if not isinstance(content, str) or (not allow_empty and not content.strip()):
@@ -259,6 +266,34 @@ def _encode_image(image_path: Path) -> tuple[int, int, str]:
         )
     encoded = base64.b64encode(image_bytes).decode("ascii")
     return width, height, f"data:{mime_type};base64,{encoded}"
+
+
+def _provider_error_detail(error: Any) -> str:
+    """Describe a provider error object by its code and its message only."""
+    if not isinstance(error, Mapping):
+        return ""
+    details: list[str] = []
+    code = error.get("code")
+    if isinstance(code, (int, str)) and not isinstance(code, bool):
+        details.append(f"code={code!r}")
+    message = error.get("message")
+    if isinstance(message, str):
+        details.append(f"message={message!r}")
+    if not details:
+        return ""
+    return _limit_provider_detail(": provider error " + ", ".join(details))
+
+
+def _native_finish_reason_detail(native_finish_reason: Any) -> str:
+    if not isinstance(native_finish_reason, str):
+        return ""
+    return _limit_provider_detail(f", native_finish_reason={native_finish_reason!r}")
+
+
+def _limit_provider_detail(detail: str) -> str:
+    if len(detail) <= PROVIDER_DETAIL_MAX_CHARACTERS:
+        return detail
+    return detail[: PROVIDER_DETAIL_MAX_CHARACTERS - len(TRUNCATION_MARK)] + TRUNCATION_MARK
 
 
 def _parse_json_payload(content: str) -> Any:

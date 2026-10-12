@@ -505,9 +505,8 @@ class TestApi(TestCase):
         ocr_text = "private letter"
         encoded_page = base64.b64encode(image_bytes()).decode("ascii")
         regions = {"coordinate_system": "normalized", "regions": [{"text": ocr_text}]}
-        completion = {
-            "choices": [{"finish_reason": "stop", "message": {"content": json.dumps(regions)[:-3]}}]
-        }
+        choice = {"finish_reason": "stop", "message": {"content": json.dumps(regions)[:-3]}}
+        completion = {"choices": [choice]}
         cases = (
             (
                 400,
@@ -515,9 +514,19 @@ class TestApi(TestCase):
                 ("request failed for model provider/model", "BadRequestError", "too large"),
             ),
             (200, completion, ("service returned invalid JSON", "JSONDecodeError")),
+            (
+                200,
+                {"error": {"code": 502, "message": "Provider returned error"}},
+                ("no completion choices: provider error code=502", "Provider returned error"),
+            ),
+            (
+                200,
+                {"choices": [{**choice, "finish_reason": "length", "native_finish_reason": "MAX"}]},
+                ("finish_reason='length', native_finish_reason='MAX'",),
+            ),
         )
         for status_code, body, expected in cases:
-            with self.subTest(status_code=status_code):
+            with self.subTest(expected=expected):
                 provider_requests: list[httpx.Request] = []
                 client = provider_client(status_code, body, provider_requests)
                 backend = OpenAICompatibleBackend(

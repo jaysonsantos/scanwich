@@ -11,7 +11,11 @@ from unittest.mock import patch
 
 from PIL import Image
 
-from scanwich.backends.openai_compatible import DEFAULT_MODEL, OpenAICompatibleBackend
+from scanwich.backends.openai_compatible import (
+    DEFAULT_MODEL,
+    PROVIDER_DETAIL_MAX_CHARACTERS,
+    OpenAICompatibleBackend,
+)
 from scanwich.models import Point
 
 
@@ -34,6 +38,24 @@ class FakeCompletions:
 
 
 class OpenAICompatibleBackendTests(TestCase):
+    def recognition_error(self, reply: SimpleNamespace) -> RuntimeError:
+        """Return the error that the backend raises for one provider reply."""
+        completions = SimpleNamespace(create=lambda **_: reply)
+        fake_client = SimpleNamespace(chat=SimpleNamespace(completions=completions))
+        fake_openai = SimpleNamespace(OpenAI=lambda **_: fake_client)
+        with TemporaryDirectory() as temporary_directory:
+            image_path = Path(temporary_directory) / "page.png"
+            Image.new("RGB", (10, 10), "white").save(image_path)
+            backend = OpenAICompatibleBackend(languages=["en"], options={})
+
+            with (
+                patch.dict(os.environ, {"OPENROUTER_API_KEY": "test-secret"}),
+                patch.dict(sys.modules, {"openai": fake_openai}),
+                self.assertRaises(RuntimeError) as raised,
+            ):
+                backend.recognize(image_path)
+        return raised.exception
+
     def test_sends_image_and_converts_normalized_polygons_to_pixels(self) -> None:
         payload = {
             "coordinate_system": "normalized",
@@ -143,6 +165,41 @@ class OpenAICompatibleBackendTests(TestCase):
                 self.assertRaisesRegex(RuntimeError, "finish_reason='length'"),
             ):
                 backend.recognize(image_path)
+
+    def test_reports_provider_error_for_a_reply_without_choices(self) -> None:
+        no_choices = "OpenAI-compatible service returned no completion choices"
+        provider_error = {
+            "code": 502,
+            "message": "Provider returned error",
+            "metadata": {"raw": "upstream reply"},
+        }
+        self.assertEqual(
+            str(self.recognition_error(SimpleNamespace(choices=None, error=provider_error))),
+            f"{no_choices}: provider error code=502, message='Provider returned error'",
+        )
+        long_error = {"code": "overloaded", "message": "m" * 2 * PROVIDER_DETAIL_MAX_CHARACTERS}
+        message = str(self.recognition_error(SimpleNamespace(choices=[], error=long_error)))
+        self.assertTrue(message.startswith(f"{no_choices}: provider error code='overloaded'"))
+        self.assertTrue(message.endswith("m..."))
+        self.assertEqual(len(message) - len(no_choices), PROVIDER_DETAIL_MAX_CHARACTERS)
+        for reply in (SimpleNamespace(choices=[]), SimpleNamespace(choices=[], error={})):
+            self.assertEqual(str(self.recognition_error(reply)), no_choices)
+
+    def test_reports_native_finish_reason_without_model_output(self) -> None:
+        incomplete = "OpenAI-compatible completion ended before OCR was complete: "
+        message = SimpleNamespace(content="private letter", refusal="I cannot read this letter")
+        choice = SimpleNamespace(
+            finish_reason="content_filter", native_finish_reason="refusal", message=message
+        )
+        self.assertEqual(
+            str(self.recognition_error(SimpleNamespace(choices=[choice]))),
+            f"{incomplete}finish_reason='content_filter', native_finish_reason='refusal'",
+        )
+        choice = SimpleNamespace(finish_reason="length", native_finish_reason=None, message=message)
+        self.assertEqual(
+            str(self.recognition_error(SimpleNamespace(choices=[choice]))),
+            f"{incomplete}finish_reason='length'",
+        )
 
     def test_requires_api_key_environment_variable(self) -> None:
         with TemporaryDirectory() as temporary_directory:
