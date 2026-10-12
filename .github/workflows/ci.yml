@@ -20,7 +20,7 @@ env:
 jobs:
   lint:
     name: Lint
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     steps:
       - name: Check out repository
         uses: actions/checkout@v7
@@ -46,7 +46,7 @@ jobs:
 
   test:
     name: Test on Python ${{ matrix.python-version }}
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     strategy:
       fail-fast: false
       matrix:
@@ -74,7 +74,7 @@ jobs:
 
   container:
     name: Build openai-compatible image
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     steps:
       - name: Check out repository
         uses: actions/checkout@v7
