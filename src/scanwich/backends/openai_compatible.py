@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import io
 import json
 import logging
 import math
@@ -9,6 +10,7 @@ import os
 import time
 import uuid
 from collections.abc import Mapping, Sequence
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -27,6 +29,50 @@ DEFAULT_API_KEY_ENV = "OPENROUTER_API_KEY"
 DEFAULT_TIMEOUT_SECONDS = 180.0
 DEFAULT_MAX_TOKENS = 65_536
 DEFAULT_REASONING_EFFORT = "low"
+# The first request and the requests that ask the model to correct an unusable reply.
+DEFAULT_MAX_ATTEMPTS = 3
+# A correction request shows the model this many characters before a JSON error.
+JSON_ERROR_CONTEXT_CHARACTERS = 60
+# A reply with one of these errors has content, but the content is not the OCR result.
+UNUSABLE_REPLY_ERRORS = (RuntimeError, TypeError)
+BYTES_PER_MEBIBYTE = 1024 * 1024
+# Some providers reject an image when its base64 text is larger than 5 MiB.
+MAX_IMAGE_BASE64_BYTES = 5 * BYTES_PER_MEBIBYTE
+# Base64 writes 4 characters for each 3 bytes.
+MAX_IMAGE_BYTES = MAX_IMAGE_BASE64_BYTES // 4 * 3
+# The image types that the backend accepts for a page.
+PAGE_IMAGE_MIME_TYPES = frozenset({"image/png", "image/jpeg", "image/webp", "image/gif"})
+# The image type that the backend sends.
+IMAGE_MIME_TYPE = "image/jpeg"
+JPEG_QUALITY = 90
+# Full color resolution keeps the edges of colored text sharp.
+JPEG_SUBSAMPLING = "4:4:4"
+JPEG_MODES = frozenset({"L", "RGB"})
+# The EXIF tag that tells a viewer how to turn the image, and its values that turn it.
+EXIF_ORIENTATION_TAG = 0x0112
+EXIF_TURNED_ORIENTATIONS = range(2, 9)
+# The Pillow modes with integer values start with this name. Of the accepted image types,
+# only a gray PNG with 16 bits for each pixel opens in such a mode.
+INTEGER_MODE = "I"
+SIXTEEN_BIT_GRAY_STEPS_PER_8_BIT_STEP = 256
+BILEVEL_MODE = "1"
+# The decoded page image and its copies can use this much memory. An RGB page of about
+# 44 million pixels has this size.
+MAX_IMAGE_WORKING_BYTES = 512 * BYTES_PER_MEBIBYTE
+# Pillow stores one pixel of these modes in 1 byte,
+ONE_BYTE_MODES = frozenset({"1", "L", "P"})
+# one pixel of the modes with this name at the start in 2 bytes, and one pixel of the
+# other modes in 4 bytes.
+TWO_BYTE_MODE = "I;16"
+# A resize to a smaller image makes one temporary image and the result. The two are
+# smaller than the image.
+RESIZE_COPIES = 2
+ALPHA_BAND = "A"
+# Pillow puts the transparent palette entry or the transparent color of a file in this field.
+TRANSPARENCY_INFO = "transparency"
+# A too-large image becomes this much smaller than the size limit needs. The size of a
+# JPEG is not exactly proportional to its number of pixels.
+IMAGE_SCALE_MARGIN = 0.9
 NORMALIZED_COORDINATE_MAX = 1000.0
 PIXEL_COORDINATE_TOLERANCE_RATIO = 0.05
 # Points a small distance outside the normalized grid also fit a large image. Thus the points
@@ -39,6 +85,8 @@ PIXEL_FALLBACK_MIN_REGIONS = 2
 # The provider controls this text, so an error message keeps only a bounded part of it.
 PROVIDER_DETAIL_MAX_CHARACTERS = 500
 TRUNCATION_MARK = "..."
+# The values of finish_reason that the chat-completions API defines for an incomplete reply.
+FINISH_REASONS = frozenset({"length", "content_filter", "tool_calls", "function_call", "error"})
 # Other metadata fields can repeat the request input, so an error message does not have them.
 PROVIDER_ERROR_METADATA_FIELDS = ("error_type", "provider_name", "provider_code", "raw")
 REQUEST_OPTIONS = frozenset({"model"})
@@ -48,6 +96,18 @@ APP_TITLE = "Scanwich"
 SESSION_ID_HEADER = "X-Session-Id"
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class RequestImage:
+    """A page image in the form that the service receives."""
+
+    width: int
+    height: int
+    data_url: str
+    # The page image is this many times larger than the image in the request.
+    page_scale_x: float
+    page_scale_y: float
 
 
 class OpenAICompatibleBackend:
@@ -81,6 +141,11 @@ class OpenAICompatibleBackend:
             "reasoning_effort",
             DEFAULT_REASONING_EFFORT,
         )
+        self._max_attempts = _pop_positive_integer(
+            option_values,
+            "max_attempts",
+            DEFAULT_MAX_ATTEMPTS,
+        )
         if option_values:
             unsupported = ", ".join(sorted(option_values))
             raise TypeError(f"unsupported OpenAI-compatible backend option(s): {unsupported}")
@@ -92,36 +157,60 @@ class OpenAICompatibleBackend:
         self._session_requests_with_cost = 0
 
     def recognize(self, image_path: Path) -> list[OcrRegion]:
-        width, height, image_data_url = _encode_image(image_path)
+        image = _encode_image(image_path)
         client = self._get_client()
-        request = self._request(width, height, image_data_url)
-        logger.info("Sending page image to OpenAI-compatible model %s", self._model)
-        started_at = time.monotonic()
-        try:
-            completion = client.chat.completions.create(**request)
-        except Exception as error:
-            raise RuntimeError(
-                f"OpenAI-compatible request failed for model {self._model}: {error}"
-            ) from error
-        logger.info(
-            "OpenAI-compatible response received after %.1f seconds", time.monotonic() - started_at
-        )
-        self._log_cost(completion)
-        return self._parse_completion(completion, width, height)
+        request = self._request(image)
+        attempt = 1
+        while True:
+            logger.info("Sending page image to OpenAI-compatible model %s", self._model)
+            started_at = time.monotonic()
+            try:
+                completion = client.chat.completions.create(**request)
+            except Exception as error:
+                if attempt > 1:
+                    raise self._correction_request_error(error, attempt) from None
+                raise RuntimeError(
+                    f"OpenAI-compatible request failed for model {self._model}: {error}"
+                ) from error
+            logger.info(
+                "OpenAI-compatible response received after %.1f seconds",
+                time.monotonic() - started_at,
+            )
+            self._log_cost(completion)
+            content = self._completion_content(completion, provider_text=attempt == 1)
+            try:
+                return self._parse_reply(content, image, attempt)
+            except UNUSABLE_REPLY_ERRORS as error:
+                self._log_unusable_reply(error, attempt)
+                if attempt == self._max_attempts:
+                    raise
+                request = _correction_request(request, content, error)
+                attempt += 1
 
     async def recognize_async(self, image_path: Path) -> list[OcrRegion]:
-        width, height, image_data_url = await asyncio.to_thread(_encode_image, image_path)
+        image = await asyncio.to_thread(_encode_image, image_path)
         client = self._get_client(asynchronous=True)
-        try:
-            completion = await client.chat.completions.create(
-                **self._request(width, height, image_data_url)
-            )
-        except Exception as error:
-            raise RuntimeError(
-                f"OpenAI-compatible request failed for model {self._model}"
-            ) from error
-        self._log_cost(completion)
-        return self._parse_completion(completion, width, height)
+        request = self._request(image)
+        attempt = 1
+        while True:
+            try:
+                completion = await client.chat.completions.create(**request)
+            except Exception as error:
+                if attempt > 1:
+                    raise self._correction_request_error(error, attempt) from None
+                raise RuntimeError(
+                    f"OpenAI-compatible request failed for model {self._model}"
+                ) from error
+            self._log_cost(completion)
+            content = self._completion_content(completion, provider_text=attempt == 1)
+            try:
+                return self._parse_reply(content, image, attempt)
+            except UNUSABLE_REPLY_ERRORS as error:
+                self._log_unusable_reply(error, attempt)
+                if attempt == self._max_attempts:
+                    raise
+                request = _correction_request(request, content, error)
+                attempt += 1
 
     async def aclose(self) -> None:
         if self._async_client is not None:
@@ -129,11 +218,11 @@ class OpenAICompatibleBackend:
             self._async_client = None
 
     async def recognize_text_async(self, image_path: Path) -> str:
-        width, height, image_data_url = await asyncio.to_thread(_encode_image, image_path)
+        image = await asyncio.to_thread(_encode_image, image_path)
         client = self._get_client(asynchronous=True)
         try:
             completion = await client.chat.completions.create(
-                **self._request(width, height, image_data_url, plain_text=True)
+                **self._request(image, plain_text=True)
             )
         except Exception as error:
             raise RuntimeError(
@@ -142,9 +231,8 @@ class OpenAICompatibleBackend:
         self._log_cost(completion)
         return self._completion_content(completion, allow_empty=True)
 
-    def _request(
-        self, width: int, height: int, image_data_url: str, *, plain_text: bool = False
-    ) -> dict[str, Any]:
+    def _request(self, image: RequestImage, *, plain_text: bool = False) -> dict[str, Any]:
+        width, height = image.width, image.height
         request: dict[str, Any] = {
             "model": self._model,
             "messages": [
@@ -161,7 +249,7 @@ class OpenAICompatibleBackend:
                         {"type": "text", "text": self._prompt(width=width, height=height)},
                         {
                             "type": "image_url",
-                            "image_url": {"url": image_data_url},
+                            "image_url": {"url": image.data_url},
                         },
                     ],
                 },
@@ -184,25 +272,75 @@ class OpenAICompatibleBackend:
 
         return request
 
-    def _parse_completion(self, completion: Any, width: int, height: int) -> list[OcrRegion]:
-        payload = _parse_json_payload(self._completion_content(completion))
-        return _parse_regions(payload, image_width=width, image_height=height)
+    def _parse_reply(self, content: str, image: RequestImage, attempt: int) -> list[OcrRegion]:
+        payload = _parse_json_payload(content)
+        regions = _parse_regions(payload, image_width=image.width, image_height=image.height)
+        if attempt > 1:
+            logger.info(
+                "OpenAI-compatible model %s corrected its reply in attempt %d of %d",
+                self._model,
+                attempt,
+                self._max_attempts,
+            )
+        return _scale_regions(regions, image)
 
-    def _completion_content(self, completion: Any, *, allow_empty: bool = False) -> str:
+    def _log_unusable_reply(self, error: Exception, attempt: int) -> None:
+        logger.warning(
+            "OpenAI-compatible model %s returned an unusable reply in attempt %d of %d (%s: %s)",
+            self._model,
+            attempt,
+            self._max_attempts,
+            type(error).__name__,
+            _defect_summary(error),
+        )
+
+    def _correction_request_error(self, error: Exception, attempt: int) -> RuntimeError:
+        """Return the error for a correction request that failed, without provider text.
+
+        A correction request has text from the model reply, and a provider can repeat request
+        input in its error.
+        """
+        status_code = getattr(error, "status_code", None)
+        status = f", HTTP status {status_code}" if isinstance(status_code, int) else ""
+        return RuntimeError(
+            f"OpenAI-compatible request failed for model {self._model} in attempt {attempt} of "
+            f"{self._max_attempts}: {type(error).__name__}{status}"
+        )
+
+    def _completion_content(
+        self, completion: Any, *, allow_empty: bool = False, provider_text: bool = True
+    ) -> str:
+        """Return the text of the reply.
+
+        A correction request has text from the model reply, and a provider can repeat request
+        input in an error. Thus an error has text from the provider only when
+        `provider_text` is true.
+        """
         choices = getattr(completion, "choices", None)
         if not choices:
             raise RuntimeError(
                 "OpenAI-compatible service returned no completion choices"
-                + _provider_error_detail(getattr(completion, "error", None))
+                + (
+                    _provider_error_detail(getattr(completion, "error", None))
+                    if provider_text
+                    else ""
+                )
             )
         choice = choices[0]
         finish_reason = getattr(choice, "finish_reason", None)
         if finish_reason not in {None, "stop"}:
+            if provider_text:
+                detail = (
+                    f"finish_reason={finish_reason!r}"
+                    + _native_finish_reason_detail(getattr(choice, "native_finish_reason", None))
+                    + _provider_error_detail(getattr(choice, "error", None))
+                )
+            elif finish_reason in FINISH_REASONS:
+                detail = f"finish_reason={finish_reason!r}"
+            else:
+                detail = "finish_reason=unknown"
             raise RuntimeError(
-                "OpenAI-compatible completion ended before OCR was complete: "
-                f"finish_reason={finish_reason!r}"
-                + _native_finish_reason_detail(getattr(choice, "native_finish_reason", None))
-                + _provider_error_detail(getattr(choice, "error", None))
+                "OpenAI-compatible completion ended before OCR was complete: " + detail
             )
         content = getattr(getattr(choice, "message", None), "content", None)
         if not isinstance(content, str) or (not allow_empty and not content.strip()):
@@ -287,24 +425,206 @@ class OpenAICompatibleBackend:
         )
 
 
-def _encode_image(image_path: Path) -> tuple[int, int, str]:
+def _encode_image(image_path: Path) -> RequestImage:
+    """Return the page image as a JPEG that is not larger than the provider limit."""
     try:
-        with image_path.open("rb") as image_file:
-            with Image.open(image_file) as image:
-                width, height = image.size
-                mime_type = Image.MIME.get(image.format or "")
-            image_file.seek(0)
-            image_bytes = image_file.read()
+        with Image.open(image_path) as page_image:
+            page_width, page_height = page_image.size
+            if page_width <= 0 or page_height <= 0:
+                raise RuntimeError(
+                    f"OCR page image has invalid dimensions: {page_width}x{page_height}"
+                )
+            mime_type = Image.MIME.get(page_image.format or "")
+            if mime_type not in PAGE_IMAGE_MIME_TYPES:
+                raise RuntimeError(
+                    "OpenAI-compatible service does not support image type "
+                    f"{mime_type or 'unknown'}"
+                )
+            # Pillow knows the size and the mode before it decodes the pixels.
+            working_bytes = _working_bytes(page_image)
+            if working_bytes > MAX_IMAGE_WORKING_BYTES:
+                raise RuntimeError(
+                    f"OCR page image of {page_width}x{page_height} pixels needs "
+                    f"{math.ceil(working_bytes / BYTES_PER_MEBIBYTE)} MiB of memory, and the limit "
+                    f"is {MAX_IMAGE_WORKING_BYTES // BYTES_PER_MEBIBYTE} MiB; "
+                    "use a lower DPI or a smaller image"
+                )
+            orientation = _exif_orientation(page_image)
+            image = _jpeg_mode_image(page_image)
+            jpeg = _jpeg_bytes(image, orientation)
+            while len(jpeg) > MAX_IMAGE_BYTES and image.size != (1, 1):
+                ratio = math.sqrt(MAX_IMAGE_BYTES / len(jpeg)) * IMAGE_SCALE_MARGIN
+                size = (max(1, round(image.width * ratio)), max(1, round(image.height * ratio)))
+                image = image.resize(size, Image.Resampling.LANCZOS)
+                jpeg = _jpeg_bytes(image, orientation)
     except OSError as error:
         raise RuntimeError(f"could not read OCR page image {image_path}: {error}") from error
-    if width <= 0 or height <= 0:
-        raise RuntimeError(f"OCR page image has invalid dimensions: {width}x{height}")
-    if mime_type not in {"image/png", "image/jpeg", "image/webp", "image/gif"}:
-        raise RuntimeError(
-            f"OpenAI-compatible service does not support image type {mime_type or 'unknown'}"
+    if image.size != (page_width, page_height):
+        logger.warning(
+            "OpenAI-compatible page image of %dx%d pixels is too large for one request; "
+            "sending it as %dx%d pixels (%d bytes)",
+            page_width,
+            page_height,
+            image.width,
+            image.height,
+            len(jpeg),
         )
-    encoded = base64.b64encode(image_bytes).decode("ascii")
-    return width, height, f"data:{mime_type};base64,{encoded}"
+    encoded = base64.b64encode(jpeg).decode("ascii")
+    return RequestImage(
+        width=image.width,
+        height=image.height,
+        data_url=f"data:{IMAGE_MIME_TYPE};base64,{encoded}",
+        page_scale_x=page_width / image.width,
+        page_scale_y=page_height / image.height,
+    )
+
+
+def _jpeg_mode_image(image: Image.Image) -> Image.Image:
+    """Return the image in a mode that JPEG has. White replaces transparent pixels.
+
+    `_conversion_copy_modes` gives the copies that this function makes.
+    """
+    if image.mode in JPEG_MODES:
+        return image
+    if image.mode.startswith(INTEGER_MODE):
+        # Pillow does not scale these values in a conversion. It limits them to 255.
+        to_8_bits = 1 / SIXTEEN_BIT_GRAY_STEPS_PER_8_BIT_STEP
+        return image.point(lambda value: value * to_8_bits).convert("L")
+    if image.mode == BILEVEL_MODE:
+        return image.convert("L")
+    if not _has_transparency(image):
+        return image.convert("RGB")
+    # A conversion to the mode of the image makes a copy that is not necessary.
+    rgba = image if image.mode == "RGBA" else image.convert("RGBA")
+    opaque = Image.new("RGB", rgba.size, "white")
+    opaque.paste(rgba, mask=rgba)
+    return opaque
+
+
+def _conversion_copy_modes(image: Image.Image) -> tuple[str, ...]:
+    """Return the modes of the copies that `_jpeg_mode_image` makes. The last one is the result."""
+    if image.mode in JPEG_MODES:
+        return ()
+    if image.mode.startswith(INTEGER_MODE):
+        return (image.mode, "L")
+    if image.mode == BILEVEL_MODE:
+        return ("L",)
+    if not _has_transparency(image) or image.mode == "RGBA":
+        return ("RGB",)
+    return ("RGBA", "RGB")
+
+
+def _has_transparency(image: Image.Image) -> bool:
+    return ALPHA_BAND in image.getbands() or TRANSPARENCY_INFO in image.info
+
+
+def _pixel_bytes(mode: str) -> int:
+    """Return the number of bytes that Pillow uses for one pixel of the mode."""
+    if mode in ONE_BYTE_MODES:
+        return 1
+    if mode.startswith(TWO_BYTE_MODE):
+        return 2
+    return 4
+
+
+def _working_bytes(image: Image.Image) -> int:
+    """Return an upper limit of the memory for the pixels of the page image and its copies.
+
+    The copies are the copies of the conversion to a JPEG mode, and the copies of a resize
+    when the JPEG is too large.
+    """
+    copy_modes = _conversion_copy_modes(image)
+    jpeg_mode = copy_modes[-1] if copy_modes else image.mode
+    bytes_per_pixel = (
+        _pixel_bytes(image.mode)
+        + sum(_pixel_bytes(mode) for mode in copy_modes)
+        + RESIZE_COPIES * _pixel_bytes(jpeg_mode)
+    )
+    return image.width * image.height * bytes_per_pixel
+
+
+def _exif_orientation(image: Image.Image) -> int | None:
+    """Return the EXIF orientation of the image when it tells a viewer to turn the image."""
+    try:
+        orientation = image.getexif().get(EXIF_ORIENTATION_TAG)
+    except Exception:
+        # Damaged metadata must not stop the OCR of the page. The record has no error text,
+        # because that text can have metadata of the image.
+        logger.debug("Could not read the EXIF data of a page image")
+        return None
+    return orientation if orientation in EXIF_TURNED_ORIENTATIONS else None
+
+
+def _jpeg_bytes(image: Image.Image, orientation: int | None) -> bytes:
+    """Return the image as a JPEG. The JPEG has the EXIF orientation and no other metadata."""
+    options: dict[str, Any] = {}
+    if orientation is not None:
+        # The service got this tag with the page image file before the backend made a JPEG.
+        # Without the tag, the service gets a turned page.
+        exif = Image.Exif()
+        exif[EXIF_ORIENTATION_TAG] = orientation
+        options["exif"] = exif
+    output = io.BytesIO()
+    image.save(output, format="JPEG", quality=JPEG_QUALITY, subsampling=JPEG_SUBSAMPLING, **options)
+    return output.getvalue()
+
+
+def _scale_regions(regions: list[OcrRegion], image: RequestImage) -> list[OcrRegion]:
+    """Convert regions from the pixels of the request image to the pixels of the page image."""
+    if image.page_scale_x == 1 and image.page_scale_y == 1:
+        return regions
+    return [
+        replace(
+            region,
+            polygon=tuple(
+                Point(x=point.x * image.page_scale_x, y=point.y * image.page_scale_y)
+                for point in region.polygon
+            ),
+        )
+        for region in regions
+    ]
+
+
+def _correction_request(request: dict[str, Any], content: str, error: Exception) -> dict[str, Any]:
+    """Return the request that shows the model its unusable reply and asks for a new one.
+
+    With a temperature of 0, the model mostly repeats the defect for the same request.
+    Thus the model gets its reply and the defect.
+    """
+    return {
+        **request,
+        "messages": [
+            *request["messages"],
+            {"role": "assistant", "content": content},
+            {"role": "user", "content": _correction_prompt(error)},
+        ],
+    }
+
+
+def _defect_summary(error: Exception) -> str:
+    """Describe an unusable reply for a log record, without text of the reply."""
+    if isinstance(error.__cause__, json.JSONDecodeError):
+        return f"{error}: {error.__cause__}"
+    return str(error)
+
+
+def _correction_prompt(error: Exception) -> str:
+    """Describe an unusable reply to the model. This text can have parts of the reply."""
+    cause = error.__cause__
+    if isinstance(cause, json.JSONDecodeError):
+        context = cause.doc[max(0, cause.pos - JSON_ERROR_CONTEXT_CHARACTERS) : cause.pos]
+        defect = (
+            f"it is not valid JSON ({cause.msg}). "
+            f"The JSON parser stopped directly after this text: {context}"
+        )
+    else:
+        defect = str(error)
+    return (
+        f"Your last reply cannot be used: {defect}\n"
+        "Return the complete JSON object again, in the shape that the first message gives. "
+        'In a JSON string, write a double quote as \\" and a backslash as \\\\. '
+        "Return only the JSON object."
+    )
 
 
 def _provider_error_detail(error: Any) -> str:

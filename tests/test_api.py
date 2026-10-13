@@ -1,6 +1,7 @@
 import asyncio
 import base64
 import io
+import itertools
 import json
 import logging
 import os
@@ -47,12 +48,20 @@ def pdf_bytes(page_count: int) -> bytes:
     return output.getvalue()
 
 
-def provider_client(status_code: int, body: dict, requests: list[httpx.Request]):
-    """Return an AsyncOpenAI factory whose provider answers every request with one response."""
+def provider_client(status_code: int, body: dict | list, requests: list[httpx.Request]):
+    """Return an AsyncOpenAI factory whose provider answers every request with one response.
+
+    A list gives one response for each request, in sequence. An item of the list is a body,
+    or a response that has its own status code.
+    """
+    bodies = iter(body) if isinstance(body, list) else itertools.repeat(body)
 
     def provider(request: httpx.Request) -> httpx.Response:
         requests.append(request)
-        return httpx.Response(status_code, json=body)
+        reply = next(bodies)
+        if isinstance(reply, httpx.Response):
+            return reply
+        return httpx.Response(status_code, json=reply)
 
     def client(**options) -> AsyncOpenAI:
         transport = httpx.MockTransport(provider)
@@ -505,7 +514,6 @@ class TestApi(TestCase):
     def test_backend_failure_log_explains_the_cause(self):
         api_key = "sk-private-key"
         ocr_text = "private letter"
-        encoded_page = base64.b64encode(image_bytes()).decode("ascii")
         regions = {"coordinate_system": "normalized", "regions": [{"text": ocr_text}]}
         choice = {"finish_reason": "stop", "message": {"content": json.dumps(regions)[:-3]}}
         completion = {"choices": [choice]}
@@ -514,8 +522,11 @@ class TestApi(TestCase):
                 400,
                 {"error": {"message": "image is too large"}},
                 ("request failed for model provider/model", "BadRequestError", "too large"),
+                1,
+                0,
             ),
-            (200, completion, ("service returned invalid JSON", "JSONDecodeError")),
+            # The backend asks the model to correct a reply that is not valid JSON.
+            (200, completion, ("service returned invalid JSON", "JSONDecodeError"), 3, 3),
             (
                 200,
                 {
@@ -526,19 +537,25 @@ class TestApi(TestCase):
                     }
                 },
                 ("no completion choices: provider error code=502", "error_type='server'"),
+                1,
+                0,
             ),
             (
                 200,
                 {"choices": [{**choice, "finish_reason": "length", "native_finish_reason": "MAX"}]},
                 ("finish_reason='length', native_finish_reason='MAX'",),
+                1,
+                0,
             ),
             (
                 200,
                 {"choices": [{**choice, "finish_reason": "error", "error": {"code": 502}}]},
                 ("finish_reason='error': provider error code=502",),
+                1,
+                0,
             ),
         )
-        for status_code, body, expected in cases:
+        for status_code, body, expected, request_count, unusable_replies in cases:
             with self.subTest(expected=expected):
                 provider_requests: list[httpx.Request] = []
                 client = provider_client(status_code, body, provider_requests)
@@ -550,24 +567,31 @@ class TestApi(TestCase):
                     patch.dict(os.environ, {"OPENROUTER_API_KEY": api_key}),
                     patch("openai.AsyncOpenAI", client),
                     TestClient(create_app()) as api,
-                    self.assertLogs("scanwich.api", level="WARNING") as logs,
+                    self.assertLogs("scanwich", level="WARNING") as logs,
                 ):
                     response = api.post(
                         "/ocr/openai-compatible", files={"image": ("page.png", image_bytes())}
                     )
                 self.assertEqual(response.status_code, 502)
                 self.assertEqual(response.json(), {"detail": "OCR backend failed"})
-                (record,) = logs.output
+                *unusable, record = logs.output
+                self.assertEqual(len(unusable), unusable_replies)
+                for line in unusable:
+                    self.assertIn("returned an unusable reply in attempt", line)
                 self.assertIn("OCR backend openai-compatible failed: RuntimeError: ", record)
                 self.assertIn("Traceback (most recent call last)", record)
                 for fragment in expected:
                     self.assertIn(fragment, record)
                 # The provider received the key and the page, but the log must not repeat them.
-                (request,) = provider_requests
-                self.assertEqual(request.headers["authorization"], f"Bearer {api_key}")
-                self.assertIn(encoded_page, request.content.decode())
-                for private in (api_key, encoded_page, ocr_text):
-                    self.assertNotIn(private, record)
+                self.assertEqual(len(provider_requests), request_count)
+                for request in provider_requests:
+                    self.assertEqual(request.headers["authorization"], f"Bearer {api_key}")
+                    messages = json.loads(request.content)["messages"]
+                    page_url = messages[1]["content"][1]["image_url"]["url"]
+                    prefix, encoded_page = page_url.split(",")
+                    self.assertEqual(prefix, "data:image/jpeg;base64")
+                    for private in (api_key, encoded_page, ocr_text):
+                        self.assertNotIn(private, "\n".join(logs.output))
 
     def post_pdf(self, provider_body: dict, *, pages: int, output: str):
         """Return the response, the provider requests, and the cost records for one PDF."""
@@ -644,6 +668,92 @@ class TestApi(TestCase):
         )
         for record in logs.output:
             self.assertNotIn("private letter", record)
+
+    def test_corrected_reply_gives_the_document_and_the_cost_of_each_request(self):
+        def body(content: str, cost: float) -> dict:
+            choice = {"finish_reason": "stop", "message": {"content": content}}
+            return {"choices": [choice], "usage": {"cost": cost}}
+
+        corners = ((100, 100), (900, 100), (900, 150), (100, 150))
+        polygon = [{"x": x, "y": y} for x, y in corners]
+        region = {"text": 'private „letter" end', "polygon": polygon}
+        good = json.dumps(
+            {"coordinate_system": "normalized", "regions": [region]}, ensure_ascii=False
+        )
+        unusable = good.replace('\\"', '"')
+
+        response, provider_requests, cost_records = self.post_pdf(
+            [body(unusable, 0.002), body(good, 0.003)], pages=1, output="pdf"
+        )
+
+        self.assertEqual(response.status_code, 200, response.text)
+        pdf = PdfReader(io.BytesIO(base64.b64decode(response.json()["pdf_base64"])))
+        self.assertIn('private „letter" end', pdf.pages[0].extract_text())
+        first, second = (json.loads(request.content) for request in provider_requests)
+        self.assertEqual(second["messages"][:2], first["messages"])
+        self.assertEqual(second["messages"][2], {"role": "assistant", "content": unusable})
+        self.assertIn("it is not valid JSON", second["messages"][3]["content"])
+        self.assertEqual(len({request.headers["x-session-id"] for request in provider_requests}), 1)
+        self.assertEqual(len(cost_records), 2)
+        self.assertIn(
+            "usage.cost=0.003000 for this request, total 0.005000 for 2 request(s)",
+            cost_records[-1],
+        )
+
+    def test_failed_correction_request_does_not_log_provider_text(self):
+        ocr_text = "private letter"
+        content = '{"coordinate_system": "normalized", "regions": [{"text": "private" letter"}]}'
+        unusable = {"choices": [{"finish_reason": "stop", "message": {"content": content}}]}
+        # The correction request has the reply, and a provider can repeat request input.
+        moderation = {
+            "error": {
+                "code": 403,
+                "message": "Input was flagged",
+                "metadata": {"reasons": ["other"], "flagged_input": ocr_text},
+            }
+        }
+        provider_error = {
+            "error": {"code": 502, "message": f"flagged {ocr_text}", "metadata": {"raw": ocr_text}}
+        }
+        cases = (
+            (
+                httpx.Response(403, json=moderation),
+                (
+                    "OpenAI-compatible request failed for model provider/model in attempt 2 "
+                    "of 3: PermissionDeniedError, HTTP status 403"
+                ),
+            ),
+            # An error with HTTP 200 has no exception from the client.
+            (provider_error, "OpenAI-compatible service returned no completion choices\n"),
+        )
+        for correction_reply, expected in cases:
+            with self.subTest(expected=expected):
+                provider_requests: list[httpx.Request] = []
+                client = provider_client(200, [unusable, correction_reply], provider_requests)
+                backend = OpenAICompatibleBackend(
+                    languages=["en"], options={"model": "provider/model"}
+                )
+                with (
+                    patch("scanwich.api.load_backend", return_value=backend),
+                    patch.dict(os.environ, {"OPENROUTER_API_KEY": "sk-private-key"}),
+                    patch("openai.AsyncOpenAI", client),
+                    TestClient(create_app()) as api,
+                    self.assertLogs("scanwich", level="WARNING") as logs,
+                ):
+                    response = api.post(
+                        "/ocr/openai-compatible", files={"file": ("page.png", image_bytes())}
+                    )
+
+                self.assertEqual(response.status_code, 502)
+                self.assertEqual(len(provider_requests), 2)
+                self.assertIn(ocr_text.split()[0], provider_requests[1].content.decode())
+                _, record = logs.output
+                self.assertIn(
+                    f"OCR backend openai-compatible failed: RuntimeError: {expected}", record
+                )
+                for line in logs.output:
+                    self.assertNotIn("private", line)
+                    self.assertNotIn("flagged", line)
 
     def test_cost_of_an_unusable_reply_is_logged(self):
         choice = {"finish_reason": "length", "message": {"content": "{"}}
@@ -774,4 +884,22 @@ class TestAsyncBackend(IsolatedAsyncioTestCase):
                 backend.recognize(path)
             with self.assertRaisesRegex(RuntimeError, "finish_reason"):
                 await backend.recognize_async(path)
-        self.assertEqual(sync_create.call_args.kwargs, async_create.call_args.kwargs)
+            self.assertEqual(sync_create.call_args.kwargs, async_create.call_args.kwargs)
+
+            # The two methods also send the same request to correct an unusable reply.
+            replies = [
+                SimpleNamespace(
+                    choices=[
+                        SimpleNamespace(finish_reason="stop", message=SimpleNamespace(content=text))
+                    ]
+                )
+                for text in ('{"regions": [}', '{"coordinate_system": "normalized", "regions": []}')
+            ]
+            for create in (sync_create, async_create):
+                create.reset_mock()
+                create.side_effect = replies
+            self.assertEqual(backend.recognize(path), [])
+            self.assertEqual(await backend.recognize_async(path), [])
+        self.assertEqual(len(sync_create.call_args_list), 2)
+        self.assertEqual(len(sync_create.call_args.kwargs["messages"]), 4)
+        self.assertEqual(sync_create.call_args_list, async_create.call_args_list)
