@@ -12,6 +12,26 @@
         "x86_64-linux"
       ];
       forAllSystems = nixpkgs.lib.genAttrs supportedSystems;
+      # The package and the development shell use the same dependency lists.
+      runtimeDependencies =
+        pythonPackages: withEasyocr:
+        with pythonPackages;
+        [
+          openai
+          fastapi
+          pydantic
+          pydantic-settings
+          uvicorn
+          python-multipart
+          pillow
+          pypdfium2
+          reportlab
+        ]
+        ++ nixpkgs.lib.optionals withEasyocr [ pythonPackages.easyocr ];
+      testDependencies = pythonPackages: [
+        pythonPackages.pypdf
+        pythonPackages.httpx
+      ];
     in
     {
       packages = forAllSystems (
@@ -28,29 +48,13 @@
               src = self;
 
               build-system = [ python.pkgs.setuptools ];
-              dependencies =
-                with python.pkgs;
-                [
-                  openai
-                  fastapi
-                  pydantic
-                  pydantic-settings
-                  uvicorn
-                  python-multipart
-                  pillow
-                  pypdfium2
-                  reportlab
-                ]
-                ++ pkgs.lib.optionals withEasyocr [ python.pkgs.easyocr ];
+              dependencies = runtimeDependencies python.pkgs withEasyocr;
 
               postPatch = pkgs.lib.optionalString (!withEasyocr) ''
                 substituteInPlace pyproject.toml \
                   --replace-fail 'easyocr = "scanwich.backends.easyocr:factory"' ""
               '';
-              nativeCheckInputs = [
-                python.pkgs.pypdf
-                python.pkgs.httpx
-              ];
+              nativeCheckInputs = testDependencies python.pkgs;
 
               checkPhase = ''
                 runHook preCheck
@@ -98,15 +102,31 @@
         system:
         let
           pkgs = nixpkgs.legacyPackages.${system};
+          python = pkgs.python3;
+          project = (builtins.fromTOML (builtins.readFile ./pyproject.toml)).project;
+          # An editable install: Python imports `src/` of the working tree, and the commands
+          # and the backend entry points are available. The shell does not build the package,
+          # so a test that fails does not prevent the shell. `nix flake check` runs the tests.
+          editablePackage = python.pkgs.mkPythonEditablePackage {
+            pname = project.name;
+            inherit (project) version scripts entry-points;
+            # Python expands the variable when it starts. The shell hook sets it.
+            root = "$REPO_ROOT/src";
+          };
+          pythonEnvironment = python.withPackages (
+            pythonPackages:
+            [ editablePackage ] ++ runtimeDependencies pythonPackages true ++ testDependencies pythonPackages
+          );
         in
         {
           default = pkgs.mkShell {
-            inputsFrom = [ self.packages.${system}.default ];
             packages = [
-              self.packages.${system}.default
-              pkgs.python3Packages.pypdf
-              pkgs.python3Packages.ruff
+              pythonEnvironment
+              python.pkgs.ruff
             ];
+            shellHook = ''
+              export REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+            '';
           };
         }
       );
