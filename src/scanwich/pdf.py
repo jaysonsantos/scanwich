@@ -51,42 +51,8 @@ def rasterize_pdf(
     try:
         page_count = len(document)
         for page_index in range(page_count):
-            page = document[page_index]
-            try:
-                width_points, height_points = (float(value) for value in page.get_size())
-                page_dpi, dpi_source = _select_page_dpi(
-                    page,
-                    width_points=width_points,
-                    height_points=height_points,
-                    requested_dpi=dpi,
-                )
-                logger.info(
-                    "Rasterizing page %d/%d at %.1f DPI (%s)",
-                    page_index + 1,
-                    page_count,
-                    page_dpi,
-                    dpi_source,
-                )
-                bitmap = page.render(scale=page_dpi / POINTS_PER_INCH, rev_byteorder=True)
-                try:
-                    image_path = output_directory / f"page-{page_index:06d}.png"
-                    bitmap.to_pil().save(
-                        image_path,
-                        format="PNG",
-                        compress_level=PNG_COMPRESSION_LEVEL,
-                    )
-                finally:
-                    bitmap.close()
-                pages.append(
-                    RasterizedPage(
-                        image_path=image_path,
-                        width_points=width_points,
-                        height_points=height_points,
-                        dpi=page_dpi,
-                    )
-                )
-            finally:
-                page.close()
+            image_path = output_directory / f"page-{page_index:06d}.png"
+            pages.append(_rasterize_page(document, page_index, page_count, image_path, dpi))
     except (OSError, ValueError, pdfium.PdfiumError) as error:
         raise PdfPipelineError(f"PDFium could not rasterize {input_pdf}: {error}") from error
     finally:
@@ -95,6 +61,78 @@ def rasterize_pdf(
     if not pages:
         raise PdfPipelineError(f"PDFium found no pages in {input_pdf}")
     return pages
+
+
+def rasterize_pdf_page(
+    input_pdf: Path,
+    page_index: int,
+    image_path: Path,
+    *,
+    dpi: int | None = None,
+) -> RasterizedPage:
+    """Rasterize one page of a PDF to an image file. The first page has the index 0.
+
+    A caller that needs the pages one at a time uses this function, so that the images
+    of all pages do not exist at the same time. PDFium does not permit calls at the same
+    time, so the caller makes one call after the other.
+    """
+    try:
+        document = pdfium.PdfDocument(input_pdf)
+    except (OSError, pdfium.PdfiumError) as error:
+        raise PdfPipelineError(f"PDFium could not open {input_pdf}: {error}") from error
+    try:
+        page_count = len(document)
+        if not 0 <= page_index < page_count:
+            raise PdfPipelineError(
+                f"{input_pdf} has {page_count} page(s), and no page {page_index + 1}"
+            )
+        return _rasterize_page(document, page_index, page_count, image_path, dpi)
+    except (OSError, ValueError, pdfium.PdfiumError) as error:
+        raise PdfPipelineError(f"PDFium could not rasterize {input_pdf}: {error}") from error
+    finally:
+        document.close()
+
+
+def _rasterize_page(
+    document: pdfium.PdfDocument,
+    page_index: int,
+    page_count: int,
+    image_path: Path,
+    dpi: int | None,
+) -> RasterizedPage:
+    page = document[page_index]
+    try:
+        width_points, height_points = (float(value) for value in page.get_size())
+        page_dpi, dpi_source = _select_page_dpi(
+            page,
+            width_points=width_points,
+            height_points=height_points,
+            requested_dpi=dpi,
+        )
+        logger.info(
+            "Rasterizing page %d/%d at %.1f DPI (%s)",
+            page_index + 1,
+            page_count,
+            page_dpi,
+            dpi_source,
+        )
+        bitmap = page.render(scale=page_dpi / POINTS_PER_INCH, rev_byteorder=True)
+        try:
+            bitmap.to_pil().save(
+                image_path,
+                format="PNG",
+                compress_level=PNG_COMPRESSION_LEVEL,
+            )
+        finally:
+            bitmap.close()
+        return RasterizedPage(
+            image_path=image_path,
+            width_points=width_points,
+            height_points=height_points,
+            dpi=page_dpi,
+        )
+    finally:
+        page.close()
 
 
 def count_pdf_pages(input_pdf: Path) -> int:
