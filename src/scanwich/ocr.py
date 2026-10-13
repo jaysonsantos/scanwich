@@ -59,6 +59,63 @@ class FigureLocator(Protocol):
         """
 
 
+@runtime_checkable
+class AsyncLayoutBackend(Protocol):
+    """Contract of a provider that reads more than one page at the same time.
+
+    A provider implements it in addition to `LayoutBackend`. A document writer then
+    awaits this method from the tasks of one event loop, for some pages at the same time.
+    A provider with only `recognize_layout` gets one call at a time, in a thread.
+
+    When the provider has a coroutine method `aclose()`, the document writer awaits it
+    before the event loop ends, so that the provider can close its connections.
+    """
+
+    async def recognize_layout_async(
+        self, image_path: Path, *, upright: bool = False
+    ) -> PageLayout:
+        """Recognize the blocks of one page image, as `recognize_layout` does."""
+
+
+@runtime_checkable
+class AsyncFigureLocator(Protocol):
+    """Contract of a provider that finds the boxes of illustrations at the same time.
+
+    A provider implements it in addition to `FigureLocator`.
+    """
+
+    async def locate_figure_async(
+        self, image_path: Path, *, estimate: Box | None = None, caption: str | None = None
+    ) -> FigureLocation | None:
+        """Find one illustration in an image, as `locate_figure` does."""
+
+
+@runtime_checkable
+class LayoutSettings(Protocol):
+    """Contract of a provider that tells which settings change the layout of a page."""
+
+    def layout_settings(self) -> Mapping[str, Any]:
+        """Return the settings of the provider that change a page layout, as JSON values.
+
+        Examples are the model and the languages. A document writer puts them in the
+        record of a saved layout, and tells the user when a saved layout is from other
+        settings. The values must have no secret.
+        """
+
+
+class RateLimitError(RuntimeError):
+    """The service answers that it gets too many requests.
+
+    A provider raises this error from a layout request or a figure request. A document
+    writer then makes all its requests wait, and sends the request again. `retry_after`
+    is the wait in seconds that the service asks for, when the provider knows it.
+    """
+
+    def __init__(self, message: str, *, retry_after: float | None = None) -> None:
+        super().__init__(message)
+        self.retry_after = retry_after
+
+
 class OcrBackendFactory(Protocol):
     """Callable that builds a backend.
 

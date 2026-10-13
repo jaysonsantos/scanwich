@@ -27,6 +27,7 @@ from scanwich.layout import (
     plain_text,
 )
 from scanwich.models import OcrRegion, Point
+from scanwich.ocr import RateLimitError
 
 DEFAULT_MODEL = "deepseek/deepseek-v4-flash-vision-exp"
 DEFAULT_MODEL_ALIASES = {
@@ -117,6 +118,10 @@ HTTP_REFERER = "https://github.com/jaysonsantos/scanwich"
 APP_TITLE = "Scanwich"
 # OpenRouter groups the requests that have the same value of this header.
 SESSION_ID_HEADER = "X-Session-Id"
+# The HTTP status of a service that gets too many requests, and the header that has the
+# wait in seconds that the service asks for.
+RATE_LIMIT_STATUS = 429
+RETRY_AFTER_HEADER = "retry-after"
 
 logger = logging.getLogger(__name__)
 
@@ -217,14 +222,47 @@ class OpenAICompatibleBackend:
         only this one task. `estimate` and `caption` tell the model which illustration to
         find when the image shows more than one.
         """
-        image = _encode_image(image_path)
+        request = self._figure_request(_encode_image(image_path), estimate, caption)
+        # One call is one request. The caller has a limit for its calls, and a
+        # correction request for each of them would multiply that limit.
+        return self._complete(request, self._parse_figure_reply, max_attempts=1)
+
+    async def recognize_layout_async(
+        self, image_path: Path, *, upright: bool = False
+    ) -> PageLayout:
+        """Return the blocks of one page, as `recognize_layout` does.
+
+        A caller awaits this method for some pages at the same time. The image encode
+        uses the processor, so it is in a thread.
+        """
+        image = await asyncio.to_thread(_encode_image, image_path)
+        request = self._request(image, layout=True, upright=upright)
+        return await self._complete_async(request, self._parse_layout_reply)
+
+    async def locate_figure_async(
+        self, image_path: Path, *, estimate: Box | None = None, caption: str | None = None
+    ) -> FigureLocation | None:
+        """Return the box of one illustration, as `locate_figure` does."""
+        image = await asyncio.to_thread(_encode_image, image_path)
+        request = self._figure_request(image, estimate, caption)
+        return await self._complete_async(request, self._parse_figure_reply, max_attempts=1)
+
+    def layout_settings(self) -> dict[str, Any]:
+        """Return the settings that change the layout of a page."""
+        return {
+            "model": self._layout_model,
+            "reasoning_effort": self._layout_reasoning_effort,
+            "languages": list(self._languages),
+        }
+
+    def _figure_request(
+        self, image: RequestImage, estimate: Box | None, caption: str | None
+    ) -> dict[str, Any]:
         request = self._request(image, figure=True)
         request["messages"][1]["content"][0]["text"] = self._figure_prompt(
             width=image.width, height=image.height, estimate=estimate, caption=caption
         )
-        # One call is one request. The caller has a limit for its calls, and a
-        # correction request for each of them would multiply that limit.
-        return self._complete(request, self._parse_figure_reply, max_attempts=1)
+        return request
 
     def _complete(
         self,
@@ -249,6 +287,57 @@ class OpenAICompatibleBackend:
             try:
                 completion = client.chat.completions.create(**request)
             except Exception as error:
+                if attempt > 1:
+                    raise self._correction_request_error(error, attempt, model, limit) from None
+                raise RuntimeError(
+                    f"OpenAI-compatible request failed for model {model}: {error}"
+                ) from error
+            logger.info(
+                "OpenAI-compatible response received after %.1f seconds",
+                time.monotonic() - started_at,
+            )
+            self._log_usage(completion, model)
+            content = self._completion_content(completion, provider_text=attempt == 1)
+            try:
+                result = parse(content)
+            except UNUSABLE_REPLY_ERRORS as error:
+                self._log_unusable_reply(error, attempt, model, limit)
+                if attempt == limit:
+                    raise
+                request = _correction_request(request, content, error)
+                attempt += 1
+            else:
+                self._log_corrected_reply(attempt, model, limit)
+                return result
+
+    async def _complete_async(
+        self,
+        request: dict[str, Any],
+        parse: Callable[[str], Result],
+        *,
+        max_attempts: int | None = None,
+    ) -> Result:
+        """Send a request with the async client, as `_complete` does.
+
+        A service that answers that it gets too many requests gives `RateLimitError`,
+        so that the caller can make all its requests wait.
+        """
+        model = request["model"]
+        client = self._get_client(asynchronous=True, model=model)
+        limit = self._max_attempts if max_attempts is None else max_attempts
+        attempt = 1
+        while True:
+            logger.info("Sending page image to OpenAI-compatible model %s", model)
+            started_at = time.monotonic()
+            try:
+                completion = await client.chat.completions.create(**request)
+            except Exception as error:
+                if getattr(error, "status_code", None) == RATE_LIMIT_STATUS:
+                    raise RateLimitError(
+                        f"OpenAI-compatible request failed for model {model}: the service "
+                        f"gets too many requests (HTTP status {RATE_LIMIT_STATUS})",
+                        retry_after=_retry_after_seconds(error),
+                    ) from error
                 if attempt > 1:
                     raise self._correction_request_error(error, attempt, model, limit) from None
                 raise RuntimeError(
@@ -885,6 +974,16 @@ def _scale_regions(regions: list[OcrRegion], image: RequestImage) -> list[OcrReg
         )
         for region in regions
     ]
+
+
+def _retry_after_seconds(error: Exception) -> float | None:
+    """Return the wait that the response of a service asks for, when it is a number."""
+    headers = getattr(getattr(error, "response", None), "headers", None)
+    try:
+        seconds = float(headers.get(RETRY_AFTER_HEADER))
+    except (AttributeError, TypeError, ValueError):
+        return None
+    return seconds if math.isfinite(seconds) and seconds >= 0 else None
 
 
 def _correction_request(request: dict[str, Any], content: str, error: Exception) -> dict[str, Any]:
