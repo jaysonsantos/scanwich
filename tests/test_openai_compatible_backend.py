@@ -2,12 +2,14 @@ import base64
 import json
 import os
 import sys
+import uuid
+from collections.abc import Sequence
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 from typing import Any
 from unittest import TestCase
-from unittest.mock import patch
+from unittest.mock import ANY, patch
 
 from PIL import Image
 
@@ -93,6 +95,34 @@ class OpenAICompatibleBackendTests(TestCase):
                 backend.recognize(image_path)
         return raised.exception
 
+    def cost_records(self, usages: Sequence[Any]) -> tuple[str, list[str]]:
+        """Return the session ID and the cost records of a backend with one request per usage."""
+        content = json.dumps({"coordinate_system": "normalized", "regions": []})
+        choice = SimpleNamespace(finish_reason="stop", message=SimpleNamespace(content=content))
+        replies = iter([SimpleNamespace(choices=[choice], usage=usage) for usage in usages])
+        completions = SimpleNamespace(create=lambda **_: next(replies))
+        client_options: dict[str, Any] = {}
+
+        def make_client(**options: Any) -> SimpleNamespace:
+            client_options.update(options)
+            return SimpleNamespace(chat=SimpleNamespace(completions=completions))
+
+        fake_openai = SimpleNamespace(OpenAI=make_client)
+        with TemporaryDirectory() as temporary_directory:
+            image_path = Path(temporary_directory) / "page.png"
+            Image.new("RGB", (10, 10), "white").save(image_path)
+            backend = OpenAICompatibleBackend(languages=["en"], options={})
+
+            with (
+                patch.dict(os.environ, {"OPENROUTER_API_KEY": "test-secret"}),
+                patch.dict(sys.modules, {"openai": fake_openai}),
+                self.assertLogs(LOGGER_NAME, level="INFO") as logs,
+            ):
+                for _ in usages:
+                    backend.recognize(image_path)
+        session_id = client_options["default_headers"]["X-Session-Id"]
+        return session_id, [record for record in logs.output if "usage.cost" in record]
+
     def test_sends_image_and_converts_normalized_polygons_to_pixels(self) -> None:
         payload = {
             "coordinate_system": "normalized",
@@ -147,6 +177,7 @@ class OpenAICompatibleBackendTests(TestCase):
                     "default_headers": {
                         "HTTP-Referer": "https://github.com/jaysonsantos/scanwich",
                         "X-Title": "Scanwich",
+                        "X-Session-Id": ANY,
                     },
                 }
             ],
@@ -263,6 +294,59 @@ class OpenAICompatibleBackendTests(TestCase):
         self.assertTrue(message.startswith(f"{stopped}: provider error code=502"))
         self.assertTrue(message.endswith("m..."))
         self.assertEqual(len(message) - len(stopped), PROVIDER_DETAIL_MAX_CHARACTERS)
+
+    def test_sends_one_session_id_for_all_requests_of_a_backend(self) -> None:
+        completions = FakeCompletions(
+            json.dumps({"coordinate_system": "normalized", "regions": []})
+        )
+        client_headers: list[dict[str, str] | None] = []
+
+        def make_client(**options: Any) -> SimpleNamespace:
+            client_headers.append(options.get("default_headers"))
+            return SimpleNamespace(chat=SimpleNamespace(completions=completions))
+
+        fake_openai = SimpleNamespace(OpenAI=make_client)
+        with (
+            TemporaryDirectory() as temporary_directory,
+            patch.dict(os.environ, {"OPENROUTER_API_KEY": "test-secret"}),
+            patch.dict(sys.modules, {"openai": fake_openai}),
+        ):
+            image_path = Path(temporary_directory) / "page.png"
+            Image.new("RGB", (10, 10), "white").save(image_path)
+            for options in ({}, {}, {"base_url": "https://example.invalid/v1"}):
+                backend = OpenAICompatibleBackend(languages=["en"], options=options)
+                backend.recognize(image_path)
+                backend.recognize(image_path)
+
+        # One client, and thus one header value, serves the two requests of a backend.
+        self.assertEqual(len(completions.calls), 6)
+        first, second, other_service = client_headers
+        session_id = first["X-Session-Id"]
+        self.assertEqual(str(uuid.UUID(session_id)), session_id)
+        self.assertNotEqual(second["X-Session-Id"], session_id)
+        self.assertIsNone(other_service)
+
+    def test_logs_the_cost_of_each_request_and_the_session_total(self) -> None:
+        session_id, records = self.cost_records(
+            [SimpleNamespace(cost=0.0012), None, SimpleNamespace(cost=0.003)]
+        )
+
+        prefix = (
+            f"INFO:{LOGGER_NAME}:OpenAI-compatible session {session_id}, model {DEFAULT_MODEL}: "
+        )
+        self.assertEqual(
+            records,
+            [
+                prefix + "usage.cost=0.001200 for this request, total 0.001200 for 1 request(s)",
+                prefix + "usage.cost=0.003000 for this request, total 0.004200 for 2 request(s)",
+            ],
+        )
+
+    def test_logs_no_cost_when_the_service_reports_none(self) -> None:
+        usages = [None, SimpleNamespace()]
+        usages += [SimpleNamespace(cost=cost) for cost in (None, "0.1", True, float("nan"), -1.0)]
+
+        self.assertEqual(self.cost_records(usages)[1], [])
 
     def test_requires_api_key_environment_variable(self) -> None:
         with TemporaryDirectory() as temporary_directory:

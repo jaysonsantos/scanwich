@@ -151,6 +151,21 @@ scanwich input.pdf output.pdf \
 Page images are base64-encoded and sent to the configured service and its selected model
 provider. Do not use this backend for documents that must remain local.
 
+One backend instance is one session. It makes one random session ID.
+The CLI and the API make one backend instance for each document.
+With the default `base_url`, the backend sends that ID in the `X-Session-Id` header of each request.
+OpenRouter then shows the requests of one document as one session.
+Other services do not receive the header.
+
+When a response has `usage.cost`, the backend writes one `INFO` log record for the request.
+The record has the session ID, the model, the cost of the request, and the total of the session.
+The last record of a session thus has the cost of the document. OpenRouter reports the cost in credits.
+A failed request has no `usage.cost`, so the total does not include it.
+
+```text
+INFO: OpenAI-compatible session 2f0c6f0e-5d0b-4c53-9d57-3f6a4f1f6f0a, model provider/vision-model: usage.cost=0.001500 for this request, total 0.003000 for 2 request(s)
+```
+
 ## HTTP API
 
 Install the API and a backend:
@@ -224,6 +239,8 @@ Set `max_dpi` to change the DPI ceiling for the `dpi` field.
 Invalid images and PDFs return 422; oversized uploads and excessive page counts return 413;
 backend failures return 502.
 Backend cleanup errors are logged. They do not change the response.
+`scanwich-api` writes log records of level `INFO` and higher to standard error.
+When you run Uvicorn directly, set its `--log-config` option to see the `INFO` records of Scanwich.
 The server has no authentication. Keep the default local address or put an authenticated proxy before the server.
 Set `SCANWICH_API_CONFIG` to a JSON file path for `uvicorn scanwich.api:create_app --factory`.
 Pydantic Settings loads and checks the configuration.
