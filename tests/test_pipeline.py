@@ -472,7 +472,13 @@ class LatexConversionTests(TestCase):
         backend = FakeLayoutBackend(PageLayout(), PageLayout(blocks=(Paragraph("Text."),)))
 
         with self.assertLogs(LOGGER_NAME, level="WARNING") as captured_logs:
-            convert_to_latex(input_pdf, output_tex, backend=backend, dpi=72)
+            convert_to_latex(
+                input_pdf,
+                output_tex,
+                backend=backend,
+                dpi=72,
+                ocr_output_directory=self.directory / "layout",
+            )
 
         self.assertEqual(
             captured_logs.output,

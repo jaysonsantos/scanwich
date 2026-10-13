@@ -1,5 +1,7 @@
 import io
 import logging
+import signal
+import time
 from contextlib import redirect_stderr
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -11,6 +13,7 @@ from PIL import Image
 from scanwich.cli import main
 from scanwich.layout import PageLayout, Paragraph
 from scanwich.models import OcrRegion
+from scanwich.pipeline import ConversionStopped
 
 
 class RegionBackend:
@@ -156,6 +159,8 @@ class CliTests(TestCase):
             ocr_output_directory=Path("layout"),
             ignore_saved_layouts=False,
             parallel_pages=4,
+            # These signals stop the conversion as Ctrl-C does.
+            stop_signals=(signal.SIGTERM, signal.SIGHUP),
         )
         with patch("scanwich.cli.convert_to_latex") as convert_to_latex:
             exit_code, _ = self.run_main(
@@ -311,6 +316,85 @@ class CliTests(TestCase):
             )
         self.assertEqual(exit_code, 130)
         self.assertIn("so there is no new document.\n", log_output)
+
+    def test_signals_of_a_closed_terminal_and_of_the_system_stop_as_ctrl_c_does(self) -> None:
+        # A book needs 40 minutes or more. A closed terminal and a lost connection are
+        # probable in that time.
+        output = self.directory / "page.tex"
+        for number, name, exit_code in (
+            (signal.SIGTERM, "SIGTERM", 143),
+            (signal.SIGHUP, "SIGHUP", 129),
+        ):
+            with (
+                self.subTest(signal=name),
+                patch("scanwich.cli.convert_to_latex", side_effect=ConversionStopped(number)),
+            ):
+                code, log_output = self.run_main(
+                    [str(self.photo), str(output), "--ocr-output-dir", "layout"],
+                    LayoutCapableBackend(),
+                )
+                self.assertEqual(code, exit_code)
+                self.assertIn(
+                    f"ERROR: The conversion stopped before its end (signal {name}), so there "
+                    "is no new document. The layouts that are complete are in layout: the same "
+                    "command sends requests only for the other pages.",
+                    log_output,
+                )
+                self.assertNotIn("Traceback", log_output)
+
+    def test_real_stop_signal_during_a_conversion(self) -> None:
+        class StoppedBackend(LayoutCapableBackend):
+            """A backend whose second page gets the signal while its request is in work."""
+
+            def recognize_layout(self, image_path: Path, *, upright: bool = False) -> PageLayout:
+                layout = super().recognize_layout(image_path, upright=upright)
+                if len(self.image_sizes) == 2:
+                    signal.raise_signal(signal.SIGTERM)
+                    time.sleep(0.05)
+                return layout
+
+        photos = [self.photo]
+        for number in (2, 3, 4):
+            photos.append(self.directory / f"photo-{number}.png")
+            Image.new("RGB", (40 + number, 20), "white").save(photos[-1])
+        output, layouts = self.directory / "out" / "book.tex", self.directory / "layouts"
+        handler = signal.getsignal(signal.SIGTERM)
+        backend = StoppedBackend()
+
+        exit_code, log_output = self.run_main(
+            [
+                *map(str, photos),
+                str(output),
+                "--ocr-output-dir",
+                str(layouts),
+                "--parallel-pages",
+                "1",
+            ],
+            backend,
+        )
+
+        self.assertEqual(exit_code, 143, log_output)
+        self.assertIn("ERROR: The conversion stopped before its end (signal SIGTERM)", log_output)
+        self.assertNotIn("Traceback", log_output)
+        # The page before the signal is saved, and no later page got a request.
+        self.assertEqual(len(backend.image_sizes), 2)
+        self.assertEqual(len(list(layouts.glob("*.json"))), 1)
+        # No document, and no hidden directory for new illustrations stays.
+        self.assertEqual(list(output.parent.iterdir()), [])
+        # The handler of the caller is in place again.
+        self.assertIs(signal.getsignal(signal.SIGTERM), handler)
+
+    def test_platform_with_no_sighup_has_the_other_stop_signal(self) -> None:
+        output = self.directory / "page.tex"
+        sighup = signal.SIGHUP
+        del signal.SIGHUP
+        try:
+            with patch("scanwich.cli.convert_to_latex") as convert_to_latex:
+                exit_code, _ = self.run_main([str(self.photo), str(output)], LayoutCapableBackend())
+        finally:
+            signal.SIGHUP = sighup
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(convert_to_latex.call_args.kwargs["stop_signals"], (signal.SIGTERM,))
 
     def test_rejects_commands_that_have_no_meaning(self) -> None:
         cases = {

@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import logging
 import os
+import signal
 import sys
 from collections.abc import Sequence
 from pathlib import Path
@@ -19,8 +20,12 @@ from scanwich.pipeline import (
     parse_backend_options,
 )
 
-# The exit code of a command that the user stops with Ctrl-C: 128 and the signal number.
-EXIT_CODE_STOPPED = 130
+# The exit code of a command that a signal stops is this number and the signal number:
+# 130 for Ctrl-C, 143 for SIGTERM, and 129 for SIGHUP.
+EXIT_CODE_SIGNAL_BASE = 128
+# These signals stop LaTeX output as Ctrl-C does. SIGHUP comes when the terminal closes
+# or a connection is lost, which is probable in the hours that a book needs.
+STOP_SIGNAL_NAMES = ("SIGTERM", "SIGHUP")
 
 logger = logging.getLogger(__name__)
 
@@ -35,6 +40,11 @@ class _PageFilter(logging.Filter):
         page = LOG_PAGE.get()
         record.page = f"[{page}] " if page else ""
         return True
+
+
+def _stop_signals() -> tuple[int, ...]:
+    """Return the stop signals that this platform has. Windows has no SIGHUP."""
+    return tuple(getattr(signal, name) for name in STOP_SIGNAL_NAMES if hasattr(signal, name))
 
 
 def _parallel_pages(value: str) -> int:
@@ -226,10 +236,16 @@ def main(argv: Sequence[str] | None = None) -> int:
                     ocr_output_directory=args.ocr_output_dir,
                     ignore_saved_layouts=args.ignore_saved_layouts,
                     parallel_pages=args.parallel_pages or DEFAULT_PARALLEL_PAGES,
+                    stop_signals=_stop_signals(),
                 )
-            except KeyboardInterrupt:
+            except KeyboardInterrupt as stop:
+                # Ctrl-C, or one of the stop signals.
+                signal_number = getattr(stop, "signal_number", signal.SIGINT)
                 logger.error(
-                    "The conversion stopped before its end, so there is no new document.%s",
+                    "The conversion stopped before its end%s, so there is no new document.%s",
+                    ""
+                    if signal_number == signal.SIGINT
+                    else f" (signal {signal.Signals(signal_number).name})",
                     ""
                     if args.ocr_output_dir is None
                     else (
@@ -237,7 +253,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                         "same command sends requests only for the other pages."
                     ),
                 )
-                return EXIT_CODE_STOPPED
+                return EXIT_CODE_SIGNAL_BASE + signal_number
     except (FileNotFoundError, PdfPipelineError, TypeError, ValueError, RuntimeError) as error:
         logger.error("%s", error)
         return 1

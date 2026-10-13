@@ -47,6 +47,7 @@ from scanwich.pipeline import (
     DEFAULT_PARALLEL_PAGES,
     NO_REPLY_PAGES,
     PAGE_QUEUE_SIZE,
+    ConversionStopped,
     OutputDirectoryError,
     PageLayoutError,
     convert_to_latex,
@@ -353,7 +354,63 @@ class ManyInputsTests(BookTestCase):
         for names in (["page01.png", "page02.png", "page10.png"], ["b.png", "a.png", "c.png"]):
             with self.subTest(names=names), self.assertNoLogs(LOGGER_NAME, level="WARNING"):
                 inputs = [self.photo(number, name) for number, name in enumerate(names, start=1)]
-                self.convert(inputs, PageBackend(), ocr_output_directory=None)
+                self.convert(inputs, PageBackend())
+
+    def test_name_with_a_digit_that_is_not_a_decimal_digit(self) -> None:
+        # `str.isdigit` is true for such a character, and `int` does not read it.
+        names = ["1\u00b23.png", "10\u00b2.png", "a\u00b2b.png", "\u0663.png"]
+        inputs = [self.photo(number, name) for number, name in enumerate(names, start=1)]
+        backend = PageBackend()
+        self.convert(inputs, backend, parallel_pages=1)
+        self.assertEqual(backend.requests, [1, 2, 3, 4])
+
+    def test_conversion_of_many_pages_that_saves_no_layouts_warns_at_its_start(self) -> None:
+        # A failure at page 199 of 200 loses 198 layouts. The user must know this before
+        # the first request, not after the failure.
+        with self.assertLogs(LOGGER_NAME, level="INFO") as captured_logs:
+            self.convert(self.photos(3), PageBackend(), ocr_output_directory=None)
+        warning = (
+            f"WARNING:{LOGGER_NAME}:The conversion has 3 pages and saves no layouts: a failure "
+            "at one page loses the layouts of the pages before it. With --ocr-output-dir "
+            "DIRECTORY, a new run sends requests only for the pages that have no saved layout"
+        )
+        self.assertIn(warning, captured_logs.output)
+        first_request = next(
+            index
+            for index, record in enumerate(captured_logs.output)
+            if "Recognizing the layout of page" in record
+        )
+        self.assertLess(captured_logs.output.index(warning), first_request)
+
+        # One page has no pages before it, and a conversion that saves its layouts loses none.
+        with self.assertNoLogs(LOGGER_NAME, level="WARNING"):
+            self.convert(self.photos(1), PageBackend(), ocr_output_directory=None)
+            self.convert(self.photos(3), PageBackend())
+
+    def test_caller_with_a_running_event_loop_gets_a_clear_error(self) -> None:
+        inputs = self.photos(1)
+        backend = PageBackend()
+
+        async def call_in_the_loop() -> None:
+            self.convert(inputs, backend)
+
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "convert_to_latex starts an event loop of its own, so a thread with a running "
+            "event loop cannot call it; call it from a different thread, for example with "
+            "asyncio.to_thread",
+        ):
+            asyncio.run(call_in_the_loop())
+        self.assertEqual(backend.requests, [])
+        self.assertFalse(self.layouts.exists())
+
+        # The way that the message names.
+        async def call_in_a_thread() -> None:
+            await asyncio.to_thread(self.convert, inputs, backend)
+
+        asyncio.run(call_in_a_thread())
+        self.assertEqual(backend.requests, [1])
+        self.assertIn(text_of(1), self.document())
 
 
 class SavedLayoutTests(BookTestCase):
@@ -851,8 +908,9 @@ class FailedPageTests(BookTestCase):
         self.assertNotIsInstance(raised.exception, PageLayoutError)
         self.assertEqual(str(raised.exception), "the service did not read page 2")
         self.assertEqual(backend.requests, [1, 2])
+        # The first record is the warning at the start of the conversion.
         self.assertEqual(
-            captured_logs.output,
+            captured_logs.output[1:],
             [
                 (
                     f"WARNING:{LOGGER_NAME}:Page 2 failed, and the conversion saves no layouts: "
@@ -1365,6 +1423,79 @@ class ParallelPagesTests(BookTestCase):
         self.convert(inputs, backend)
         self.assertEqual(len(backend.requests), 10 - saved)
         self.assertEqual(self.document().count("\\begin{sourcepage}"), 10)
+
+    def test_stop_signal_gives_the_same_clean_stop_as_ctrl_c(self) -> None:
+        # The signal of a closed terminal and the signal of the system. Without a
+        # handler, such a signal ends the process at once, and the work files stay.
+        for number in (signal.SIGTERM, signal.SIGHUP):
+            with self.subTest(signal=signal.Signals(number).name):
+                inputs = self.photos(10)
+                self.output = self.directory / f"out-{number}" / "book.tex"
+                layouts = self.directory / f"layouts-{number}"
+                work_directory = self.directory / f"work-{number}"
+                work_directory.mkdir()
+                threads_before = threading.active_count()
+
+                def handler_of_the_caller(*arguments: object) -> None:
+                    raise AssertionError("the conversion has the signal")
+
+                handler = signal.signal(number, handler_of_the_caller)
+                self.addCleanup(signal.signal, number, handler)
+
+                def stop_at_page_6(page: int, number: int = number) -> None:
+                    if page == 6:
+                        signal.raise_signal(number)
+
+                backend = AsyncPageBackend(delay=0.03, on_request=stop_at_page_6)
+                with (
+                    patch("tempfile.tempdir", str(work_directory)),
+                    self.assertNoLogs("asyncio", level="WARNING"),
+                    self.assertRaises(ConversionStopped) as raised,
+                ):
+                    self.convert(
+                        inputs,
+                        backend,
+                        parallel_pages=2,
+                        ocr_output_directory=layouts,
+                        stop_signals=(signal.SIGTERM, signal.SIGHUP),
+                    )
+
+                self.assertEqual(raised.exception.signal_number, number)
+                # Ctrl-C has the same type of error, so one handler is for the two.
+                self.assertIsInstance(raised.exception, KeyboardInterrupt)
+                saved = len(list(layouts.glob("*.json")))
+                self.assertIn(saved, (4, 5))
+                self.assertLess(max(backend.requests), 8)
+                # No document, no hidden directory, no work file, no task, and no thread.
+                self.assertEqual(list(self.output.parent.iterdir()), [])
+                self.assertEqual(list(work_directory.iterdir()), [])
+                self.assertEqual(backend.in_flight, 0)
+                self.assertEqual(backend.closed, 1)
+                self.assertEqual(threading.active_count(), threads_before)
+                # The handler of the caller is in place again.
+                self.assertIs(signal.getsignal(number), handler_of_the_caller)
+
+                backend = AsyncPageBackend()
+                self.convert(inputs, backend, ocr_output_directory=layouts)
+                self.assertEqual(len(backend.requests), 10 - saved)
+
+    def test_stop_signals_in_a_thread_that_has_no_signal_handlers(self) -> None:
+        # Only the main thread has signal handlers. The conversion must still work.
+        inputs = self.photos(2)
+        backend = AsyncPageBackend()
+        errors: list[BaseException] = []
+
+        def convert() -> None:
+            try:
+                self.convert(inputs, backend, stop_signals=(signal.SIGTERM, signal.SIGHUP))
+            except BaseException as error:
+                errors.append(error)
+
+        thread = threading.Thread(target=convert)
+        thread.start()
+        thread.join()
+        self.assertEqual(errors, [])
+        self.assertEqual(sorted(backend.requests), [1, 2])
 
 
 class RateLimitTests(BookTestCase):
