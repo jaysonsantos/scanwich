@@ -614,6 +614,37 @@ class TestApi(TestCase):
             )
         self.assertNotEqual(*session_ids)
 
+    def test_warns_when_the_pdf_leaves_out_a_region(self):
+        def region(text: str, top: int, bottom: int) -> dict:
+            corners = ((100, top), (900, top), (900, bottom), (100, bottom))
+            return {"text": text, "polygon": [{"x": x, "y": y} for x, y in corners]}
+
+        # The model put the second region fully below the page.
+        regions = [region("first line", 100, 150), region("private letter", 1200, 1400)]
+        content = json.dumps({"coordinate_system": "normalized", "regions": regions})
+        body = {"choices": [{"finish_reason": "stop", "message": {"content": content}}]}
+        backend = OpenAICompatibleBackend(languages=["en"], options={})
+        with (
+            patch("scanwich.api.load_backend", return_value=backend),
+            patch.dict(os.environ, {"OPENROUTER_API_KEY": "sk-private-key"}),
+            patch("openai.AsyncOpenAI", provider_client(200, body, [])),
+            TestClient(create_app()) as api,
+            self.assertLogs("scanwich", level="WARNING") as logs,
+        ):
+            response = api.post(
+                "/ocr/openai-compatible", files={"file": ("page.png", image_bytes())}
+            )
+
+        self.assertEqual(response.status_code, 200, response.text)
+        clamped, left_out = logs.output
+        self.assertIn("4 of 8 points outside, largest distance 400.0", clamped)
+        self.assertIn(
+            "Page 1: 1 of 2 text region(s) have zero size, so their text is not in the PDF",
+            left_out,
+        )
+        for record in logs.output:
+            self.assertNotIn("private letter", record)
+
     def test_cost_of_an_unusable_reply_is_logged(self):
         choice = {"finish_reason": "length", "message": {"content": "{"}}
         body = {"choices": [choice], "usage": {"cost": 0.02}}
