@@ -181,6 +181,8 @@ class AsyncPageBackend(PageBackend):
 
     async def aclose(self) -> None:
         self.closed += 1
+        # The backend closes its connections after the last request ended.
+        self.in_flight_at_close = self.in_flight
 
 
 class NoRequestBackend(PageBackend):
@@ -960,6 +962,35 @@ class FailedPageTests(BookTestCase):
                 ),
                 error,
             )
+
+    def test_failure_with_no_saved_layouts_cancels_the_pages_in_work(self) -> None:
+        # The conversion has no result then, so each more request is only a cost.
+        # Page 1 fails while the requests of 3 other pages are in work.
+        backend = AsyncPageBackend(failing={1}, delay=0.4, delays={1: 0.1})
+
+        def too_long(*arguments: object) -> None:
+            raise AssertionError("the conversion did not end after the failure of a page")
+
+        # Without the cancel of its tasks, the conversion waits with no end. The test
+        # must then fail, and not wait.
+        handler = signal.signal(signal.SIGALRM, too_long)
+        self.addCleanup(signal.signal, signal.SIGALRM, handler)
+        signal.alarm(10)
+        self.addCleanup(signal.alarm, 0)
+        started = time.monotonic()
+        with (
+            self.assertLogs(LOGGER_NAME, level="WARNING"),
+            self.assertRaisesRegex(RuntimeError, "the service did not read page 1"),
+        ):
+            self.convert(self.photos(12), backend, ocr_output_directory=None, parallel_pages=4)
+
+        # The 3 other pages in work do not come to their end, and no other page starts.
+        self.assertEqual(backend.finished, [1])
+        self.assertEqual(sorted(backend.requests), [1, 2, 3, 4])
+        self.assertEqual(backend.in_flight, 0)
+        # Their requests ended before the backend closed its connections.
+        self.assertEqual((backend.closed, backend.in_flight_at_close), (1, 0))
+        self.assertLess(time.monotonic() - started, 0.4)
 
     def test_conversion_starts_no_more_pages_when_the_service_gives_no_reply(self) -> None:
         # A service that stops in the middle of a book. Without this rule, each later
