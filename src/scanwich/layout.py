@@ -71,7 +71,20 @@ PAGE_FURNITURE_KINDS = (PAGE_HEADER, PAGE_FOOTER, PAGE_NUMBER)
 POSITION_EDGES = ("top", "bottom")
 POSITION_SIDES = ("left", "center", "right")
 POSITIONS = tuple(f"{edge}-{side}" for edge in POSITION_EDGES for side in POSITION_SIDES)
-POSITION_WORDS = {"middle": "center", "centre": "center", "centered": "center"}
+# Other words that name an edge or a side. A word such as "outer" names no side without
+# the side of the page in the book, so it is not here.
+POSITION_WORDS = {
+    "middle": "center",
+    "centre": "center",
+    "centered": "center",
+    "centred": "center",
+    "upper": "top",
+    "head": "top",
+    "header": "top",
+    "lower": "bottom",
+    "foot": "bottom",
+    "footer": "bottom",
+}
 POSITION_SEPARATORS = re.compile(r"[\s_,/-]+")
 # The fields that the layout reads from each JSON object. Text in a different field is
 # content that the layout cannot keep, so it is an error.
@@ -347,8 +360,9 @@ class PageFurniture:
 
     kind: str
     text: str
-    # The place of the text on the page, one of `POSITIONS`. `None` is a place that the
-    # layout does not know.
+    # The place of the text on the page: one of `POSITIONS`, or only an edge or only a
+    # side of them. `None` is a place that the layout does not know. A document writer
+    # gives the usual place to the part that is not known.
     position: str | None = None
 
     def to_json(self) -> dict[str, Any]:
@@ -740,7 +754,9 @@ def _parse_position(value: Any, where: str) -> str | None:
     """Return the place of a running head or a page number, or `None` for no value.
 
     A place has an edge of the page and a side: "top-right". The two words can be in
-    each sequence. A value with other text is an error.
+    each sequence. A value with only an edge, "top", or only a side, "right", also has one
+    clear meaning, and the result is then that one word. A value with other text is an
+    error.
     """
     if isinstance(value, str):
         words = [
@@ -750,8 +766,8 @@ def _parse_position(value: Any, where: str) -> str | None:
         ]
         edges = [word for word in words if word in POSITION_EDGES]
         sides = [word for word in words if word in POSITION_SIDES]
-        if len(edges) == 1 and len(sides) == 1 and len(words) == 2:
-            return f"{edges[0]}-{sides[0]}"
+        if len(edges) <= 1 and len(sides) <= 1 and len(edges) + len(sides) == len(words) > 0:
+            return "-".join(edges + sides)
     if _has_text(value):
         raise LayoutFormatError(f"{where} must be one of: " + ", ".join(POSITIONS))
     return None

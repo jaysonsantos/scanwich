@@ -930,7 +930,9 @@ class SourcePageTests(TestCase):
             "\\pagestyle{sourcepage}\n",
             # A box that is too high becomes smaller, and the engine reports the page.
             "\\PackageWarningNoLine{scanwich}{Source page \\sourcepagenumber\\space is at\n",
-            "\\resizebox*{!}{\\textheight}{\\usebox{\\sourcepagebox}}",
+            # The smaller box is 1pt less high than the text area. A box of the full
+            # height can be too high by a rounding error.
+            "\\resizebox*{!}{\\dimexpr\\textheight-1pt\\relax}{\\usebox{\\sourcepagebox}}",
         ):
             with self.subTest(part=part):
                 self.assertEqual(document.count(part), 1)
@@ -981,6 +983,31 @@ class SourcePageTests(TestCase):
                 ["\\sourcepagehead{}{Head}{5}", "\\sourcepagefoot{}{Foot}{}"],
             ),
             ((Paragraph("Text."), PageFurniture("page_number", "6")), ["\\sourcepagefoot{}{6}{}"]),
+            # A page number at the top with no side is at the outer side of its page: an
+            # even number is on a left page.
+            (
+                (PageFurniture("page_number", "24"), Paragraph("Text.")),
+                ["\\sourcepagehead{24}{}{}"],
+            ),
+            (
+                (PageFurniture("page_number", "xii"), Paragraph("Text.")),
+                ["\\sourcepagehead{}{}{xii}"],
+            ),
+            (
+                (Paragraph("Text."), PageFurniture("page_number", "30", "top")),
+                ["\\sourcepagehead{30}{}{}"],
+            ),
+            # A place with only one part gets the usual other part of its type.
+            (
+                (
+                    PageFurniture("page_header", "Head", "right"),
+                    PageFurniture("page_footer", "Foot", "left"),
+                    PageFurniture("page_number", "8", "bottom"),
+                    PageFurniture("page_number", "9", "center"),
+                    Paragraph("Text."),
+                ),
+                ["\\sourcepagehead{}{9}{Head}", "\\sourcepagefoot{Foot}{8}{}"],
+            ),
             # The text cannot add a command or end the line.
             (
                 (PageFurniture("page_header", "50 % } \\end{document}<br>next", "top-left"),),
@@ -993,7 +1020,7 @@ class SourcePageTests(TestCase):
         for number, (blocks, commands) in enumerate(cases, start=1):
             with self.subTest(case=number):
                 (page,) = page_bodies(PageLayout(blocks=tuple(blocks)))
-                printed = ["23", "24", "5", "6"][number - 1 : number]
+                printed = ["23", "24", "5", "6", "24", "xii", "30", "8, 9"][number - 1 : number]
                 comment = "% Source page 1" + (
                     f" (printed page number: {printed[0]})" if printed else ""
                 )
@@ -1629,6 +1656,36 @@ class CompilationTests(TestCase):
                 self.assertEqual({number for number, _ in reports}, {"2"}, output[-2000:])
                 self.assertTrue(all(30 <= int(percent) < 100 for _, percent in reports), reports)
                 self.assertNotIn("Overfull \\vbox", output)
+
+    def test_dense_page_gets_no_empty_page_before_it(self) -> None:
+        # The box of a dense page becomes smaller. At the full height of the text area, it
+        # can be too high by a rounding error, and the engine then puts an empty page
+        # before it. This occurs for a page that ends with a block that has no depth: an
+        # illustration with no caption, and with pdfLaTeX a line that has no descender.
+        usual = PageLayout(blocks=(Paragraph("A usual page."),))
+        endings = {
+            "an illustration with no caption": (
+                (Figure(box=BOX, image=FIGURE_IMAGE),),
+                (60, 68, 108),
+            ),
+            "a line with no descender": (
+                (Paragraph("THE END OF THE CHAPTER 1234", align="center"),),
+                (60, 76),
+            ),
+        }
+        for ending, (blocks, row_counts) in endings.items():
+            for row_count in row_counts:
+                rows = tuple(cells(f"r{row}", "value") for row in range(row_count))
+                dense = PageLayout(blocks=(Paragraph("Dense page."), Table(rows=rows), *blocks))
+                document = render_latex([usual, dense, usual])
+                for engine, options in self.all_engines().items():
+                    with self.subTest(ending=ending, rows=row_count, engine=engine):
+                        texts, output = self.compile_pages(engine, options, document)
+                        self.assertEqual(len(texts), 3, output[-1500:])
+                        self.assertEqual(texts[0], "A usual page.")
+                        self.assertTrue(texts[1].startswith("Dense page. r0 value"), texts[1][:60])
+                        self.assertEqual(texts[2], "A usual page.")
+                        self.assertIn("Source page 2 is at", output)
 
     def test_small_capitals_are_capital_letters_in_the_pdf(self) -> None:
         # The default font has no bold and no italic small capitals. The text of the PDF

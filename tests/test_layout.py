@@ -398,6 +398,14 @@ class PageLayoutJsonTests(TestCase):
             ("bottom, centre", "bottom-center"),
             ("top/middle", "top-center"),
             ("bottom-left", "bottom-left"),
+            ("upper right", "top-right"),
+            ("Lower-Centre", "bottom-center"),
+            # Only an edge or only a side also has one clear meaning. The writer gives
+            # the usual place to the other part.
+            ("top", "top"),
+            ("footer", "bottom"),
+            ("right", "right"),
+            (" Center ", "center"),
             (None, None),
             ("", None),
         ]
@@ -419,7 +427,7 @@ class PageLayoutJsonTests(TestCase):
             "block 1 (page_number) position must be one of: top-left, top-center, top-right, "
             "bottom-left, bottom-center, bottom-right"
         )
-        for value in ("right", "top", "top-right-left", "at the outer corner", "upper right"):
+        for value in ("top-right-left", "top bottom", "at the outer corner", "outer", "margin"):
             self.assert_rejects(
                 {"blocks": [{"type": "page_number", "text": "23", "position": value}]}, message
             )

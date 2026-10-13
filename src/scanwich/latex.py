@@ -29,6 +29,8 @@ from scanwich.layout import (
     PAGE_FOOTER,
     PAGE_HEADER,
     PAGE_NUMBER,
+    POSITION_EDGES,
+    POSITION_SIDES,
     RULES_COLUMNS,
     RULES_GRID,
     RULES_NONE,
@@ -367,7 +369,9 @@ TABLE_PACKAGES = """\
 PAGED_LAYOUT = """\
 % One page of the source is one page of this document. The content of a source page is in
 % a box. When the box is higher than the text area, the page shows it at a smaller size,
-% and the engine writes a warning that has the number of the source page.
+% and the engine writes a warning that has the number of the source page. The smaller box
+% is 1pt less high than the text area: a box of the full height can be too high by a
+% rounding error, and the engine then puts an empty page before it.
 \\setlength{\\textwidth}{420pt}
 \\setlength{\\textheight}{672pt}
 \\setlength{\\oddsidemargin}{\\dimexpr(\\paperwidth-\\textwidth)/2-1in\\relax}
@@ -401,7 +405,8 @@ PAGED_LAYOUT = """\
     \\PackageWarningNoLine{scanwich}{Source page \\sourcepagenumber\\space is at
       \\the\\numexpr\\dimexpr\\textheight\\relax*100/\\dimexpr\\ht\\sourcepagebox+\\dp\\sourcepagebox\\relax\\relax
       \\space percent of its size: its content is too high for one page}%
-    \\makebox[\\textwidth][c]{\\resizebox*{!}{\\textheight}{\\usebox{\\sourcepagebox}}}%
+    \\makebox[\\textwidth][c]{%
+      \\resizebox*{!}{\\dimexpr\\textheight-1pt\\relax}{\\usebox{\\sourcepagebox}}}%
   \\else
     \\usebox{\\sourcepagebox}%
   \\fi
@@ -654,23 +659,34 @@ class _DocumentWriter:
     def _page_lines(self, page: PageLayout) -> list[str]:
         """Return the commands for the running head, the running foot, and the page number.
 
-        A block without a place gets the usual place of its type. A page number without
-        a place is at the top right when it comes before the content of the page.
+        A block gets the usual place of its type for the part of its place that the
+        layout does not have. A running head is at the top center, and a running foot at
+        the bottom center. A page number is at the top when it comes before the content
+        of the page, and else at the bottom. At the bottom, its usual side is the center.
+        At the top, it is the outer side of the page: a book prints an even number on a
+        left page, so an even number is at the left, and an odd number at the right.
         """
         texts: dict[str, dict[str, list[str]]] = {
-            edge: {side: [] for side in ("left", "center", "right")} for edge in ("top", "bottom")
+            edge: {side: [] for side in POSITION_SIDES} for edge in POSITION_EDGES
         }
         before_content = True
         for block in page.blocks:
             if not isinstance(block, PageFurniture):
                 before_content = False
                 continue
-            if block.position is not None:
-                edge, side = block.position.split("-")
-            elif block.kind == PAGE_NUMBER:
-                edge, side = ("top", "right") if before_content else ("bottom", "center")
-            else:
-                edge, side = ("top" if block.kind == PAGE_HEADER else "bottom"), "center"
+            known = (block.position or "").split("-")
+            edge = next((word for word in known if word in POSITION_EDGES), None)
+            side = next((word for word in known if word in POSITION_SIDES), None)
+            if edge is None and block.kind == PAGE_NUMBER:
+                edge = "top" if before_content else "bottom"
+            elif edge is None:
+                edge = "top" if block.kind == PAGE_HEADER else "bottom"
+            if side is None and block.kind == PAGE_NUMBER and edge == "top":
+                number = plain_text(block.text).strip()
+                is_even = number.isascii() and number.isdigit() and int(number) % 2 == 0
+                side = "left" if is_even else "right"
+            elif side is None:
+                side = "center"
             text = self._inline(block.text, None, CONTEXT_PAGE_LINE)
             if text:
                 texts[edge][side].append(text)
