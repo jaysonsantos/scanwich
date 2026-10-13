@@ -28,6 +28,7 @@ from scanwich.layout import (
     BLOCK_TYPES,
     Box,
     Figure,
+    FigureLocation,
     Footnote,
     Heading,
     LayoutFormatError,
@@ -40,7 +41,7 @@ from scanwich.layout import (
     TableCell,
 )
 from scanwich.models import OcrRegion, Point
-from scanwich.ocr import LayoutBackend, OcrBackend
+from scanwich.ocr import FigureLocator, LayoutBackend, OcrBackend
 
 LOGGER_NAME = "scanwich.backends.openai_compatible"
 
@@ -1347,3 +1348,125 @@ class LayoutRecognitionTests(TestCase):
             "page_footer, page_number",
         )
         self.assertNotIn(secret, "\n".join(captured_logs.output))
+
+
+class FigureLocationTests(TestCase):
+    def locate_figure(
+        self,
+        completions: FakeCompletions,
+        *,
+        image_size: tuple[int, int] = (900, 600),
+        estimate: Box | None = None,
+        caption: str | None = None,
+    ) -> FigureLocation | None:
+        """Return the place that the backend makes from the replies for one part of a page."""
+        fake_client = SimpleNamespace(chat=SimpleNamespace(completions=completions))
+        fake_openai = SimpleNamespace(OpenAI=lambda **_: fake_client)
+        with TemporaryDirectory() as temporary_directory:
+            image_path = Path(temporary_directory) / "region.png"
+            Image.new("RGB", image_size, "white").save(image_path)
+            backend = OpenAICompatibleBackend(languages=["en"], options={})
+
+            with (
+                patch.dict(os.environ, {"OPENROUTER_API_KEY": "test-secret"}),
+                patch.dict(sys.modules, {"openai": fake_openai}),
+            ):
+                return backend.locate_figure(image_path, estimate=estimate, caption=caption)
+
+    def test_backend_finds_the_box_of_an_illustration(self) -> None:
+        backend = OpenAICompatibleBackend(languages=["en"], options={})
+        self.assertIsInstance(backend, FigureLocator)
+
+    def test_returns_the_box_and_the_cut_sides_of_the_reply(self) -> None:
+        reply = '{"box":{"left":250,"top":150,"right":750,"bottom":640},"cut":["top"]}'
+        completions = FakeCompletions(reply)
+
+        location = self.locate_figure(completions)
+
+        self.assertEqual(location, FigureLocation(Box(250, 150, 750, 640), frozenset({"top"})))
+        (request,) = completions.calls
+        self.assertEqual(request["response_format"], {"type": "json_object"})
+        self.assertEqual(request["temperature"], 0)
+        self.assertEqual(sent_image(request).size, (900, 600))
+        prompt = request["messages"][1]["content"][0]["text"]
+        for part in (
+            "This 900x600 pixel image shows a part of one page of a printed document.",
+            (
+                'Return one JSON object with this shape: {"box":{"left":L,"top":T,"right":R,'
+                '"bottom":B},"cut":[]}'
+            ),
+            "0-to-1000 grid",
+            # A crop that is too large loses nothing. A crop that cuts the drawing does.
+            "all its lines, and all the labels and numbers that are a part of it",
+            "It does not contain the caption",
+            "When you are not sure that a mark is a part of the illustration, include it.",
+            '"cut" has the sides of the image where the illustration continues outside',
+            'Return {"box":null,"cut":[]} when the image shows no illustration.',
+        ):
+            with self.subTest(part=part):
+                self.assertIn(part, prompt)
+        # Without data about the illustration, the request does not tell which one to find.
+        self.assertNotIn("Which illustration.", prompt)
+
+    def test_tells_the_model_which_illustration_to_find(self) -> None:
+        # An image can show two illustrations. Without these data, a model returns one
+        # box around the two of them.
+        completions = FakeCompletions('{"box":[250,150,750,640],"cut":[]}')
+        caption = 'Fig. 2. <i>A wheel</i> with "spokes"<br>and a hub<fn>1</fn>'
+
+        self.locate_figure(completions, estimate=Box(213, 317, 617, 723), caption=caption)
+
+        prompt = completions.calls[0]["messages"][1]["content"][0]["text"]
+        self.assertIn(
+            "Which illustration. The page gives this caption to the illustration: "
+            '"Fig. 2. A wheel with \\"spokes\\" and a hub". A first estimate puts the center '
+            "of the illustration near x=415, y=520 on the grid. The estimate is not exact. "
+            "When the image shows more than one illustration, find only the one that these "
+            "data describe.\n\n",
+            prompt,
+        )
+        # The sides of the estimate are the values that the request must correct, so the
+        # model does not get them.
+        for side in ("213", "317", "617", "723"):
+            self.assertNotIn(side, prompt)
+
+        completions = FakeCompletions('{"box":[250,150,750,640],"cut":[]}')
+        self.locate_figure(completions, caption="Plate " + "long caption " * 60)
+        prompt = completions.calls[0]["messages"][1]["content"][0]["text"]
+        quoted = prompt.split("caption to the illustration: ")[1].split(". When the image")[0]
+        self.assertEqual(len(json.loads(quoted)), 300)
+        self.assertNotIn("A first estimate", prompt)
+
+    def test_returns_none_when_the_image_shows_no_illustration(self) -> None:
+        self.assertIsNone(self.locate_figure(FakeCompletions('{"box":null,"cut":[]}')))
+
+    def test_asks_the_model_to_correct_a_box_that_it_cannot_use(self) -> None:
+        # The first box uses the pixels of the image and not the grid.
+        unusable = '{"box":{"left":250,"top":150,"right":2400,"bottom":1700},"cut":[]}'
+        usable = '{"box":{"left":250,"top":150,"right":750,"bottom":640},"cut":[]}'
+        completions = FakeCompletions(unusable, usable)
+
+        with self.assertLogs(LOGGER_NAME, level="INFO") as captured_logs:
+            location = self.locate_figure(completions)
+
+        self.assertEqual(location, FigureLocation(Box(250, 150, 750, 640)))
+        self.assertEqual(len(completions.calls), 2)
+        self.assertIn(
+            "Your last reply cannot be used: box must use the 0-to-1000 grid of the image, "
+            "not its pixels",
+            completions.calls[1]["messages"][3]["content"],
+        )
+        self.assertIn(
+            f"INFO:{LOGGER_NAME}:OpenAI-compatible model {DEFAULT_MODEL} "
+            "corrected its reply in attempt 2 of 3",
+            captured_logs.output,
+        )
+
+    def test_fails_when_each_attempt_gives_an_unusable_box(self) -> None:
+        completions = FakeCompletions('{"cut":[]}')
+        with (
+            self.assertLogs(LOGGER_NAME, level="WARNING"),
+            self.assertRaisesRegex(LayoutFormatError, "the reply must be a JSON object with a box"),
+        ):
+            self.locate_figure(completions)
+        self.assertEqual(len(completions.calls), DEFAULT_MAX_ATTEMPTS)

@@ -194,6 +194,29 @@ The correction request to the model has more: it names each field that the layou
 LaTeX output needs a backend that has the method `recognize_layout(image_path)`.
 The `openai-compatible` backend has it. EasyOCR returns text lines without structure, so it does not have it.
 
+### Box of an illustration
+
+A model that reads a full page gives a box for an illustration that is frequently not exact.
+On a photo of a page, the box can be too low by a third of the illustration, and the crop then cuts the illustration.
+Thus Scanwich sends one more request for each illustration, when the backend has the method `locate_figure(image_path, estimate=..., caption=...)`.
+The `openai-compatible` backend has it.
+
+- The request has only the part of the page image around the first box. The margin at each side is 100 units of the grid, or half of the size of the box when that is more.
+- The backend returns the box of the illustration in that part, and the sides where the part cuts the illustration.
+  The caption and the center of the first box tell the model which illustration to find when the part shows more than one.
+- Scanwich sends a larger part when the backend reports a cut side, and when the new box is nearer than 30 units to a side of the part. A label of the illustration can then be outside the part.
+  One illustration gets a maximum of 3 such requests.
+- The crop has the new box and a margin of 5 units at each side. The layout JSON also has the new box.
+- An `INFO` log record has the new box and the box of the page layout.
+
+A crop that is too large loses nothing, and a crop that cuts the illustration loses a part of it. Thus:
+
+- When the backend still reports a cut side after the last request, the crop goes to the border of the part at that side, with a `WARNING` log record.
+- When a request for the box fails, or the backend finds no illustration in the part, the crop uses the box that the backend gave before, with a `WARNING` log record. Compare that illustration with the source.
+
+Each of these requests has a cost. A page with one illustration needs 2 requests, and a page without an illustration needs 1 request.
+The request is small: it has a part of the page, and its reply has only a box.
+
 ### Page direction
 
 A photo can show a page that is not upright. A model reads such a page badly.
@@ -202,7 +225,7 @@ The model does not read a page that is not upright. Scanwich turns the page imag
 When the backend reports that the page is not upright after that turn, the conversion fails.
 
 `--rotate DEGREES` gives the direction of all pages: Scanwich turns each page image clockwise by 0, 90, 180, or 270 degrees before recognition.
-The backend then gets no request to find the direction, and each page needs one request.
+The backend then gets no request to find the direction, and each page needs one request for its layout.
 Use it when all pages have the same direction. `--rotate 0` is for pages that are upright.
 Scanwich uses the blocks of the backend also when the backend reports a different direction, and writes a `WARNING` log record.
 
@@ -262,6 +285,18 @@ LaTeX output uses that method. `scanwich.layout.page_layout_from_json` makes a `
 The page image has no EXIF orientation.
 For a page that is not upright, a provider can return `PageLayout(page_top="right")` without blocks. Scanwich then turns the page image and calls the method again.
 With `upright=True`, the caller knows that the page is upright. The provider then does not look for the direction: it reads the page and returns its blocks.
+
+A provider can also have this method, for the exact box of one illustration:
+
+```python
+def locate_figure(
+    self, image_path: Path, *, estimate: Box | None = None, caption: str | None = None
+) -> FigureLocation | None: ...
+```
+
+The image shows a part of a page. `estimate` is a first box of the illustration on the 0-to-1000 grid of that image, and `caption` is its caption.
+The result has the box on the same grid and the sides where the image cuts the illustration. It is `None` when the image shows no illustration.
+`scanwich.layout.figure_location_from_json` makes a `FigureLocation` from JSON and checks it.
 
 Backend options use `KEY=VALUE`; JSON values are decoded automatically. EasyOCR passes
 top-level options to `easyocr.Reader`. A `readtext` JSON object is passed to

@@ -302,6 +302,18 @@ class Figure:
 
 
 @dataclass(frozen=True)
+class FigureLocation:
+    """The place of one illustration in an image that shows a part of a page.
+
+    `box` is on the 0-to-1000 grid of that image. `cut_sides` has the sides of the image
+    where the illustration continues outside the image.
+    """
+
+    box: Box
+    cut_sides: frozenset[str] = frozenset()
+
+
+@dataclass(frozen=True)
 class Footnote:
     text: str
     # The reference mark that the page prints, for example "1" or "*".
@@ -497,6 +509,33 @@ def page_layout_from_json(payload: Any, *, reply: bool = False) -> PageLayout:
             hint=reading.other_content_hint(),
         )
     return layout
+
+
+def figure_location_from_json(payload: Any) -> FigureLocation | None:
+    """Check the JSON form of the place of an illustration, and return the place.
+
+    The form is {"box": {"left": L, "top": T, "right": R, "bottom": B}, "cut": ["top"]}.
+    A `box` of null gives None: the image shows no illustration. The function raises
+    `LayoutFormatError` for a value that it cannot use.
+    """
+    if not isinstance(payload, Mapping) or "box" not in payload:
+        raise LayoutFormatError("the reply must be a JSON object with a box")
+    if payload["box"] is None:
+        return None
+    box = _parse_box(payload["box"], "box", _Reading())
+    raw_sides = payload.get("cut")
+    if raw_sides is None:
+        raw_sides = []
+    elif isinstance(raw_sides, str):
+        raw_sides = [raw_sides]
+    if not isinstance(raw_sides, list):
+        raw_sides = [None]
+    sides = [side.strip().lower() if isinstance(side, str) else "" for side in raw_sides]
+    if not all(side in BOX_SIDES for side in sides):
+        raise LayoutFormatError(
+            "cut must be an array that has only the sides " + ", ".join(BOX_SIDES)
+        )
+    return FigureLocation(box=box, cut_sides=frozenset(sides))
 
 
 def _parse_page(payload: Any, reading: _Reading) -> PageLayout:

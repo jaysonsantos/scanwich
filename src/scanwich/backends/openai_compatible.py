@@ -16,7 +16,15 @@ from typing import Any, TypeVar
 
 from PIL import Image
 
-from scanwich.layout import LayoutFormatError, PageLayout, page_layout_from_json
+from scanwich.layout import (
+    Box,
+    FigureLocation,
+    LayoutFormatError,
+    PageLayout,
+    figure_location_from_json,
+    page_layout_from_json,
+    plain_text,
+)
 from scanwich.models import OcrRegion, Point
 
 DEFAULT_MODEL = "deepseek/deepseek-v4-flash-vision-exp"
@@ -92,6 +100,9 @@ FINISH_REASONS = frozenset({"length", "content_filter", "tool_calls", "function_
 PROVIDER_ERROR_METADATA_FIELDS = ("error_type", "provider_name", "provider_code", "raw")
 # The fields of `usage` that have the number of tokens of the request and of the reply.
 USAGE_TOKEN_FIELDS = ("prompt_tokens", "completion_tokens")
+# The request for the box of an illustration has not more than this many characters of
+# its caption. The start of a caption is sufficient to find the illustration.
+MAX_CAPTION_HINT_CHARACTERS = 300
 REQUEST_OPTIONS = frozenset({"model"})
 HTTP_REFERER = "https://github.com/jaysonsantos/scanwich"
 APP_TITLE = "Scanwich"
@@ -180,6 +191,23 @@ class OpenAICompatibleBackend:
         image = _encode_image(image_path)
         request = self._request(image, layout=True, upright=upright)
         return self._complete(request, self._parse_layout_reply)
+
+    def locate_figure(
+        self, image_path: Path, *, estimate: Box | None = None, caption: str | None = None
+    ) -> FigureLocation | None:
+        """Return the box of one illustration in an image that shows a part of a page.
+
+        The model gives a box that is not exact when it reads a full page. It gives an
+        exact box when it gets only the part of the page that has the illustration, and
+        only this one task. `estimate` and `caption` tell the model which illustration to
+        find when the image shows more than one.
+        """
+        image = _encode_image(image_path)
+        request = self._request(image)
+        request["messages"][1]["content"][0]["text"] = self._figure_prompt(
+            width=image.width, height=image.height, estimate=estimate, caption=caption
+        )
+        return self._complete(request, self._parse_figure_reply)
 
     def _complete(self, request: dict[str, Any], parse: Callable[[str, int], Result]) -> Result:
         """Send a request, and return the result that `parse` makes from the reply.
@@ -321,6 +349,11 @@ class OpenAICompatibleBackend:
         layout = page_layout_from_json(_parse_json_payload(content), reply=True)
         self._log_corrected_reply(attempt)
         return layout
+
+    def _parse_figure_reply(self, content: str, attempt: int) -> FigureLocation | None:
+        location = figure_location_from_json(_parse_json_payload(content))
+        self._log_corrected_reply(attempt)
+        return location
 
     def _log_corrected_reply(self, attempt: int) -> None:
         if attempt > 1:
@@ -573,6 +606,56 @@ class OpenAICompatibleBackend:
             "Markdown, LaTeX, or other HTML. Write a formula as plain text with Unicode "
             "characters.\n\n"
             f"Return {no_content} for a page that has no content. Return only the JSON object."
+        )
+
+    def _figure_prompt(
+        self, *, width: int, height: int, estimate: Box | None, caption: str | None
+    ) -> str:
+        """Return the request for the box of one illustration in a part of a page."""
+        box = '{"left":L,"top":T,"right":R,"bottom":B}'
+        hints = []
+        caption = " ".join(plain_text(caption or "").split())[:MAX_CAPTION_HINT_CHARACTERS]
+        if caption:
+            quoted = json.dumps(caption, ensure_ascii=False)
+            hints.append(f"The page gives this caption to the illustration: {quoted}.")
+        if estimate is not None:
+            # The model gets only the center of the estimate. The sides of the estimate
+            # are the values that this request must correct.
+            hints.append(
+                "A first estimate puts the center of the illustration near "
+                f"x={(estimate.left + estimate.right) / 2:.0f}, "
+                f"y={(estimate.top + estimate.bottom) / 2:.0f} on the grid. The estimate is "
+                "not exact."
+            )
+        which = ""
+        if hints:
+            hints.append(
+                "When the image shows more than one illustration, find only the one that "
+                "these data describe."
+            )
+            which = "Which illustration. " + " ".join(hints) + "\n\n"
+        return (
+            f"This {width}x{height} pixel image shows a part of one page of a printed "
+            "document. The part has an illustration: a drawing, photograph, diagram, map, "
+            "ornament, stamp, or signature. It can also have text of the page and parts of "
+            "other illustrations around it.\n\n"
+            f'Return one JSON object with this shape: {{"box":{box},"cut":[]}}\n\n'
+            f"Coordinates. A box is {box} on a 0-to-1000 grid, where (0, 0) is the top-left "
+            "corner of the image and (1000, 1000) is its bottom-right corner. L and R are "
+            "distances from the left edge of the image. T and B are distances from its top "
+            "edge.\n\n"
+            f"{which}"
+            '"box" contains the full illustration: all its lines, and all the labels and '
+            "numbers that are a part of it. It does not contain the caption that the page "
+            "prints above or below the illustration, and it does not contain the paragraphs "
+            "and tables of the page. Find the outermost mark of the illustration at each of "
+            "its four sides. When you are not sure that a mark is a part of the "
+            "illustration, include it.\n\n"
+            '"cut" has the sides of the image where the illustration continues outside the '
+            'image: "left", "top", "right", "bottom". It is empty when the image shows the '
+            "full illustration.\n\n"
+            'Return {"box":null,"cut":[]} when the image shows no illustration. Return only '
+            "the JSON object."
         )
 
 

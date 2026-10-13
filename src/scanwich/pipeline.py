@@ -16,8 +16,16 @@ from PIL import Image
 
 from scanwich.images import UPRIGHT_TURNS, crop_box, is_pdf, read_photo, turn_clockwise
 from scanwich.latex import render_latex
-from scanwich.layout import PAGE_TOP_UPRIGHT, SURROGATE, Figure, PageLayout
-from scanwich.ocr import LayoutBackend, OcrBackend
+from scanwich.layout import (
+    BOX_SIDES,
+    GRID_MAX,
+    PAGE_TOP_UPRIGHT,
+    SURROGATE,
+    Box,
+    Figure,
+    PageLayout,
+)
+from scanwich.ocr import FigureLocator, LayoutBackend, OcrBackend
 from scanwich.pdf import PNG_COMPRESSION_LEVEL, assemble_searchable_pdf, rasterize_pdf
 
 # The illustrations of a LaTeX document are in a directory next to it. The name of the
@@ -32,6 +40,19 @@ FIGURE_JPEG_SUBSAMPLING = "4:4:4"
 # A backend does not give the edges of an illustration exactly. Thus the crop is this much
 # larger at each side, on the 0-to-1000 grid of the page image.
 FIGURE_MARGIN = 5.0
+# The box of an illustration in the layout of a full page can be wrong by a large part of
+# the illustration. A backend that is a `FigureLocator` gets a second request for each
+# illustration, with only the part of the page image that has it. That part is the box of
+# the layout and a margin at each side: this distance on the 0-to-1000 grid of the page
+# image, or this ratio of the size of the box when that is more.
+FIGURE_SEARCH_MARGIN = 100.0
+FIGURE_SEARCH_MARGIN_RATIO = 0.5
+# The part of the page image must show paper around the illustration. When the new box is
+# nearer than this to a side of the part, a label of the illustration can be outside the
+# part. The part then becomes larger at that side, and the backend gets it again.
+FIGURE_SEARCH_MIN_GAP = 30.0
+# The maximum number of requests for the box of one illustration.
+FIGURE_SEARCH_REQUESTS = 3
 # LaTeX reads the name of the figure directory in a command, so the name has only
 # characters that are safe there.
 UNSAFE_NAME_CHARACTERS = re.compile(r"[^A-Za-z0-9._-]+")
@@ -147,6 +168,10 @@ def convert_to_latex(
                 type(backend).__name__,
             )
             layout = _recognize_upright_layout(backend, page_image, page_number, rotate)
+            if isinstance(backend, FigureLocator):
+                layout = _locate_figures(
+                    backend, layout, page_image, work_directory / "regions", page_number
+                )
             layout = _crop_figures(
                 layout,
                 page_image,
@@ -261,6 +286,180 @@ def _turn_page_image(page_image: Path, degrees: int) -> None:
     with Image.open(page_image) as image:
         turned = turn_clockwise(image, degrees)
     turned.save(page_image, format="PNG", compress_level=PNG_COMPRESSION_LEVEL)
+
+
+def _locate_figures(
+    backend: FigureLocator,
+    layout: PageLayout,
+    page_image: Path,
+    work_directory: Path,
+    page_number: int,
+) -> PageLayout:
+    """Return the layout with the box that a second request gives for each illustration."""
+    if not any(isinstance(block, Figure) for block in layout.blocks):
+        return layout
+    work_directory.mkdir(parents=True, exist_ok=True)
+    blocks = []
+    figure_number = 0
+    with Image.open(page_image) as image:
+        for block in layout.blocks:
+            if isinstance(block, Figure):
+                figure_number += 1
+                box = _locate_figure(
+                    backend,
+                    image,
+                    block,
+                    work_directory / "region.png",
+                    f"illustration {figure_number} of page {page_number}",
+                )
+                block = replace(block, box=box)
+            blocks.append(block)
+    return replace(layout, blocks=tuple(blocks))
+
+
+def _locate_figure(
+    backend: FigureLocator, image: Image.Image, figure: Figure, region_path: Path, name: str
+) -> Box:
+    """Return the box of one illustration on the grid of the page image.
+
+    The backend gets a part of the page image around the box of the layout. It gets a
+    larger part when the first part does not show the full illustration with paper around
+    it. The function keeps the box of the layout when the backend gives no box.
+    """
+    region = _search_region(figure.box)
+    box = figure.box
+    for request in range(1, FIGURE_SEARCH_REQUESTS + 1):
+        crop_box(image, region).save(region_path, format="PNG", compress_level=1)
+        try:
+            location = backend.locate_figure(
+                region_path, estimate=_box_in_region(box, region), caption=figure.caption
+            )
+        except (RuntimeError, ValueError) as error:
+            logger.warning(
+                "The request for the box of %s failed (%s); the crop uses the box that the "
+                "backend gave before. Compare the illustration with the source",
+                name,
+                error,
+            )
+            return box
+        if location is None:
+            logger.warning(
+                "The backend found no illustration in the part of the page image for %s; "
+                "the crop uses the box that the backend gave before. Compare the "
+                "illustration with the source",
+                name,
+            )
+            return box
+        box = _box_on_page(location.box, region)
+        open_sides = _open_sides(box, region, location.cut_sides)
+        if not open_sides:
+            break
+        if request == FIGURE_SEARCH_REQUESTS:
+            still_cut = [side for side in BOX_SIDES if side in open_sides & location.cut_sides]
+            if still_cut:
+                # A crop that is too large loses nothing. A crop that cuts the
+                # illustration loses a part of it.
+                box = replace(box, **{side: getattr(region, side) for side in still_cut})
+                logger.warning(
+                    "After %d requests, the backend still reports that %s continues at "
+                    "the %s; the crop is larger at such a side. Compare the illustration "
+                    "with the source",
+                    request,
+                    name,
+                    ", ".join(still_cut),
+                )
+            break
+        region = _grown_region(region, open_sides)
+    logger.info(
+        "The box of %s is %s after %d request(s) for it; the page layout gave %s",
+        name,
+        _box_text(box),
+        request,
+        _box_text(figure.box),
+    )
+    return box
+
+
+def _search_region(box: Box) -> Box:
+    """Return the part of the page that the first request for an illustration shows."""
+    margin_x = max(FIGURE_SEARCH_MARGIN, FIGURE_SEARCH_MARGIN_RATIO * box.width)
+    margin_y = max(FIGURE_SEARCH_MARGIN, FIGURE_SEARCH_MARGIN_RATIO * box.height)
+    return Box(
+        left=max(0.0, box.left - margin_x),
+        top=max(0.0, box.top - margin_y),
+        right=min(GRID_MAX, box.right + margin_x),
+        bottom=min(GRID_MAX, box.bottom + margin_y),
+    )
+
+
+def _open_sides(box: Box, region: Box, cut_sides: frozenset[str]) -> set[str]:
+    """Return the sides where a larger part of the page can show more of an illustration.
+
+    At such a side, the backend reports that the illustration continues, or the box is
+    near the side of the part. A side at the edge of the page cannot move.
+    """
+    gaps = {
+        "left": box.left - region.left,
+        "top": box.top - region.top,
+        "right": region.right - box.right,
+        "bottom": region.bottom - box.bottom,
+    }
+    at_page_edge = {
+        "left": region.left <= 0.0,
+        "top": region.top <= 0.0,
+        "right": region.right >= GRID_MAX,
+        "bottom": region.bottom >= GRID_MAX,
+    }
+    return {
+        side
+        for side in BOX_SIDES
+        if not at_page_edge[side] and (side in cut_sides or gaps[side] < FIGURE_SEARCH_MIN_GAP)
+    }
+
+
+def _grown_region(region: Box, sides: set[str]) -> Box:
+    return Box(
+        left=max(0.0, region.left - FIGURE_SEARCH_MARGIN) if "left" in sides else region.left,
+        top=max(0.0, region.top - FIGURE_SEARCH_MARGIN) if "top" in sides else region.top,
+        right=(
+            min(GRID_MAX, region.right + FIGURE_SEARCH_MARGIN) if "right" in sides else region.right
+        ),
+        bottom=(
+            min(GRID_MAX, region.bottom + FIGURE_SEARCH_MARGIN)
+            if "bottom" in sides
+            else region.bottom
+        ),
+    )
+
+
+def _box_in_region(box: Box, region: Box) -> Box:
+    """Return a box of the page grid on the 0-to-1000 grid of a part of the page."""
+    scale_x = GRID_MAX / region.width
+    scale_y = GRID_MAX / region.height
+    return Box(
+        left=(box.left - region.left) * scale_x,
+        top=(box.top - region.top) * scale_y,
+        right=(box.right - region.left) * scale_x,
+        bottom=(box.bottom - region.top) * scale_y,
+    )
+
+
+def _box_on_page(box: Box, region: Box) -> Box:
+    """Return a box of the grid of a part of the page on the 0-to-1000 grid of the page."""
+    scale_x = region.width / GRID_MAX
+    scale_y = region.height / GRID_MAX
+    # One decimal place is less than one pixel of a page image, and the layout JSON
+    # stays easy to read.
+    return Box(
+        left=round(region.left + box.left * scale_x, 1),
+        top=round(region.top + box.top * scale_y, 1),
+        right=round(region.left + box.right * scale_x, 1),
+        bottom=round(region.top + box.bottom * scale_y, 1),
+    )
+
+
+def _box_text(box: Box) -> str:
+    return f"left {box.left:.0f}, top {box.top:.0f}, right {box.right:.0f}, bottom {box.bottom:.0f}"
 
 
 def _crop_figures(

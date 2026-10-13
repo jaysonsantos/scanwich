@@ -5,6 +5,7 @@ from unittest import TestCase
 from scanwich.layout import (
     Box,
     Figure,
+    FigureLocation,
     Footnote,
     FootnoteReference,
     Heading,
@@ -19,6 +20,7 @@ from scanwich.layout import (
     Span,
     Table,
     TableCell,
+    figure_location_from_json,
     page_layout_from_json,
     parse_inline,
     plain_text,
@@ -841,3 +843,56 @@ class PageLayoutJsonTests(TestCase):
                 page_layout_from_json(payload)
             self.assertNotIn("private", str(raised.exception))
             self.assertNotIn("private", repr(raised.exception))
+
+
+class FigureLocationJsonTests(TestCase):
+    def test_reads_the_box_and_the_cut_sides(self) -> None:
+        box = {"left": 120, "top": 80, "right": 870.5, "bottom": 640}
+        cases = [
+            ({"box": box, "cut": []}, frozenset()),
+            ({"box": box}, frozenset()),
+            ({"box": box, "cut": None}, frozenset()),
+            ({"box": [120, 80, 870.5, 640], "cut": ["top", "left"]}, frozenset({"left", "top"})),
+            ({"box": box, "cut": "bottom"}, frozenset({"bottom"})),
+            ({"box": box, "cut": [" Right "]}, frozenset({"right"})),
+        ]
+        for payload, cut_sides in cases:
+            with self.subTest(payload=payload):
+                self.assertEqual(
+                    figure_location_from_json(payload),
+                    FigureLocation(Box(120, 80, 870.5, 640), cut_sides),
+                )
+
+    def test_returns_none_for_an_image_without_an_illustration(self) -> None:
+        self.assertIsNone(figure_location_from_json({"box": None, "cut": []}))
+
+    def test_rejects_a_value_that_it_cannot_use(self) -> None:
+        box = {"left": 120, "top": 80, "right": 870, "bottom": 640}
+        cases = [
+            ([box], "the reply must be a JSON object with a box"),
+            ({"cut": []}, "the reply must be a JSON object with a box"),
+            ({"box": "120, 80, 870, 640"}, "box must be an object with the numbers"),
+            ({"box": {"left": 120, "top": 80}}, "box must be an object with the numbers"),
+            (
+                {"box": {"left": 0.12, "top": 0.08, "right": 0.87, "bottom": 0.64}},
+                "box must use the 0-to-1000 grid of the image, not a scale of 0 to 1",
+            ),
+            (
+                {"box": {"left": 120, "top": 80, "right": 2400, "bottom": 1700}},
+                "box must use the 0-to-1000 grid of the image, not its pixels",
+            ),
+            (
+                {"box": {"left": 870, "top": 80, "right": 120, "bottom": 640}},
+                "box must have left < right and top < bottom",
+            ),
+            ({"box": box, "cut": ["upper"]}, "cut must be an array that has only the sides"),
+            ({"box": box, "cut": [1]}, "cut must be an array that has only the sides"),
+            ({"box": box, "cut": 2}, "cut must be an array that has only the sides"),
+        ]
+        for payload, message in cases:
+            with (
+                self.subTest(payload=payload),
+                self.assertRaises(LayoutFormatError) as raised,
+            ):
+                figure_location_from_json(payload)
+            self.assertIn(message, str(raised.exception))

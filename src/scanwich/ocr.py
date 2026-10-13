@@ -5,7 +5,7 @@ from importlib.metadata import EntryPoint, entry_points
 from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
 
-from scanwich.layout import PageLayout
+from scanwich.layout import Box, FigureLocation, PageLayout
 from scanwich.models import OcrRegion
 
 ENTRY_POINT_GROUP = "scanwich.ocr_backends"
@@ -34,6 +34,28 @@ class LayoutBackend(Protocol):
         provider then does not look for the direction of the page: it reads the page.
         Without it, a provider that gets a page that is not upright can return the side
         of the image where the top of the page is, and no blocks.
+        """
+
+
+@runtime_checkable
+class FigureLocator(Protocol):
+    """Contract of a provider that finds the exact box of one illustration.
+
+    A provider implements it in addition to `LayoutBackend`. The box of an illustration in
+    the layout of a full page is often not exact. With this contract, a document writer
+    asks again with the part of the page image that has the illustration.
+    """
+
+    def locate_figure(
+        self, image_path: Path, *, estimate: Box | None = None, caption: str | None = None
+    ) -> FigureLocation | None:
+        """Find one illustration in an image that shows a part of a page.
+
+        `estimate` is a first box of the illustration, which can be wrong at each side.
+        `caption` is the caption that the page gives to the illustration. The two values
+        tell the provider which illustration to find when the image shows more than one.
+        The boxes use the 0-to-1000 grid of the image. The result is None when the image
+        shows no illustration.
         """
 
 

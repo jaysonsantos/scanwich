@@ -9,14 +9,23 @@ from types import SimpleNamespace
 from unittest import TestCase
 from unittest.mock import patch
 
-from PIL import Image
+from PIL import Image, ImageChops
 from pypdf import PdfReader
 from reportlab.pdfgen import canvas
 
-from scanwich.layout import Box, Figure, Heading, PageFurniture, PageLayout, Paragraph
+from scanwich.layout import (
+    Box,
+    Figure,
+    FigureLocation,
+    Heading,
+    PageFurniture,
+    PageLayout,
+    Paragraph,
+)
 from scanwich.models import OcrRegion, Point
-from scanwich.ocr import LayoutBackend, OcrBackend, backend_request_options
+from scanwich.ocr import FigureLocator, LayoutBackend, OcrBackend, backend_request_options
 from scanwich.pipeline import (
+    FIGURE_SEARCH_REQUESTS,
     PageLayoutError,
     convert_pdf,
     convert_to_latex,
@@ -561,3 +570,239 @@ class LatexConversionTests(TestCase):
             convert_to_latex(
                 text_file, self.directory / "page.tex", backend=FakeLayoutBackend(PageLayout())
             )
+
+
+def red_part(image: Image.Image) -> tuple[int, int, int, int] | None:
+    """Return the pixel box of the red part of an image, or None."""
+    red, green, blue = image.convert("RGB").split()
+    mask = ImageChops.multiply(
+        red.point(lambda value: 255 if value > 200 else 0),
+        ImageChops.multiply(
+            green.point(lambda value: 255 if value < 60 else 0),
+            blue.point(lambda value: 255 if value < 60 else 0),
+        ),
+    )
+    return mask.getbbox()
+
+
+class FakeFigureBackend(FakeLayoutBackend):
+    """A layout backend that also finds an illustration in a part of a page.
+
+    The illustration is the red part of the image. It continues at each side of the
+    image that the red part touches.
+    """
+
+    def __init__(self, *layouts: PageLayout) -> None:
+        super().__init__(*layouts)
+        self.part_sizes: list[tuple[int, int]] = []
+        self.estimates: list[Box | None] = []
+        self.captions: list[str | None] = []
+
+    def locate_figure(
+        self, image_path: Path, *, estimate: Box | None = None, caption: str | None = None
+    ) -> FigureLocation | None:
+        with Image.open(image_path) as image:
+            width, height = image.size
+            pixels = red_part(image)
+        self.part_sizes.append((width, height))
+        self.estimates.append(estimate)
+        self.captions.append(caption)
+        if pixels is None:
+            return None
+        left, top, right, bottom = pixels
+        sides = {
+            "left": left == 0,
+            "top": top == 0,
+            "right": right == width,
+            "bottom": bottom == height,
+        }
+        return FigureLocation(
+            Box(
+                left * 1000 / width,
+                top * 1000 / height,
+                right * 1000 / width,
+                bottom * 1000 / height,
+            ),
+            frozenset(side for side, is_cut in sides.items() if is_cut),
+        )
+
+
+class FigureBoxTests(TestCase):
+    """The second request for the box of an illustration.
+
+    The page image has 1000x2000 pixels, so one unit of the grid is 1 pixel across and
+    2 pixels down.
+    """
+
+    def setUp(self) -> None:
+        temporary_directory = TemporaryDirectory()
+        self.addCleanup(temporary_directory.cleanup)
+        self.directory = Path(temporary_directory.name)
+
+    def page(self, *red_boxes: tuple[int, int, int, int]) -> Path:
+        """Return a white page image with red parts. Each box is on the grid of the page."""
+        path = self.directory / "page.png"
+        image = Image.new("RGB", (1000, 2000), WHITE)
+        for left, top, right, bottom in red_boxes:
+            image.paste(RED, (left, top * 2, right, bottom * 2))
+        image.save(path)
+        return path
+
+    def convert(self, backend: FakeLayoutBackend, page: Path) -> Box:
+        """Convert the page, and return the box of its illustration in the layout JSON."""
+        json_directory = self.directory / "layout"
+        convert_to_latex(
+            page, self.directory / "page.tex", backend=backend, ocr_output_directory=json_directory
+        )
+        saved = json.loads((json_directory / "page-000001.json").read_text(encoding="utf-8"))
+        (figure,) = [block for block in saved["blocks"] if block["type"] == "figure"]
+        return Box(**figure["box"])
+
+    def crop(self) -> Image.Image:
+        with Image.open(self.directory / "page-figures" / "page-0001-figure-01.jpg") as image:
+            return image.convert("RGB")
+
+    def test_backend_contract_for_the_box_of_an_illustration_is_an_addition(self) -> None:
+        self.assertIsInstance(FakeFigureBackend(), LayoutBackend)
+        self.assertIsInstance(FakeFigureBackend(), FigureLocator)
+        self.assertNotIsInstance(FakeLayoutBackend(), FigureLocator)
+
+    def test_crops_the_box_of_the_second_request(self) -> None:
+        # The box of the layout is too low: it cuts the top third of the illustration,
+        # and it has the area below the illustration.
+        layout = PageLayout(
+            blocks=(Paragraph("Text."), Figure(box=Box(300, 450, 600, 600), caption="Fig. 1"))
+        )
+        backend = FakeFigureBackend(layout)
+
+        with self.assertLogs(LOGGER_NAME, level="INFO") as captured_logs:
+            box = self.convert(backend, self.page((300, 400, 600, 550)))
+
+        self.assertEqual(box, Box(300.0, 400.0, 600.0, 550.0))
+        # The backend got one part of the page: the box of the layout with a margin of
+        # 150 units across (half of the box) and 100 units down.
+        self.assertEqual(backend.part_sizes, [(600, 700)])
+        self.assertEqual(backend.captions, ["Fig. 1"])
+        (estimate,) = backend.estimates
+        assert estimate is not None
+        # The estimate is the box of the layout on the grid of the part.
+        self.assertEqual(
+            [
+                round(value, 1)
+                for value in (estimate.left, estimate.top, estimate.right, estimate.bottom)
+            ],
+            [250.0, 285.7, 750.0, 714.3],
+        )
+        # The crop has the full illustration and a margin of 5 units of white paper.
+        crop = self.crop()
+        self.assertEqual(crop.size, (310, 320))
+        self.assertEqual(red_part(crop), (5, 10, 305, 310))
+        self.assertIn(
+            f"INFO:{LOGGER_NAME}:The box of illustration 1 of page 1 is left 300, top 400, "
+            "right 600, bottom 550 after 1 request(s) for it; the page layout gave left 300, "
+            "top 450, right 600, bottom 600",
+            captured_logs.output,
+        )
+
+    def test_asks_again_with_a_larger_part_when_the_part_cuts_the_illustration(self) -> None:
+        layout = PageLayout(blocks=(Figure(box=Box(300, 520, 600, 640)),))
+        backend = FakeFigureBackend(layout)
+
+        box = self.convert(backend, self.page((300, 400, 600, 550)))
+
+        self.assertEqual(box, Box(300.0, 400.0, 600.0, 550.0))
+        # The first part starts at 420 on the grid and the illustration at 400. The
+        # second part is 100 units larger at its top.
+        self.assertEqual(backend.part_sizes, [(600, 640), (600, 840)])
+        # The second request has the box of the first one as its estimate.
+        second_estimate = backend.estimates[1]
+        assert second_estimate is not None
+        self.assertEqual(round(second_estimate.top, 1), 238.1)
+        self.assertEqual(red_part(self.crop()), (5, 10, 305, 310))
+
+    def test_asks_again_when_the_box_is_near_the_border_of_the_part(self) -> None:
+        # A label of the illustration is above the first part, so the backend cannot
+        # see it there. The box of the first request is 15 units from the top border.
+        layout = PageLayout(blocks=(Figure(box=Box(300, 485, 600, 640)),))
+        backend = FakeFigureBackend(layout)
+
+        box = self.convert(backend, self.page((300, 400, 600, 550), (400, 370, 500, 380)))
+
+        self.assertEqual(backend.part_sizes, [(600, 710), (600, 910)])
+        self.assertEqual(box, Box(300.0, 370.0, 600.0, 550.0))
+
+    def test_side_of_the_part_at_the_edge_of_the_page_cannot_move(self) -> None:
+        layout = PageLayout(blocks=(Figure(box=Box(0, 410, 200, 560)),))
+        backend = FakeFigureBackend(layout)
+
+        box = self.convert(backend, self.page((0, 400, 200, 550)))
+
+        # The illustration touches the left edge of the page, and thus of the part.
+        self.assertEqual(backend.part_sizes, [(300, 700)])
+        self.assertEqual(box, Box(0.0, 400.0, 200.0, 550.0))
+
+    def test_crop_is_larger_at_a_side_that_stays_cut(self) -> None:
+        class CutBackend(FakeFigureBackend):
+            def locate_figure(self, image_path: Path, **hints: object) -> FigureLocation:
+                super().locate_figure(image_path)
+                return FigureLocation(Box(100, 100, 900, 900), frozenset({"bottom"}))
+
+        layout = PageLayout(blocks=(Figure(box=Box(300, 400, 600, 550)),))
+        backend = CutBackend(layout)
+
+        with self.assertLogs(LOGGER_NAME, level="WARNING") as captured_logs:
+            box = self.convert(backend, self.page())
+
+        self.assertEqual(FIGURE_SEARCH_REQUESTS, 3)
+        # Each request has a part that is 100 units larger at its bottom.
+        self.assertEqual(backend.part_sizes, [(600, 700), (600, 900), (600, 1100)])
+        # The last part is from 300 to 850. The box gets the bottom of that part.
+        self.assertEqual(box, Box(210.0, 355.0, 690.0, 850.0))
+        self.assertEqual(
+            captured_logs.output,
+            [
+                (
+                    f"WARNING:{LOGGER_NAME}:After 3 requests, the backend still reports that "
+                    "illustration 1 of page 1 continues at the bottom; the crop is larger at such "
+                    "a side. Compare the illustration with the source"
+                )
+            ],
+        )
+
+    def test_keeps_the_box_of_the_layout_when_the_second_request_gives_no_box(self) -> None:
+        class FailingFigureBackend(FakeFigureBackend):
+            def locate_figure(self, image_path: Path, **hints: object) -> FigureLocation:
+                raise RuntimeError("the service is not available")
+
+        first_box = Box(300, 450, 600, 600)
+        layout = PageLayout(blocks=(Figure(box=first_box),))
+        cases = [
+            (
+                FailingFigureBackend(layout),
+                self.page((300, 400, 600, 550)),
+                (
+                    "The request for the box of illustration 1 of page 1 failed (the service is "
+                    "not available); the crop uses the box that the backend gave before. Compare "
+                    "the illustration with the source"
+                ),
+            ),
+            (
+                # The part of the page has no red part, so the backend finds nothing.
+                FakeFigureBackend(layout),
+                self.page(),
+                (
+                    "The backend found no illustration in the part of the page image for "
+                    "illustration 1 of page 1; the crop uses the box that the backend gave "
+                    "before. Compare the illustration with the source"
+                ),
+            ),
+        ]
+        for backend, page, warning in cases:
+            with (
+                self.subTest(backend=type(backend).__name__),
+                self.assertLogs(LOGGER_NAME, level="WARNING") as captured_logs,
+            ):
+                box = self.convert(backend, page)
+                self.assertEqual(box, first_box)
+                self.assertEqual(captured_logs.output, [f"WARNING:{LOGGER_NAME}:{warning}"])
+                self.assertEqual(self.crop().size, (310, 320))
