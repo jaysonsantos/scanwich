@@ -5,6 +5,8 @@ import json
 import os
 import random
 import sys
+import threading
+import time
 import uuid
 from collections.abc import Sequence
 from pathlib import Path
@@ -16,6 +18,7 @@ from unittest.mock import ANY, patch
 
 from PIL import Image
 
+from scanwich.backends import openai_compatible
 from scanwich.backends.openai_compatible import (
     DEFAULT_LAYOUT_MODEL,
     DEFAULT_MAX_ATTEMPTS,
@@ -1929,6 +1932,56 @@ class AsyncRequestTests(TestCase):
 
         asyncio.run(read_and_close())
         self.assertEqual(closed, [True])
+
+    def test_image_encode_does_not_stop_the_event_loop(self) -> None:
+        # The encode of a page image uses the processor, so it is in a thread. A task
+        # that needs the event loop at short intervals gets it during the encode.
+        work_seconds = 0.3
+        encode_image = openai_compatible._encode_image
+        threads: list[str] = []
+
+        def slow_encode(image_path: Path) -> object:
+            threads.append(threading.current_thread().name)
+            time.sleep(work_seconds)
+            return encode_image(image_path)
+
+        for method, reply in (
+            ("recognize_layout_async", self.LAYOUT_REPLY),
+            ("locate_figure_async", self.FIGURE_REPLY),
+        ):
+            gaps: list[float] = []
+            backend = OpenAICompatibleBackend(languages=["en"], options={})
+            completions = FakeAsyncCompletions(reply)
+            client = SimpleNamespace(chat=SimpleNamespace(completions=completions))
+
+            async def beat(gaps: list[float] = gaps) -> None:
+                last = time.monotonic()
+                while True:
+                    await asyncio.sleep(0.005)
+                    gaps.append(time.monotonic() - last)
+                    last = time.monotonic()
+
+            async def read(backend: Any = backend, method: str = method) -> None:
+                heartbeat = asyncio.create_task(beat())
+                try:
+                    await getattr(backend, method)(self.image_path)
+                finally:
+                    heartbeat.cancel()
+
+            with (
+                self.subTest(method=method),
+                patch.object(openai_compatible, "_encode_image", slow_encode),
+                patch.dict(os.environ, {"OPENROUTER_API_KEY": "test-secret"}),
+                patch.dict(
+                    sys.modules, {"openai": SimpleNamespace(AsyncOpenAI=lambda _c=client, **_: _c)}
+                ),
+            ):
+                asyncio.run(read())
+                self.assertEqual(len(completions.calls), 1)
+                self.assertGreater(len(gaps), 20)
+                self.assertLess(max(gaps), work_seconds / 2)
+        self.assertEqual(len(threads), 2)
+        self.assertNotIn(threading.main_thread().name, threads)
 
     def test_settings_that_change_a_layout(self) -> None:
         backend = OpenAICompatibleBackend(languages=["fr", "la"], options={})

@@ -425,11 +425,23 @@ class SavedLayoutTests(BookTestCase):
         )
 
         backend = NoRequestBackend()
-        with self.assertLogs(LOGGER_NAME, level="INFO") as captured_logs:
+        made: list[int] = []
+        make_page_image = pipeline._make_page_image
+
+        def counting(page: object, *arguments: object, **options: object) -> None:
+            made.append(page.number)  # type: ignore[attr-defined]
+            make_page_image(page, *arguments, **options)
+
+        with (
+            patch.object(pipeline, "_make_page_image", counting),
+            self.assertLogs(LOGGER_NAME, level="INFO") as captured_logs,
+        ):
             self.convert(inputs, backend, dpi=72)
 
         self.assertEqual(backend.requests, [])
         self.assertIsInstance(backend, FigureLocator)
+        # Only a page with an illustration needs its page image, for the crop.
+        self.assertEqual(made, [3, 4])
         # The document and its illustrations are the same, and no layout file changed.
         self.assertEqual(self.document(), first_document)
         self.assertEqual(self.figure_files(), first_figures)
@@ -1255,54 +1267,129 @@ class ParallelPagesTests(BookTestCase):
                 self.convert(inputs, backend, parallel_pages=parallel_pages)
 
     def test_work_for_the_processor_does_not_stop_the_event_loop(self) -> None:
-        # The decode of a photo and the crops are in threads. A task that needs the event
-        # loop at short intervals gets it while that work is in progress.
-        work_seconds = 0.5
-        gaps: list[float] = []
+        # Each kind of work that uses the processor or the disk is in a thread. A task
+        # that needs the event loop at short intervals gets it while that work is in
+        # progress.
+        work_seconds = 0.3
 
-        class HeartbeatBackend(AsyncPageBackend):
-            heartbeat: asyncio.Task[None] | None = None
+        class TurnedFigureBackend(AsyncPageBackend):
+            """Each page is not upright in its first image, and it has one illustration."""
 
             async def recognize_layout_async(
                 self, image_path: Path, *, upright: bool = False
             ) -> PageLayout:
-                if self.heartbeat is None:
-                    self.heartbeat = asyncio.create_task(self.beat())
-                return await super().recognize_layout_async(image_path, upright=upright)
+                await super().recognize_layout_async(image_path, upright=upright)
+                with Image.open(image_path) as image:
+                    if image.width > image.height:
+                        return PageLayout(page_top="right")
+                return PageLayout(blocks=(Paragraph("Text."), Figure(box=Box(250, 250, 750, 750))))
 
-            async def beat(self) -> None:
-                last = time.monotonic()
-                while True:
-                    await asyncio.sleep(0.005)
-                    gaps.append(time.monotonic() - last)
+            async def locate_figure_async(
+                self, image_path: Path, **hints: object
+            ) -> FigureLocation:
+                return FigureLocation(Box(100, 100, 900, 900))
+
+            def locate_figure(self, image_path: Path, **hints: object) -> FigureLocation:
+                raise AssertionError("a backend with the async methods gets no synchronous call")
+
+        # The kinds of work, and True for a kind that only a conversion with saved
+        # layouts has.
+        kinds = {
+            "_saved_layout_index": False,
+            "_file_digest": False,
+            "_make_page_image": False,
+            "_turn_page_image": False,
+            "_save_region": False,
+            "_write_layout_file": False,
+            "_crop_figures": False,
+            "_read_saved_layout": True,
+        }
+        for name, with_saved_layouts in kinds.items():
+            gaps: list[float] = []
+            calls: list[str] = []
+
+            class HeartbeatCalls(pipeline._BackendCalls):
+                """Start a task of the event loop at the start of the conversion."""
+
+                def __init__(self, backend: LayoutBackend, gaps: list[float] = gaps) -> None:
+                    super().__init__(backend)
+                    self._gaps = gaps
+                    self._heartbeat = asyncio.create_task(self.beat())
+
+                async def beat(self) -> None:
                     last = time.monotonic()
+                    while True:
+                        await asyncio.sleep(0.005)
+                        self._gaps.append(time.monotonic() - last)
+                        last = time.monotonic()
 
-            async def aclose(self) -> None:
-                assert self.heartbeat is not None
-                self.heartbeat.cancel()
-                await super().aclose()
+                async def close(self) -> None:
+                    self._heartbeat.cancel()
+                    await super().close()
 
-        def slow(function: Callable[..., object]) -> Callable[..., object]:
-            def work(*arguments: object, **options: object) -> object:
-                # The thread keeps the processor busy for the loop only if the call is
-                # in the thread of the loop.
+            function = getattr(pipeline, name)
+
+            def slow(
+                *arguments: object,
+                function: Callable[..., object] = function,
+                calls: list[str] = calls,
+                **options: object,
+            ) -> object:
+                # A wait in the thread of the event loop stops the loop for this time.
+                calls.append(threading.current_thread().name)
                 time.sleep(work_seconds)
                 return function(*arguments, **options)
 
-            return work
+            with self.subTest(work=name):
+                inputs = self.photos(2)
+                layouts = self.directory / f"layouts-{name}"
+                self.output = self.directory / f"out-{name}" / "book.tex"
+                if with_saved_layouts:
+                    self.convert(inputs, TurnedFigureBackend(), ocr_output_directory=layouts)
+                with (
+                    patch.object(pipeline, "_BackendCalls", HeartbeatCalls),
+                    patch.object(pipeline, name, slow),
+                ):
+                    self.convert(inputs, TurnedFigureBackend(), ocr_output_directory=layouts)
 
-        figure = PageLayout(blocks=(Paragraph("Text."), Figure(box=RED_BOX)))
-        backend = HeartbeatBackend(dict.fromkeys(range(1, 5), figure), delay=0.01)
-        with (
-            patch.object(pipeline, "_make_page_image", slow(pipeline._make_page_image)),
-            patch.object(pipeline, "_crop_figures", slow(pipeline._crop_figures)),
-        ):
-            self.convert(self.photos(4), backend, parallel_pages=2)
+                self.assertEqual(len(self.figure_files()), 2)
+                # The work was in progress while the task ran, and not in its thread.
+                self.assertGreater(len(calls), 0)
+                self.assertNotIn(threading.main_thread().name, calls)
+                self.assertGreater(len(gaps), 20)
+                self.assertLess(max(gaps), work_seconds / 2)
 
-        self.assertEqual(len(self.figure_files()), 4)
-        # The work of 3 page images and 4 crops was in progress while the task ran.
-        self.assertGreater(len(gaps), 50)
-        self.assertLess(max(gaps), work_seconds / 2)
+    def test_region_files_of_box_requests_do_not_stay(self) -> None:
+        # A box request has an image file with a part of the page.
+        readers = 3
+        counts: list[int] = []
+        at_the_end: list[int] = []
+
+        class RegionBackend(AsyncPageBackend):
+            async def locate_figure_async(
+                self, image_path: Path, **hints: object
+            ) -> FigureLocation:
+                await asyncio.sleep(0.01)
+                counts.append(len(list(image_path.parent.glob("*.png"))))
+                self.region_directory = image_path.parent
+                return FigureLocation(Box(100, 100, 900, 900))
+
+            def locate_figure(self, image_path: Path, **hints: object) -> FigureLocation:
+                raise AssertionError("a backend with the async methods gets no synchronous call")
+
+            async def aclose(self) -> None:
+                # All pages are complete here, and the work directory is still there.
+                at_the_end.append(len(list(self.region_directory.iterdir())))
+                await super().aclose()
+
+        figure = PageLayout(blocks=(Paragraph("Text."), Figure(box=Box(250, 250, 750, 750))))
+        backend = RegionBackend(dict.fromkeys(range(1, 13), figure), delay=0.005)
+        self.convert(self.photos(12), backend, parallel_pages=readers)
+
+        self.assertEqual(len(counts), 12)
+        # Not more than one region file for each page in work.
+        self.assertLessEqual(max(counts), readers)
+        self.assertEqual(at_the_end, [0])
 
     def test_backend_with_only_synchronous_methods_gets_one_call_at_a_time(self) -> None:
         # The pipeline does not know that such a backend permits calls from more than
