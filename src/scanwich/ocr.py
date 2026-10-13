@@ -5,6 +5,7 @@ from importlib.metadata import EntryPoint, entry_points
 from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
 
+from scanwich.layout import PageLayout
 from scanwich.models import OcrRegion
 
 ENTRY_POINT_GROUP = "scanwich.ocr_backends"
@@ -16,6 +17,24 @@ class OcrBackend(Protocol):
 
     def recognize(self, image_path: Path) -> Sequence[OcrRegion]:
         """Recognize text in one page image."""
+
+
+@runtime_checkable
+class LayoutBackend(Protocol):
+    """Contract of an OCR provider that also returns the structure of a page.
+
+    A provider implements it in addition to `OcrBackend`. A document writer, such as the
+    LaTeX writer, needs it.
+    """
+
+    def recognize_layout(self, image_path: Path, *, upright: bool = False) -> PageLayout:
+        """Recognize the blocks of one page image in reading order.
+
+        `upright` is True when the caller knows that the page is upright in the image. The
+        provider then does not look for the direction of the page: it reads the page.
+        Without it, a provider that gets a page that is not upright can return the side
+        of the image where the top of the page is, and no blocks.
+        """
 
 
 class OcrBackendFactory(Protocol):

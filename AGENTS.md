@@ -4,7 +4,9 @@
 
 Application code lives in `src/scanwich/`. `cli.py` handles arguments and logging,
 `pipeline.py` coordinates rasterization, OCR, and PDF assembly, and `pdf.py`, `ocr.py`, and
-`models.py` contain focused domain logic. OCR implementations belong in
+`models.py` contain focused domain logic. For LaTeX output, `layout.py` has the provider-neutral
+page layout types and their JSON form, `latex.py` writes them as a LaTeX document, and
+`images.py` reads photos and camera raw files. OCR implementations belong in
 `src/scanwich/backends/`; expose new providers through the `scanwich.ocr_backends` entry-point
 group in `pyproject.toml`. Tests live in `tests/` and follow the source behavior they cover.
 Container model warm-up code is in `docker/`, while Nix packaging is defined by `flake.nix` and
@@ -45,6 +47,13 @@ Tests use the standard-library `unittest` framework. Name files `test_*.py`, tes
 `python -m unittest tests.test_pipeline -v`. Add regression tests for bug fixes and cover plugin
 option parsing, lazy backend initialization, coordinate conversion, and PDF text extraction when
 those areas change. There is no numeric coverage threshold; new behavior should have direct tests.
+`tests.test_latex.CompilationTests` compiles documents with each of `lualatex`, `xelatex`,
+`tectonic`, and `pdflatex` that is on `PATH`, and skips the others. It also reads the text of
+the PDF, which needs the font Latin Modern Math for the first three engines. CI and the Nix
+build have no TeX engine. When you change `latex.py`, run these tests with an engine, for example
+`nix shell nixpkgs#tectonic -c python -m unittest tests.test_latex -v` in the development shell.
+Tests and documentation must not have text or values from a private source document. Use
+invented values.
 
 ## Commit & Pull Request Guidelines
 

@@ -11,6 +11,9 @@ For pip installations, use `pip install "scanwich[easyocr]"`.
 The PDF pipeline itself does not import or depend on
 EasyOCR-specific result types.
 
+Scanwich can also write a PDF or a photo of a page as a LaTeX document.
+See [LaTeX documents](#latex-documents).
+
 ## Run with Nix
 
 The flake provides Python, EasyOCR, pypdfium2/PDFium, Pillow, and ReportLab:
@@ -91,6 +94,134 @@ The workflow adds commit tags: `sha-<short-sha>` for the standard image and `ope
 Use `nix build .#scanwich-openai-compatible` to build the package without a container.
 For direct CLI use, pass `--ocr-backend openai-compatible`.
 
+## LaTeX documents
+
+Scanwich can write a PDF or a photo of a page as a LaTeX document.
+The purpose is an archive copy of an old book.
+The document has the text and the structure of the pages. It is not an image of the pages.
+Give the output file a name that ends in `.tex`:
+
+```console
+export OPENROUTER_API_KEY=...
+scanwich book.pdf book.tex --ocr-backend openai-compatible -l de
+scanwich page.ARW page.tex --ocr-backend openai-compatible -l de --rotate 90
+```
+
+The input is a PDF, an image that Pillow can read, or a camera raw file.
+A PDF with many pages becomes one document. An image is one page.
+For a camera raw file, install the decoder with `pip install "scanwich[raw]"`.
+LibRaw then decodes all the sensor data. Scanwich does not use the small preview image of the file.
+Both Nix packages and both image targets include the decoder.
+
+The document has these parts of the source, in reading order:
+
+- headings, paragraphs, block quotations, and lists;
+- bold, italic, underlined, small-capital, superscript, and subscript text;
+- tables as `longtable` environments, with cells that span columns or rows;
+- illustrations as image files, which the document includes with `\includegraphics`;
+- footnotes as LaTeX footnotes.
+
+Scanwich crops each illustration from the page image.
+The illustrations of `book.tex` are JPEG files of quality 95 in the directory `book-figures` next to the document.
+Their names are `page-0001-figure-01.jpg`, `page-0001-figure-02.jpg`, and so on.
+Keep that directory with the document.
+LaTeX reads the name of the directory, so the name has only ASCII letters, digits, and the characters `.`, `_`, and `-`.
+For a document name with other characters, a hyphen replaces them, and the name gets a part of a hash of the document name.
+For example, `my book.tex` has the directory `my-book-2c7e412c-figures`. Thus two documents in one directory do not share their illustrations.
+A new conversion replaces the files of the earlier conversion that have a name of the form `page-NNNN-figure-NN.jpg`. It does not remove a file with a different name.
+
+Scanwich writes the document after all pages are complete. A conversion that fails does not change an earlier document.
+A conversion fails when a page has no usable layout, and when no page has content. The error message has the number of the page.
+A page with no content in a document that has content gives a `WARNING` log record.
+
+Scanwich does not start a TeX engine. Compile the document with LuaLaTeX, XeLaTeX, or Tectonic:
+
+```console
+latexmk -lualatex book.tex
+tectonic book.tex
+```
+
+These engines read all Unicode text.
+pdfLaTeX also compiles the document when the text has only characters that pdfLaTeX knows.
+The document uses the packages `iftex`, `fontspec`, `graphicx`, `array`, and `longtable`.
+It uses `multirow` only when that package is installed.
+
+The text font of the document does not have some characters, for example a prime mark, a not-equal sign, and Greek letters.
+With LuaLaTeX, XeLaTeX, and Tectonic, such a character comes from the font Latin Modern Math when that font is installed. TeX Live has it in the package `lm-math`.
+The text of the PDF then has the character of the source, so a search finds it and a copy is correct.
+Without that font, and with pdfLaTeX, a math command prints the character. The page then looks the same, but the text of the PDF can have a different character.
+With pdfLaTeX, the text of the PDF has `R`, `P`, and `Q` for the integral, sum, and product signs.
+
+### Page layout JSON
+
+A layout backend returns the structure of each page as JSON. The LaTeX writer makes all the LaTeX from that JSON.
+The backend does not write LaTeX. This has three effects:
+
+- The writer escapes each character of the text. Thus the text of a page cannot add a LaTeX command.
+  The writer also leaves out what stops LuaLaTeX, XeLaTeX, and Tectonic, for example a line break that has no line to end.
+  The compile tests give text that is hard for LaTeX to each engine that is installed.
+- Scanwich can check a reply before it uses it. The `openai-compatible` backend asks the model to correct a reply that it cannot use.
+- An illustration has a box on the page image. Scanwich needs that box to crop the illustration.
+
+`--ocr-output-dir` saves the JSON of each page as `page-000001.json`.
+The module `scanwich.layout` defines the JSON.
+One page has `blocks` in reading order. The block types are `heading`, `paragraph`, `quote`, `list`, `table`, `figure`, `footnote`, `page_header`, `page_footer`, and `page_number`.
+Text can have the tags `<b>`, `<i>`, `<u>`, `<sc>`, `<sup>`, `<sub>`, `<br>`, and `<fn>mark</fn>`.
+A box is `{"left": 120, "top": 300, "right": 880, "bottom": 560}` on a 0-to-1000 grid of the page image.
+The names of the sides leave no doubt about their sequence. The check also accepts the array `[left, top, right, bottom]`.
+
+Content of a reply does not disappear without an error. The check keeps the content, or it rejects the reply:
+
+- It accepts a value that has one clear meaning. Examples are an integer where the page prints digits, `"continued": "true"`, and header rows in a `header` field.
+- It ignores a formatting hint that it does not know, and a field that has no text.
+- It rejects a reply that has text in a field that the layout does not read. Examples are a list in a list item, and a table with a caption and no rows.
+- It rejects a box that is not on the grid: a box on a scale of 0 to 1, and a box with a value above 1020.
+- It rejects text that has a control character. In JSON, a backslash without an escape makes such a character, for example in `\frac`.
+
+The check cannot find each wrong reply.
+It accepts a box that has its sides in a different sequence, and a box in pixels that has no value above 1020.
+It cannot tell the JSON escapes `\n`, `\r`, and `\t` of a backslash without an escape from whitespace.
+An error message of the check has no text from the reply.
+
+LaTeX output needs a backend that has the method `recognize_layout(image_path)`.
+The `openai-compatible` backend has it. EasyOCR returns text lines without structure, so it does not have it.
+
+### Page direction
+
+A photo can show a page that is not upright. A model reads such a page badly.
+Without `--rotate`, the backend first finds the side of the image where the top of the page is.
+The model does not read a page that is not upright. Scanwich turns the page image and sends a second request for that page.
+When the backend reports that the page is not upright after that turn, the conversion fails.
+
+`--rotate DEGREES` gives the direction of all pages: Scanwich turns each page image clockwise by 0, 90, 180, or 270 degrees before recognition.
+The backend then gets no request to find the direction, and each page needs one request.
+Use it when all pages have the same direction. `--rotate 0` is for pages that are upright.
+Scanwich uses the blocks of the backend also when the backend reports a different direction, and writes a `WARNING` log record.
+
+### Differences from the source
+
+Compare the document with the source. A model can read a character incorrectly.
+These differences are intended:
+
+- A running head and a printed page number are not text of the document. They are in a comment line at the start of each page, for example `% Source page 3 (printed page number: 47)`.
+- A paragraph that continues on the next page becomes one paragraph.
+  When the page break divides a word with a hyphen, Scanwich joins the two parts and adds a comment line. Compare that word with the source.
+- LaTeX gives new numbers to the footnotes, because the pages of the document are not the pages of the source.
+  The footnotes of a table and of a caption keep the marks of the source and come after the block.
+- A table has the rules of one of four styles: no rules, horizontal rules, also rules between the columns, or a rule around each cell. A double rule becomes one rule.
+- Scanwich estimates the widths of the table columns from the number of characters in the cells.
+- The document has one column. Text that is at the side of an illustration comes after the illustration.
+- A formula is plain text. Scanwich does not write LaTeX math for it.
+- An illustration is a part of the page image. Scanwich does not correct its colors or its perspective.
+
+The default font of LaTeX has Latin text only.
+LaTeX prints nothing for a character that the font does not have. It then writes a `Missing character` message to the terminal and to the log.
+Scanwich writes common mathematical symbols, and a Greek letter that is alone, with a math font, so the document has them.
+For text in other scripts, set a font that has them with `\setmainfont` in the document.
+A document without content has one empty page, because LaTeX makes no PDF for a document that has no page.
+
+The HTTP API has no LaTeX output.
+
 ## OCR plugins
 
 Select a provider with `--ocr-backend NAME`; inspect installed providers with
@@ -112,6 +243,17 @@ def recognize(self, image_path: Path) -> Sequence[OcrRegion]: ...
 Every `OcrRegion` contains text, optional confidence, and four clockwise pixel points
 starting at the top-left. This normalized boundary keeps rasterization and PDF assembly
 unchanged when another OCR engine is installed.
+
+A provider that can recognize the structure of a page also has this method:
+
+```python
+def recognize_layout(self, image_path: Path, *, upright: bool = False) -> PageLayout: ...
+```
+
+LaTeX output uses that method. `scanwich.layout.page_layout_from_json` makes a `PageLayout` from JSON and checks it.
+The page image has no EXIF orientation.
+For a page that is not upright, a provider can return `PageLayout(page_top="right")` without blocks. Scanwich then turns the page image and calls the method again.
+With `upright=True`, the caller knows that the page is upright. The provider then does not look for the direction: it reads the page and returns its blocks.
 
 Backend options use `KEY=VALUE`; JSON values are decoded automatically. EasyOCR passes
 top-level options to `easyocr.Reader`. A `readtext` JSON object is passed to
@@ -181,6 +323,7 @@ An example is a text that has a double quote without an escape.
 The backend then sends a second request. That request adds the unusable reply and a description of the defect, and it asks the model for a correct reply.
 The backend does not send the first request again. With a temperature of 0, the model mostly repeats the defect.
 `max_attempts` is the maximum number of requests for the regions of one page. The default is 3. Set it to 1 to send no correction request.
+The request for the layout of a page, which LaTeX output uses, has the same correction requests.
 Each correction request has a cost. The session total includes it.
 The backend writes one `WARNING` log record for each unusable reply. The record has the error and no text from the reply.
 If the last reply is also unusable, the page fails with the error of that reply.

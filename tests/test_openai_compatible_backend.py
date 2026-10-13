@@ -24,7 +24,23 @@ from scanwich.backends.openai_compatible import (
     _jpeg_mode_image,
     _working_bytes,
 )
+from scanwich.layout import (
+    BLOCK_TYPES,
+    Box,
+    Figure,
+    Footnote,
+    Heading,
+    LayoutFormatError,
+    ListBlock,
+    ListItem,
+    PageFurniture,
+    PageLayout,
+    Paragraph,
+    Table,
+    TableCell,
+)
 from scanwich.models import OcrRegion, Point
+from scanwich.ocr import LayoutBackend, OcrBackend
 
 LOGGER_NAME = "scanwich.backends.openai_compatible"
 
@@ -966,3 +982,262 @@ class OpenAICompatibleBackendTests(TestCase):
             OpenAICompatibleBackend(languages=["en"], options={"timeout": 0})
         with self.assertRaisesRegex(ValueError, "max_attempts"):
             OpenAICompatibleBackend(languages=["en"], options={"max_attempts": 0})
+
+
+class LayoutRecognitionTests(TestCase):
+    def recognize_layout(
+        self,
+        completions: FakeCompletions,
+        *,
+        image_size: tuple[int, int] = (1200, 800),
+        languages: Sequence[str] = ("fr", "de"),
+        options: dict[str, Any] | None = None,
+        upright: bool = False,
+    ) -> PageLayout:
+        """Return the layout that the backend makes from the replies for one page."""
+        fake_client = SimpleNamespace(chat=SimpleNamespace(completions=completions))
+        fake_openai = SimpleNamespace(OpenAI=lambda **_: fake_client)
+        with TemporaryDirectory() as temporary_directory:
+            image_path = Path(temporary_directory) / "page.png"
+            Image.new("RGB", image_size, "white").save(image_path)
+            backend = OpenAICompatibleBackend(languages=languages, options=options or {})
+
+            with (
+                patch.dict(os.environ, {"OPENROUTER_API_KEY": "test-secret"}),
+                patch.dict(sys.modules, {"openai": fake_openai}),
+            ):
+                return backend.recognize_layout(image_path, upright=upright)
+
+    def test_backend_recognizes_layouts(self) -> None:
+        backend = OpenAICompatibleBackend(languages=["en"], options={})
+        self.assertIsInstance(backend, LayoutBackend)
+        self.assertIsInstance(backend, OcrBackend)
+
+    def test_returns_the_layout_of_the_reply(self) -> None:
+        payload = {
+            "page_top": "top",
+            "content_box": [100, 50, 900, 950],
+            "blocks": [
+                {"type": "page_number", "text": "406"},
+                {"type": "heading", "level": 1, "text": "A <sc>heading</sc>"},
+                {"type": "paragraph", "text": "A paragraph.<fn>1</fn>"},
+                {
+                    "type": "table",
+                    "header_rows": 1,
+                    "rules": "columns",
+                    "rows": [["a", "b"], ["1", {"text": "2", "colspan": 1}]],
+                },
+                {"type": "figure", "box": [200, 300, 700, 600], "caption": "Fig. 1"},
+                {"type": "footnote", "mark": "1", "text": "A footnote."},
+            ],
+        }
+
+        layout = self.recognize_layout(FakeCompletions(json.dumps(payload)))
+
+        self.assertEqual(
+            layout,
+            PageLayout(
+                content_box=Box(100, 50, 900, 950),
+                blocks=(
+                    PageFurniture("page_number", "406"),
+                    Heading("A <sc>heading</sc>"),
+                    Paragraph("A paragraph.<fn>1</fn>"),
+                    Table(
+                        rows=(
+                            (TableCell("a"), TableCell("b")),
+                            (TableCell("1"), TableCell("2")),
+                        ),
+                        header_rows=1,
+                        rules="columns",
+                    ),
+                    Figure(box=Box(200, 300, 700, 600), caption="Fig. 1"),
+                    Footnote("A footnote.", mark="1"),
+                ),
+            ),
+        )
+
+    def test_asks_for_the_layout_as_json(self) -> None:
+        completions = FakeCompletions('{"page_top":"top","blocks":[]}')
+
+        self.assertEqual(self.recognize_layout(completions), PageLayout())
+
+        (request,) = completions.calls
+        self.assertEqual(request["response_format"], {"type": "json_object"})
+        self.assertEqual(request["temperature"], 0)
+        self.assertEqual(sent_image(request).size, (1200, 800))
+        system_message, user_message = request["messages"]
+        self.assertIn(
+            "never translate, summarize, or infer missing text", system_message["content"]
+        )
+        prompt = user_message["content"][0]["text"]
+        self.assertIn("This 1200x800 pixel image shows one page of a printed document.", prompt)
+        self.assertIn("Expected language codes: fr, de.", prompt)
+        box = '{"left":L,"top":T,"right":R,"bottom":B}'
+        # The prompt names each field of the layout that the backend reads. A box has
+        # names for its sides, so that their sequence is not in doubt.
+        for field in (
+            f'{{"page_top":"top","content_box":{box},"blocks":[...]}}',
+            '"continued":true',
+            '"header_rows"',
+            '"colspan"',
+            '"rowspan"',
+            '"rules"',
+            f'"box":{box}',
+            '"caption"',
+            '"mark"',
+            "0-to-1000 grid",
+            "<fn>mark</fn>",
+            # The model does not read a page that is not upright.
+            'Return only {"page_top":"<side>","blocks":[]}.',
+            'Return {"page_top":"top","blocks":[]} for a page that has no content.',
+        ):
+            with self.subTest(field=field):
+                self.assertIn(field, prompt)
+        # The prompt names each block type that the layout parser knows.
+        for block_type in BLOCK_TYPES:
+            with self.subTest(block_type=block_type):
+                self.assertIn(f'{{"type":"{block_type}"', prompt)
+
+    def test_does_not_ask_for_the_direction_of_a_page_that_is_upright(self) -> None:
+        # The caller knows the direction. A request for the direction lets the model
+        # return no blocks, and the page is then not in the document.
+        completions = FakeCompletions('{"blocks":[{"type":"paragraph","text":"Text."}]}')
+
+        layout = self.recognize_layout(completions, upright=True)
+
+        self.assertEqual(layout, PageLayout(blocks=(Paragraph("Text."),)))
+        (request,) = completions.calls
+        prompt = request["messages"][1]["content"][0]["text"]
+        self.assertIn("The page is upright in the image.", prompt)
+        self.assertIn(
+            'Return one JSON object with this shape: {"content_box":'
+            '{"left":L,"top":T,"right":R,"bottom":B},"blocks":[...]}',
+            prompt,
+        )
+        self.assertIn('Return {"blocks":[]} for a page that has no content.', prompt)
+        self.assertNotIn("page_top", prompt)
+        self.assertNotIn("do not read the page", prompt)
+        # The rest of the request is the same as for a page with an unknown direction.
+        other_completions = FakeCompletions('{"blocks":[]}')
+        self.recognize_layout(other_completions)
+        (other_request,) = other_completions.calls
+        other_prompt = other_request["messages"][1]["content"][0]["text"]
+
+        def shared_part(text: str) -> str:
+            return text[text.index("Coordinates.") : text.rindex("Return {")]
+
+        self.assertEqual(shared_part(prompt), shared_part(other_prompt))
+        self.assertGreater(len(shared_part(prompt)), 2000)
+
+    def test_asks_the_model_to_correct_a_layout_that_loses_content(self) -> None:
+        # The reply has a nested list. The layout has no place for it, so its text must
+        # not disappear.
+        secret = "private text of the page"
+        nested = {"marker": "1.", "text": "a", "items": [{"marker": "a)", "text": secret}]}
+        unusable = json.dumps({"blocks": [{"type": "list", "items": [nested]}]})
+        flat = [{"marker": "1.", "text": "a"}, {"marker": "a)", "text": secret}]
+        usable = json.dumps({"blocks": [{"type": "list", "items": flat}]})
+        completions = FakeCompletions(unusable, usable)
+
+        with self.assertLogs("scanwich", level="DEBUG") as captured_logs:
+            layout = self.recognize_layout(completions)
+
+        self.assertEqual(
+            layout,
+            PageLayout(
+                blocks=(
+                    ListBlock(items=(ListItem("a", marker="1."), ListItem(secret, marker="a)"))),
+                )
+            ),
+        )
+        self.assertEqual(len(completions.calls), 2)
+        self.assertEqual(
+            completions.calls[1]["messages"][3]["content"].split("\n")[0],
+            "Your last reply cannot be used: block 1 (list) item 1 has text in a field that "
+            "the layout does not read; its fields are: marker, text",
+        )
+        self.assertNotIn(secret, "\n".join(captured_logs.output))
+
+    def test_returns_the_side_of_a_page_that_is_not_upright(self) -> None:
+        layout = self.recognize_layout(FakeCompletions('{"page_top":"right","blocks":[]}'))
+        self.assertEqual(layout, PageLayout(page_top="right"))
+
+    def test_asks_the_model_to_correct_a_layout_that_it_cannot_use(self) -> None:
+        # The box uses the pixels of the image and not the grid.
+        unusable = json.dumps({"blocks": [{"type": "figure", "box": [100, 200, 2400, 3100]}]})
+        usable = json.dumps({"blocks": [{"type": "figure", "box": [100, 200, 800, 900]}]})
+        completions = FakeCompletions(unusable, usable)
+
+        with self.assertLogs(LOGGER_NAME, level="INFO") as captured_logs:
+            layout = self.recognize_layout(completions)
+
+        self.assertEqual(layout, PageLayout(blocks=(Figure(box=Box(100, 200, 800, 900)),)))
+        first_request, second_request = completions.calls
+        self.assertEqual(second_request["messages"][:2], first_request["messages"])
+        self.assertEqual(
+            second_request["messages"][2:],
+            [
+                {"role": "assistant", "content": unusable},
+                {
+                    "role": "user",
+                    "content": (
+                        "Your last reply cannot be used: block 1 (figure) box must use the "
+                        "0-to-1000 grid of the image, not its pixels\n"
+                        "Return the complete JSON object again, in the shape that the first "
+                        'message gives. In a JSON string, write a double quote as \\" and a '
+                        "backslash as \\\\. Return only the JSON object."
+                    ),
+                },
+            ],
+        )
+        defect = (
+            "LayoutFormatError: block 1 (figure) box must use the 0-to-1000 grid of the image, "
+            "not its pixels"
+        )
+        self.assertIn(
+            f"WARNING:{LOGGER_NAME}:OpenAI-compatible model {DEFAULT_MODEL} "
+            f"returned an unusable reply in attempt 1 of 3 ({defect})",
+            captured_logs.output,
+        )
+        self.assertIn(
+            f"INFO:{LOGGER_NAME}:OpenAI-compatible model {DEFAULT_MODEL} "
+            "corrected its reply in attempt 2 of 3",
+            captured_logs.output,
+        )
+
+    def test_fails_when_each_attempt_gives_an_unusable_layout(self) -> None:
+        completions = FakeCompletions('{"blocks":[{"type":"table"}]}')
+        with (
+            self.assertLogs(LOGGER_NAME, level="WARNING"),
+            self.assertRaisesRegex(LayoutFormatError, r"block 1 \(table\) must have a rows array"),
+        ):
+            self.recognize_layout(completions)
+        self.assertEqual(len(completions.calls), DEFAULT_MAX_ATTEMPTS)
+
+        completions = FakeCompletions("not JSON")
+        with (
+            self.assertLogs(LOGGER_NAME, level="WARNING"),
+            self.assertRaisesRegex(RuntimeError, "returned invalid JSON"),
+        ):
+            self.recognize_layout(completions, options={"max_attempts": 1})
+        self.assertEqual(len(completions.calls), 1)
+
+    def test_log_records_have_no_text_from_the_reply(self) -> None:
+        secret = "private text of the page"
+        unusable = json.dumps(
+            {"blocks": [{"type": secret, "text": secret}, {"type": secret, "rows": secret}]}
+        )
+        completions = FakeCompletions(unusable)
+        with (
+            self.assertLogs("scanwich", level="DEBUG") as captured_logs,
+            self.assertRaises(LayoutFormatError) as raised,
+        ):
+            self.recognize_layout(completions)
+
+        self.assertEqual(
+            str(raised.exception),
+            "block 2 (unknown type) has a type that the layout does not have; the types are: "
+            "heading, paragraph, quote, list, table, figure, footnote, page_header, "
+            "page_footer, page_number",
+        )
+        self.assertNotIn(secret, "\n".join(captured_logs.output))

@@ -25,6 +25,7 @@
           python-multipart
           pillow
           pypdfium2
+          rawpy
           reportlab
         ]
         ++ nixpkgs.lib.optionals withEasyocr [ pythonPackages.easyocr ];

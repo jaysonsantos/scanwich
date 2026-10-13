@@ -9,13 +9,14 @@ import math
 import os
 import time
 import uuid
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any
+from typing import Any, TypeVar
 
 from PIL import Image
 
+from scanwich.layout import LayoutFormatError, PageLayout, page_layout_from_json
 from scanwich.models import OcrRegion, Point
 
 DEFAULT_MODEL = "deepseek/deepseek-v4-flash-vision-exp"
@@ -34,7 +35,7 @@ DEFAULT_MAX_ATTEMPTS = 3
 # A correction request shows the model this many characters before a JSON error.
 JSON_ERROR_CONTEXT_CHARACTERS = 60
 # A reply with one of these errors has content, but the content is not the OCR result.
-UNUSABLE_REPLY_ERRORS = (RuntimeError, TypeError)
+UNUSABLE_REPLY_ERRORS = (RuntimeError, TypeError, LayoutFormatError)
 BYTES_PER_MEBIBYTE = 1024 * 1024
 # Some providers reject an image when its base64 text is larger than 5 MiB.
 MAX_IMAGE_BASE64_BYTES = 5 * BYTES_PER_MEBIBYTE
@@ -97,6 +98,8 @@ SESSION_ID_HEADER = "X-Session-Id"
 
 logger = logging.getLogger(__name__)
 
+Result = TypeVar("Result")
+
 
 @dataclass(frozen=True)
 class RequestImage:
@@ -158,8 +161,31 @@ class OpenAICompatibleBackend:
 
     def recognize(self, image_path: Path) -> list[OcrRegion]:
         image = _encode_image(image_path)
+        return self._complete(
+            self._request(image),
+            lambda content, attempt: self._parse_reply(content, image, attempt),
+        )
+
+    def recognize_layout(self, image_path: Path, *, upright: bool = False) -> PageLayout:
+        """Return the blocks of one page in reading order.
+
+        With `upright`, the caller knows that the page is upright in the image. The model
+        then gets no request to find the direction of the page.
+
+        The boxes of the layout use the 0-to-1000 grid of the image that the model sees.
+        Thus the page image must have no EXIF orientation.
+        """
+        image = _encode_image(image_path)
+        request = self._request(image, layout=True, upright=upright)
+        return self._complete(request, self._parse_layout_reply)
+
+    def _complete(self, request: dict[str, Any], parse: Callable[[str, int], Result]) -> Result:
+        """Send a request, and return the result that `parse` makes from the reply.
+
+        `parse` gets the text of the reply and the number of the attempt. When it raises
+        an error for an unusable reply, the model gets a request to correct the reply.
+        """
         client = self._get_client()
-        request = self._request(image)
         attempt = 1
         while True:
             logger.info("Sending page image to OpenAI-compatible model %s", self._model)
@@ -179,7 +205,7 @@ class OpenAICompatibleBackend:
             self._log_cost(completion)
             content = self._completion_content(completion, provider_text=attempt == 1)
             try:
-                return self._parse_reply(content, image, attempt)
+                return parse(content, attempt)
             except UNUSABLE_REPLY_ERRORS as error:
                 self._log_unusable_reply(error, attempt)
                 if attempt == self._max_attempts:
@@ -231,7 +257,14 @@ class OpenAICompatibleBackend:
         self._log_cost(completion)
         return self._completion_content(completion, allow_empty=True)
 
-    def _request(self, image: RequestImage, *, plain_text: bool = False) -> dict[str, Any]:
+    def _request(
+        self,
+        image: RequestImage,
+        *,
+        plain_text: bool = False,
+        layout: bool = False,
+        upright: bool = False,
+    ) -> dict[str, Any]:
         width, height = image.width, image.height
         request: dict[str, Any] = {
             "model": self._model,
@@ -269,12 +302,25 @@ class OpenAICompatibleBackend:
                 "and diacritics. Return only the document text, without JSON, Markdown fences, "
                 "coordinates, or commentary. Return an empty string if no text is visible."
             )
+        if layout:
+            request["messages"][1]["content"][0]["text"] = self._layout_prompt(
+                width=width, height=height, upright=upright
+            )
 
         return request
 
     def _parse_reply(self, content: str, image: RequestImage, attempt: int) -> list[OcrRegion]:
         payload = _parse_json_payload(content)
         regions = _parse_regions(payload, image_width=image.width, image_height=image.height)
+        self._log_corrected_reply(attempt)
+        return _scale_regions(regions, image)
+
+    def _parse_layout_reply(self, content: str, attempt: int) -> PageLayout:
+        layout = page_layout_from_json(_parse_json_payload(content))
+        self._log_corrected_reply(attempt)
+        return layout
+
+    def _log_corrected_reply(self, attempt: int) -> None:
         if attempt > 1:
             logger.info(
                 "OpenAI-compatible model %s corrected its reply in attempt %d of %d",
@@ -282,7 +328,6 @@ class OpenAICompatibleBackend:
                 attempt,
                 self._max_attempts,
             )
-        return _scale_regions(regions, image)
 
     def _log_unusable_reply(self, error: Exception, attempt: int) -> None:
         logger.warning(
@@ -422,6 +467,87 @@ class OpenAICompatibleBackend:
             '"polygon":[{"x":0,"y":0},{"x":1000,"y":0},{"x":1000,"y":1000},'
             '{"x":0,"y":1000}]}]}. The coordinate_system may instead be "pixels" only '
             "when every coordinate is expressed in native image pixels."
+        )
+
+    def _layout_prompt(self, *, width: int, height: int, upright: bool = False) -> str:
+        """Return the request for the layout of a page, in the JSON form of `PageLayout`.
+
+        With `upright`, the caller knows the direction of the page. The request then has
+        no step that finds the direction, so the model reads the page in each case.
+        """
+        languages = ", ".join(self._languages) or "unknown"
+        box = '{"left":L,"top":T,"right":R,"bottom":B}'
+        if upright:
+            shape = f'{{"content_box":{box},"blocks":[...]}}'
+            direction = "Direction of the page. The page is upright in the image.\n\n"
+            no_content = '{"blocks":[]}'
+        else:
+            shape = f'{{"page_top":"top","content_box":{box},"blocks":[...]}}'
+            direction = (
+                'Direction of the page. "page_top" is the side of the image where the top of '
+                'the page is: "top", "right", "bottom", or "left". When it is not "top", do '
+                'not read the page. Return only {"page_top":"<side>","blocks":[]}. You then '
+                "get the image again, turned upright.\n\n"
+            )
+            no_content = '{"page_top":"top","blocks":[]}'
+        return (
+            f"This {width}x{height} pixel image shows one page of a printed document. "
+            "Convert the page to structured data for an archive copy of the document. "
+            f"Expected language codes: {languages}.\n\n"
+            f"Return one JSON object with this shape: {shape}\n\n"
+            f"{direction}"
+            f"Coordinates. A box is {box} on a 0-to-1000 grid, where (0, 0) is the top-left "
+            "corner of the image and (1000, 1000) is its bottom-right corner. L and R are "
+            "distances from the left edge of the image. T and B are distances from its top "
+            'edge. "content_box" is the box of the printed area of the page: all its text '
+            "and illustrations, without the margins.\n\n"
+            "Scope. Read only the page that fills most of the image. Ignore the background, "
+            "the binding, fingers, and the visible parts of other pages. Do not translate, "
+            "correct, modernize, or complete the text. Keep the spelling, the capital letters, "
+            "the punctuation, the numbers, and the diacritics of the page.\n\n"
+            'Blocks. "blocks" has the parts of the page in reading order. Each block is one '
+            "of these, with only the fields that are shown:\n"
+            '- {"type":"page_header","text":"..."}, {"type":"page_footer","text":"..."}, and '
+            '{"type":"page_number","text":"..."}: the running head, the running foot, and the '
+            "page number that the page prints outside its text.\n"
+            '- {"type":"heading","level":1,"text":"..."}: level 1 is a chapter or the main '
+            'title, level 2 is a section, and level 3 is a subsection. Add "align":"center" '
+            "for a centered heading.\n"
+            '- {"type":"paragraph","text":"..."}: one paragraph. Write its lines as one line '
+            "of text, with a space between the lines. When the end of a line divides a word "
+            "with a hyphen, write that word in one piece and without that hyphen. Add "
+            '"align":"center" or "align":"right" for a paragraph that the page centers or '
+            'sets flush right. Add "continued":true when the first paragraph of the page '
+            "continues a paragraph of the page before.\n"
+            '- {"type":"quote","text":"..."}: a block quotation that the page indents.\n'
+            '- {"type":"list","ordered":false,"items":[{"marker":"a)","text":"..."}]}: a '
+            'list. "marker" is the marker that the page prints. A list in a list is not '
+            "possible: write its items as items of the one list, in reading order.\n"
+            '- {"type":"table","caption":"...","header_rows":1,"columns":["left","right"],'
+            '"rules":"horizontal","rows":[["cell",{"text":"cell","colspan":2}]]}: a table. '
+            '"rows" has all rows, and the header rows are the first ones. Each row is an '
+            'array of cells. A cell is a string, or an object with "text" and optionally '
+            '"colspan" and "rowspan". Write an empty cell as "". Keep '
+            'ditto marks. "columns" has the alignment of each column: "left", "center", or '
+            '"right". "rules" tells which rules the table prints: "none", "horizontal" '
+            '(rules above the table, below the header, and below the table), "columns" (also '
+            'vertical rules between the columns), or "grid" (a rule around each cell).\n'
+            f'- {{"type":"figure","box":{box},"caption":"..."}}: an '
+            "illustration, photograph, diagram, map, ornament, stamp, or signature. "
+            '"box" contains the full picture with its labels, and not its caption. Do not '
+            "write the text inside a picture.\n"
+            '- {"type":"footnote","mark":"1","text":"..."}: a footnote, with its reference '
+            "mark as the page prints it.\n"
+            'Leave out "caption" when there is none.\n\n'
+            'Inline markup. In "text", in "caption", and in table cells, use only these tags: '
+            "<b> bold, <i> italic, <u> underlined, <sc> small capitals (write the small "
+            "capitals as lowercase letters), <sup> superscript, <sub> subscript, <br> for a "
+            "line break that the page makes on purpose (verse, an address, the lines of a "
+            "title), and <fn>mark</fn> at the place of a footnote reference mark. <fn> has "
+            "only the mark. The text of the footnote is in its footnote block. Do not use "
+            "Markdown, LaTeX, or other HTML. Write a formula as plain text with Unicode "
+            "characters.\n\n"
+            f"Return {no_content} for a page that has no content. Return only the JSON object."
         )
 
 

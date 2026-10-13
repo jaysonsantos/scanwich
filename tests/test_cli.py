@@ -1,0 +1,173 @@
+import io
+import logging
+from contextlib import redirect_stderr
+from pathlib import Path
+from tempfile import TemporaryDirectory
+from unittest import TestCase
+from unittest.mock import patch
+
+from PIL import Image
+
+from scanwich.cli import main
+from scanwich.layout import PageLayout, Paragraph
+from scanwich.models import OcrRegion
+
+
+class RegionBackend:
+    """A backend that returns text regions and no layout."""
+
+    def recognize(self, image_path: Path) -> list[OcrRegion]:
+        return []
+
+
+class LayoutCapableBackend(RegionBackend):
+    def __init__(self) -> None:
+        self.image_sizes: list[tuple[int, int]] = []
+
+    def recognize_layout(self, image_path: Path, *, upright: bool = False) -> PageLayout:
+        with Image.open(image_path) as image:
+            self.image_sizes.append(image.size)
+        return PageLayout(blocks=(Paragraph("The text of the page."),))
+
+
+class UnreadPageBackend(RegionBackend):
+    """A backend that reports a page that is not upright, and thus returns no blocks."""
+
+    def recognize_layout(self, image_path: Path, *, upright: bool = False) -> PageLayout:
+        return PageLayout(page_top="left")
+
+
+class CliTests(TestCase):
+    def setUp(self) -> None:
+        temporary_directory = TemporaryDirectory()
+        self.addCleanup(temporary_directory.cleanup)
+        self.directory = Path(temporary_directory.name)
+        self.photo = self.directory / "photo.png"
+        Image.new("RGB", (40, 20), "white").save(self.photo)
+        # `main` sets the handlers of the root logger.
+        root_logger = logging.getLogger()
+        handlers, level = root_logger.handlers[:], root_logger.level
+        self.addCleanup(root_logger.setLevel, level)
+        self.addCleanup(setattr, root_logger, "handlers", handlers)
+
+    def run_main(self, arguments: list[str], backend: object) -> tuple[int, str]:
+        """Return the exit code and the log output of one command."""
+        log_output = io.StringIO()
+        with (
+            patch("scanwich.cli.load_backend", return_value=backend) as load_backend,
+            redirect_stderr(log_output),
+        ):
+            exit_code = main(arguments)
+        self.load_backend = load_backend
+        return exit_code, log_output.getvalue()
+
+    def test_output_name_with_the_tex_suffix_gives_a_latex_document(self) -> None:
+        for name in ("page.tex", "PAGE.TEX"):
+            with self.subTest(name=name):
+                output = self.directory / name
+                backend = LayoutCapableBackend()
+
+                exit_code, log_output = self.run_main(
+                    [
+                        str(self.photo),
+                        str(output),
+                        "--ocr-backend",
+                        "example",
+                        "-l",
+                        "fr",
+                        "--rotate",
+                        "90",
+                    ],
+                    backend,
+                )
+
+                self.assertEqual(exit_code, 0, log_output)
+                self.assertIn("The text of the page.", output.read_text(encoding="utf-8"))
+                # The option turns the page image before the backend gets it.
+                self.assertEqual(backend.image_sizes, [(20, 40)])
+                self.load_backend.assert_called_once_with("example", languages=["fr"], options={})
+                self.assertIn(f"INFO: Wrote LaTeX document to {output.resolve()}", log_output)
+
+    def test_latex_output_needs_a_backend_that_recognizes_layouts(self) -> None:
+        output = self.directory / "page.tex"
+
+        exit_code, log_output = self.run_main(
+            [str(self.photo), str(output), "--ocr-backend", "example"], RegionBackend()
+        )
+
+        self.assertEqual(exit_code, 1)
+        self.assertIn(
+            "ERROR: OCR backend 'example' does not recognize the layout of a page; LaTeX output "
+            "needs a backend that does, for example --ocr-backend openai-compatible",
+            log_output,
+        )
+        self.assertFalse(output.exists())
+
+    def test_page_without_a_usable_layout_is_a_failure(self) -> None:
+        # A page must not disappear from the document with exit code 0.
+        output = self.directory / "page.tex"
+        for options in ([], ["--rotate", "0"]):
+            with self.subTest(options=options):
+                exit_code, log_output = self.run_main(
+                    [str(self.photo), str(output), "--ocr-backend", "example", *options],
+                    UnreadPageBackend(),
+                )
+                self.assertEqual(exit_code, 1)
+                self.assertIn("ERROR: page 1 has no usable layout: the backend", log_output)
+                self.assertFalse(output.exists())
+
+    def test_other_output_names_give_a_searchable_pdf(self) -> None:
+        backend = LayoutCapableBackend()
+        output = self.directory / "page.pdf"
+        with (
+            patch("scanwich.cli.convert_pdf") as convert_pdf,
+            patch("scanwich.cli.convert_to_latex") as convert_to_latex,
+        ):
+            exit_code, _ = self.run_main(
+                [str(self.photo), str(output), "--dpi", "150", "--ocr-output-dir", "ocr"], backend
+            )
+
+        self.assertEqual(exit_code, 0)
+        convert_pdf.assert_called_once_with(
+            self.photo, output, backend=backend, dpi=150, ocr_output_directory=Path("ocr")
+        )
+        convert_to_latex.assert_not_called()
+
+    def test_passes_the_options_to_the_latex_conversion(self) -> None:
+        backend = LayoutCapableBackend()
+        output = self.directory / "page.tex"
+        with patch("scanwich.cli.convert_to_latex") as convert_to_latex:
+            exit_code, _ = self.run_main(
+                [str(self.photo), str(output), "--dpi", "150", "--ocr-output-dir", "layout"],
+                backend,
+            )
+
+        self.assertEqual(exit_code, 0)
+        # Without `--rotate`, the backend finds the direction of each page.
+        convert_to_latex.assert_called_once_with(
+            self.photo,
+            output,
+            backend=backend,
+            dpi=150,
+            rotate=None,
+            ocr_output_directory=Path("layout"),
+        )
+
+    def test_rejects_commands_that_have_no_meaning(self) -> None:
+        cases = {
+            "--rotate applies to LaTeX output only": [
+                str(self.photo),
+                "page.pdf",
+                "--rotate",
+                "90",
+            ],
+            "argument --rotate: invalid choice": [str(self.photo), "page.tex", "--rotate", "45"],
+            "input and output are required": [str(self.photo)],
+        }
+        for message, arguments in cases.items():
+            with self.subTest(message=message):
+                usage = io.StringIO()
+                with redirect_stderr(usage), self.assertRaises(SystemExit) as raised:
+                    main(arguments)
+                self.assertEqual(raised.exception.code, 2)
+                self.assertIn(message, usage.getvalue())

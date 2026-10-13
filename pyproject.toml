@@ -19,6 +19,7 @@ dependencies = [
 [project.optional-dependencies]
 easyocr = ["easyocr>=1.7.2"]
 openai-compatible = ["openai>=1.0"]
+raw = ["rawpy>=0.24"]
 api = [
   "fastapi>=0.115",
   "pydantic>=2",
