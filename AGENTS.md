@@ -60,6 +60,11 @@ build have no TeX engine. When you change `latex.py`, run these tests with an en
 backends tell a page by the size of its image, and not by the sequence of the requests, because
 the pages are in work at the same time. Keep a test of the sequence of replies free from short
 time limits: run the file some times under processor load when you change it.
+To show that a test fails without a correction, run the test with a copy of the tree that
+does not have the correction. The development shell takes `src/` from the work tree of the
+directory where it starts, and a `PYTHONPATH` of your own does not replace it. Thus start the
+shell in the copy, or put the `src` of the copy first in `sys.path` before the import of
+`scanwich`. Check `scanwich.__file__` in each such run.
 Tests and documentation must not have text or values from a private source document. Use
 invented values.
 
