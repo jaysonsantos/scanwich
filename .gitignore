@@ -2,6 +2,7 @@ __pycache__/
 *.egg-info/
 .coverage
 .direnv/
+.env
 .pytest_cache/
 .ruff_cache/
 .venv/
