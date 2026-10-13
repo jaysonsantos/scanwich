@@ -358,7 +358,13 @@ class CliTests(TestCase):
             photos.append(self.directory / f"photo-{number}.png")
             Image.new("RGB", (40 + number, 20), "white").save(photos[-1])
         output, layouts = self.directory / "out" / "book.tex", self.directory / "layouts"
-        handler = signal.getsignal(signal.SIGTERM)
+
+        def handler(*arguments: object) -> None:
+            # Without this handler, a command that does not take the signal ends the
+            # process of the tests.
+            raise AssertionError("the command did not take the signal")
+
+        self.addCleanup(signal.signal, signal.SIGTERM, signal.signal(signal.SIGTERM, handler))
         backend = StoppedBackend()
 
         exit_code, log_output = self.run_main(
