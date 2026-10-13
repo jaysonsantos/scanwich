@@ -1,6 +1,8 @@
 import base64
+import io
 import json
 import os
+import random
 import sys
 import uuid
 from collections.abc import Sequence
@@ -14,6 +16,7 @@ from unittest.mock import ANY, patch
 from PIL import Image
 
 from scanwich.backends.openai_compatible import (
+    DEFAULT_MAX_ATTEMPTS,
     DEFAULT_MODEL,
     PROVIDER_DETAIL_MAX_CHARACTERS,
     OpenAICompatibleBackend,
@@ -24,21 +27,33 @@ LOGGER_NAME = "scanwich.backends.openai_compatible"
 
 
 class FakeCompletions:
-    def __init__(self, content: str, *, finish_reason: str | None = "stop") -> None:
+    """Answer the requests with the contents in sequence. The last content repeats."""
+
+    def __init__(self, *contents: str, finish_reason: str | None = "stop") -> None:
         self.calls: list[dict[str, Any]] = []
-        self._content = content
+        self._contents = contents
         self._finish_reason = finish_reason
 
     def create(self, **request: Any) -> SimpleNamespace:
+        content = self._contents[min(len(self.calls), len(self._contents) - 1)]
         self.calls.append(request)
         return SimpleNamespace(
             choices=[
                 SimpleNamespace(
                     finish_reason=self._finish_reason,
-                    message=SimpleNamespace(content=self._content),
+                    message=SimpleNamespace(content=content),
                 )
             ]
         )
+
+
+def sent_image(request: dict[str, Any]) -> Image.Image:
+    """Return the image that one request has."""
+    prefix, encoded_image = request["messages"][1]["content"][1]["image_url"]["url"].split(",")
+    assert prefix == "data:image/jpeg;base64", prefix
+    image = Image.open(io.BytesIO(base64.b64decode(encoded_image)))
+    assert image.format == "JPEG", image.format
+    return image
 
 
 def box(text: str, left: float, top: float, right: float, bottom: float) -> dict[str, Any]:
@@ -70,6 +85,27 @@ class OpenAICompatibleBackendTests(TestCase):
             image_path = Path(temporary_directory) / "page.png"
             Image.new("RGB", image_size, "white").save(image_path)
             backend = OpenAICompatibleBackend(languages=["en"], options={})
+
+            with (
+                patch.dict(os.environ, {"OPENROUTER_API_KEY": "test-secret"}),
+                patch.dict(sys.modules, {"openai": fake_openai}),
+            ):
+                return backend.recognize(image_path)
+
+    def recognize_replies(
+        self,
+        completions: FakeCompletions,
+        *,
+        image: Image.Image | None = None,
+        options: dict[str, Any] | None = None,
+    ) -> list[OcrRegion]:
+        """Return the regions that the backend makes from the replies for one page."""
+        fake_client = SimpleNamespace(chat=SimpleNamespace(completions=completions))
+        fake_openai = SimpleNamespace(OpenAI=lambda **_: fake_client)
+        with TemporaryDirectory() as temporary_directory:
+            image_path = Path(temporary_directory) / "page.png"
+            (image or Image.new("RGB", (2000, 3000), "white")).save(image_path)
+            backend = OpenAICompatibleBackend(languages=["en"], options=options or {})
 
             with (
                 patch.dict(os.environ, {"OPENROUTER_API_KEY": "test-secret"}),
@@ -150,7 +186,6 @@ class OpenAICompatibleBackendTests(TestCase):
         with TemporaryDirectory() as temporary_directory:
             image_path = Path(temporary_directory) / "page.png"
             Image.new("RGB", (200, 100), "white").save(image_path)
-            expected_image_bytes = image_path.read_bytes()
             backend = OpenAICompatibleBackend(languages=["pt", "en"], options={})
 
             with (
@@ -190,10 +225,10 @@ class OpenAICompatibleBackendTests(TestCase):
         user_content = request["messages"][1]["content"]
         self.assertIn("Expected language codes: pt, en", user_content[0]["text"])
         self.assertIn('{"coordinate_system":"normalized","regions":[', user_content[0]["text"])
-        image_url = user_content[1]["image_url"]["url"]
-        prefix, encoded_image = image_url.split(",", maxsplit=1)
-        self.assertEqual(prefix, "data:image/png;base64")
-        self.assertEqual(base64.b64decode(encoded_image), expected_image_bytes)
+        self.assertIn("in this 200x100 pixel document image", user_content[0]["text"])
+        image = sent_image(request)
+        self.assertEqual((image.size, image.mode), ((200, 100), "RGB"))
+        self.assertEqual(image.getpixel((100, 50)), (255, 255, 255))
         progress = "\n".join(captured_logs.output)
         self.assertIn("Initializing OpenAI-compatible client", progress)
         self.assertIn("OpenAI-compatible response received after", progress)
@@ -233,6 +268,8 @@ class OpenAICompatibleBackendTests(TestCase):
                 self.assertRaisesRegex(RuntimeError, "finish_reason='length'"),
             ):
                 backend.recognize(image_path)
+        # A new request cannot correct a reply that the provider stopped.
+        self.assertEqual(len(completions.calls), 1)
 
     def test_reports_provider_error_for_a_reply_without_choices(self) -> None:
         no_choices = "OpenAI-compatible service returned no completion choices"
@@ -574,6 +611,169 @@ class OpenAICompatibleBackendTests(TestCase):
             (Point(100, 120), Point(500, 120), Point(500, 180), Point(100, 180)),
         )
 
+    def test_sends_other_image_types_as_jpeg_with_a_white_background(self) -> None:
+        empty = json.dumps({"coordinate_system": "normalized", "regions": []})
+        white_palette = Image.new("P", (40, 20), 0)
+        white_palette.putpalette([255, 255, 255])
+        images = (
+            Image.new("RGBA", (40, 20), (0, 0, 0, 0)),
+            Image.new("LA", (40, 20), (0, 0)),
+            Image.new("L", (40, 20), 255),
+            Image.new("1", (40, 20), 1),
+            white_palette,
+            # 16-bit gray, as some scanners write it.
+            Image.new("I;16", (40, 20), 65_000),
+        )
+        for image in images:
+            with self.subTest(mode=image.mode):
+                completions = FakeCompletions(empty)
+                self.recognize_replies(completions, image=image)
+                sent = sent_image(completions.calls[0])
+                self.assertEqual(sent.size, (40, 20))
+                darkest, _ = sent.convert("L").getextrema()
+                self.assertGreaterEqual(darkest, 250)
+
+    def test_scales_16_bit_gray_values_to_8_bits(self) -> None:
+        completions = FakeCompletions(json.dumps({"coordinate_system": "pixels", "regions": []}))
+        # Half of the 16-bit range must become half of the 8-bit range, not white.
+        self.recognize_replies(completions, image=Image.new("I;16", (40, 20), 32_768))
+        darkest, lightest = sent_image(completions.calls[0]).convert("L").getextrema()
+        self.assertAlmostEqual(darkest, 128, delta=2)
+        self.assertAlmostEqual(lightest, 128, delta=2)
+
+    def test_scales_down_an_image_above_the_size_limit(self) -> None:
+        noise = random.Random(0).randbytes(400 * 200 * 3)
+        page = Image.frombytes("RGB", (400, 200), noise)
+        limit = 20_000
+
+        def recognize(coordinate_system: str, region: dict[str, Any]) -> tuple[Any, ...]:
+            payload = {"coordinate_system": coordinate_system, "regions": [region]}
+            completions = FakeCompletions(json.dumps(payload))
+            with (
+                patch("scanwich.backends.openai_compatible.MAX_IMAGE_BYTES", limit),
+                self.assertLogs(LOGGER_NAME, level="WARNING") as logs,
+            ):
+                (region,) = self.recognize_replies(completions, image=page)
+            too_large = [line for line in logs.output if "too large" in line]
+            return region.polygon, completions.calls[0], too_large
+
+        polygon, request, (record,) = recognize("normalized", box("text", 100, 100, 900, 900))
+        user_content = request["messages"][1]["content"]
+        encoded_image = user_content[1]["image_url"]["url"].split(",")[1]
+        self.assertLessEqual(len(base64.b64decode(encoded_image)), limit)
+        sent = sent_image(request)
+        self.assertLess(sent.width, 400)
+        self.assertAlmostEqual(sent.width / sent.height, 2, delta=0.05)
+        size = f"{sent.width}x{sent.height}"
+        self.assertIn(f"in this {size} pixel document image", user_content[0]["text"])
+        self.assertIn(
+            f"page image of 400x200 pixels is too large for one request; sending it as {size} "
+            f"pixels ({len(base64.b64decode(encoded_image))} bytes)",
+            record,
+        )
+        # The regions use the pixels of the page image, not of the smaller image.
+        self.assert_polygons_almost_equal(polygon, corners(40, 20, 360, 180))
+        polygon, _, _ = recognize("pixels", box("text", 0, 0, *sent.size))
+        self.assert_polygons_almost_equal(polygon, corners(0, 0, 400, 200))
+
+    def assert_polygons_almost_equal(
+        self, polygon: Sequence[Point], expected: Sequence[Point]
+    ) -> None:
+        for point, expected_point in zip(polygon, expected, strict=True):
+            self.assertAlmostEqual(point.x, expected_point.x)
+            self.assertAlmostEqual(point.y, expected_point.y)
+
+    def test_asks_the_model_to_correct_an_unusable_reply(self) -> None:
+        good_region = box('private „letter" end', 100, 100, 900, 130)
+        good = json.dumps(
+            {"coordinate_system": "normalized", "regions": [good_region]}, ensure_ascii=False
+        )
+        cases = (
+            (
+                "quote without an escape",
+                good.replace('\\"', '"'),
+                (
+                    "RuntimeError: OpenAI-compatible service returned invalid JSON: "
+                    "Expecting ',' delimiter: line 1 column 76 (char 75)"
+                ),
+                (
+                    "Your last reply cannot be used: it is not valid JSON (Expecting ',' "
+                    "delimiter). The JSON parser stopped directly after this text: "
+                    'stem": "normalized", "regions": [{"text": "private „letter" \n'
+                ),
+            ),
+            (
+                "point in the list of regions",
+                json.dumps(
+                    {"coordinate_system": "normalized", "regions": [good_region, {"x": 1, "y": 2}]}
+                ),
+                "TypeError: OpenAI-compatible OCR region 2 text must be a string",
+                (
+                    "Your last reply cannot be used: "
+                    "OpenAI-compatible OCR region 2 text must be a string\n"
+                ),
+            ),
+        )
+        for name, unusable, defect, correction_start in cases:
+            with self.subTest(name):
+                completions = FakeCompletions(unusable, good)
+                with self.assertLogs(LOGGER_NAME, level="INFO") as logs:
+                    regions = self.recognize_replies(completions)
+
+                self.assertEqual([region.text for region in regions], ['private „letter" end'])
+                first, second = completions.calls
+                self.assertEqual(len(first["messages"]), 2)
+                self.assertEqual(second["messages"][:2], first["messages"])
+                self.assertEqual(second["messages"][2], {"role": "assistant", "content": unusable})
+                correction = second["messages"][3]
+                self.assertEqual(correction["role"], "user")
+                self.assertEqual(
+                    correction["content"],
+                    correction_start
+                    + "Return the complete JSON object again, in the shape that the first "
+                    'message gives. In a JSON string, write a double quote as \\" and a '
+                    "backslash as \\\\. Return only the JSON object.",
+                )
+                # Only the messages change.
+                del first["messages"], second["messages"]
+                self.assertEqual(second, first)
+                self.assertEqual(
+                    [line for line in logs.output if "attempt" in line],
+                    [
+                        (
+                            f"WARNING:{LOGGER_NAME}:OpenAI-compatible model {DEFAULT_MODEL} "
+                            f"returned an unusable reply in attempt 1 of 3 ({defect}); "
+                            "asking the model to correct it"
+                        ),
+                        (
+                            f"INFO:{LOGGER_NAME}:OpenAI-compatible model {DEFAULT_MODEL} "
+                            "corrected its reply in attempt 2 of 3"
+                        ),
+                    ],
+                )
+                self.assertNotIn("private", "\n".join(logs.output))
+
+    def test_stops_after_the_maximum_number_of_attempts(self) -> None:
+        unusable = '{"coordinate_system": "normalized", "regions": [{"text": "private" letter"}]}'
+        self.assertEqual(DEFAULT_MAX_ATTEMPTS, 3)
+        for options, attempts in (({}, 3), ({"max_attempts": 1}, 1), ({"max_attempts": 2}, 2)):
+            with self.subTest(options=options):
+                completions = FakeCompletions(unusable)
+                with (
+                    self.assertLogs(LOGGER_NAME, level="INFO") as logs,
+                    self.assertRaisesRegex(RuntimeError, "returned invalid JSON$") as raised,
+                ):
+                    self.recognize_replies(completions, options=options)
+
+                self.assertEqual(len(completions.calls), attempts)
+                self.assertEqual(
+                    [len(call["messages"]) for call in completions.calls],
+                    [2 * attempt for attempt in range(1, attempts + 1)],
+                )
+                warnings = [line for line in logs.output if line.startswith("WARNING")]
+                self.assertEqual(len(warnings), attempts - 1)
+                self.assertNotIn("private", str(raised.exception) + "\n".join(logs.output))
+
     def test_rejects_unknown_and_invalid_options(self) -> None:
         with self.assertRaisesRegex(TypeError, "unsupported.*unknown"):
             OpenAICompatibleBackend(languages=["en"], options={"unknown": True})
@@ -581,3 +781,5 @@ class OpenAICompatibleBackendTests(TestCase):
             OpenAICompatibleBackend(languages=["en"], options={"max_tokens": 10.5})
         with self.assertRaisesRegex(ValueError, "timeout"):
             OpenAICompatibleBackend(languages=["en"], options={"timeout": 0})
+        with self.assertRaisesRegex(ValueError, "max_attempts"):
+            OpenAICompatibleBackend(languages=["en"], options={"max_attempts": 0})

@@ -138,9 +138,9 @@ scanwich input.pdf output.pdf \
   -l de pt en
 ```
 
-The backend accepts `model`, `base_url`, `api_key_env`, `timeout`, `max_tokens`, and
-`reasoning_effort` backend options. Set `base_url` and `api_key_env` to use another
-OpenAI-compatible service:
+The backend accepts `model`, `base_url`, `api_key_env`, `timeout`, `max_tokens`,
+`reasoning_effort`, and `max_attempts` backend options. Set `base_url` and `api_key_env` to use
+another OpenAI-compatible service:
 
 ```console
 scanwich input.pdf output.pdf \
@@ -150,8 +150,12 @@ scanwich input.pdf output.pdf \
   --backend-option model=provider/vision-model
 ```
 
-Page images are base64-encoded and sent to the configured service and its selected model
-provider. Do not use this backend for documents that must remain local.
+The backend sends each page image as a JPEG in base64 text to the configured service and its
+selected model provider. Do not use this backend for documents that must remain local.
+The page image file does not change, so the PDF keeps the original image.
+Some providers reject an image when its base64 text is larger than 5 MiB.
+When the JPEG is above that limit, the backend makes the image smaller and writes a `WARNING` log record.
+The regions in the result always use the pixels of the original page image.
 
 One backend instance is one session. It makes one random session ID.
 The CLI and the API make one backend instance for each document.
@@ -166,6 +170,22 @@ A failed request has no `usage.cost`, so the total does not include it.
 
 ```text
 INFO: OpenAI-compatible session 2f0c6f0e-5d0b-4c53-9d57-3f6a4f1f6f0a, model provider/vision-model: usage.cost=0.001500 for this request, total 0.003000 for 2 request(s)
+```
+
+A model can return a reply that is not the requested JSON.
+An example is a text that has a double quote without an escape.
+The backend then sends a second request. That request adds the unusable reply and a description of the defect, and it asks the model for a correct reply.
+The backend does not send the first request again. With a temperature of 0, the model mostly repeats the defect.
+`max_attempts` is the maximum number of requests for the regions of one page. The default is 3. Set it to 1 to send no correction request.
+Each correction request has a cost. The session total includes it.
+The backend writes one `WARNING` log record for each unusable reply. The record has the error and no text from the reply.
+If the last reply is also unusable, the page fails with the error of that reply.
+The backend sends no correction request when the request fails or when the provider stops the reply before its end.
+The request for plain text has no JSON, so it has no correction request.
+
+```text
+WARNING: OpenAI-compatible model provider/vision-model returned an unusable reply in attempt 1 of 3 (RuntimeError: OpenAI-compatible service returned invalid JSON: Expecting ',' delimiter: line 1 column 1343 (char 1342)); asking the model to correct it
+INFO: OpenAI-compatible model provider/vision-model corrected its reply in attempt 2 of 3
 ```
 
 ## HTTP API
