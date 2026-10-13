@@ -27,7 +27,6 @@ DEFAULT_TIMEOUT_SECONDS = 180.0
 DEFAULT_MAX_TOKENS = 65_536
 DEFAULT_REASONING_EFFORT = "low"
 NORMALIZED_COORDINATE_MAX = 1000.0
-NORMALIZED_COORDINATE_TOLERANCE = 50.0
 PIXEL_COORDINATE_TOLERANCE_RATIO = 0.05
 # Points a small distance outside the normalized grid also fit a large image. Thus the points
 # are read as pixels only when a point of a region is more than this distance outside the grid,
