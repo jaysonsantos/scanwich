@@ -170,18 +170,26 @@ Text can have the tags `<b>`, `<i>`, `<u>`, `<sc>`, `<sup>`, `<sub>`, `<br>`, an
 A box is `{"left": 120, "top": 300, "right": 880, "bottom": 560}` on a 0-to-1000 grid of the page image.
 The names of the sides leave no doubt about their sequence. The check also accepts the array `[left, top, right, bottom]`.
 
-Content of a reply does not disappear without an error. The check keeps the content, or it rejects the reply:
+Text of a reply does not disappear without an error. The check keeps the text, or it rejects the reply:
 
-- It accepts a value that has one clear meaning. Examples are an integer where the page prints digits, `"continued": "true"`, and header rows in a `header` field.
-- It ignores a formatting hint that it does not know, and a field that has no text.
+- It accepts a value that has one clear meaning. Examples are an integer where the page prints digits, `"continued": "true"`, header rows in a `header` field, and `"align": "middle"`.
 - It rejects a reply that has text in a field that the layout does not read. Examples are a list in a list item, and a table with a caption and no rows.
+- It rejects text that it cannot keep in a field that the layout reads. Examples are the heads of the columns in the `columns` field of a table, and a value of `align` or `rules` that is not one of the names.
+  A figure of a reply has no `image` field, because Scanwich makes the image file from the box.
 - It rejects a box that is not on the grid: a box on a scale of 0 to 1, and a box with a value above 1020.
 - It rejects text that has a control character. In JSON, a backslash without an escape makes such a character, for example in `\frac`.
+- It ignores a field that has no text and that the layout does not read, for example a number or a flag.
 
-The check cannot find each wrong reply.
-It accepts a box that has its sides in a different sequence, and a box in pixels that has no value above 1020.
-It cannot tell the JSON escapes `\n`, `\r`, and `\t` of a backslash without an escape from whitespace.
-An error message of the check has no text from the reply.
+The check cannot find each wrong reply:
+
+- It ignores a number in a field that the layout does not read, also when the number is content of the page. Examples are a table cell that has its value as a number in a different field, and the first number of a numbered list.
+  An integer is text only in a field that the layout reads as text.
+- It accepts a box that has its sides in a different sequence, and a box in pixels that has no value above 1020.
+- It cannot tell the JSON escapes `\n`, `\r`, and `\t` of a backslash without an escape from whitespace.
+- A JSON object that has one key two times keeps only the last value.
+
+An error message of the check has no text from the reply, so a log record can have it.
+The correction request to the model has more: it names each field that the layout does not read, and the number of objects that have the field.
 
 LaTeX output needs a backend that has the method `recognize_layout(image_path)`.
 The `openai-compatible` backend has it. EasyOCR returns text lines without structure, so it does not have it.

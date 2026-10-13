@@ -14,11 +14,12 @@ Other text that has `<` or `&` is literal text.
 
 from __future__ import annotations
 
+import json
 import logging
 import math
 import re
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 # A box gives its coordinates on a grid of this size for the width and for the height of
@@ -42,14 +43,26 @@ ALIGNMENTS = {
     "center": ALIGN_CENTER,
     "centre": ALIGN_CENTER,
     "centered": ALIGN_CENTER,
+    "middle": ALIGN_CENTER,
     "right": ALIGN_RIGHT,
+    "end": ALIGN_RIGHT,
     "left": ALIGN_LEFT,
+    "start": ALIGN_LEFT,
+    # The usual alignment of a paragraph. For a table column, it is the left alignment.
+    "justify": ALIGN_LEFT,
+    "justified": ALIGN_LEFT,
 }
 RULES_NONE = "none"
 RULES_HORIZONTAL = "horizontal"
 RULES_COLUMNS = "columns"
 RULES_GRID = "grid"
 TABLE_RULES = (RULES_NONE, RULES_HORIZONTAL, RULES_COLUMNS, RULES_GRID)
+# The names that a layout can have for the rules of a table.
+RULE_NAMES = {
+    **{rules: rules for rules in TABLE_RULES},
+    "all": RULES_GRID,
+    "vertical": RULES_COLUMNS,
+}
 PAGE_HEADER = "page_header"
 PAGE_FOOTER = "page_footer"
 PAGE_NUMBER = "page_number"
@@ -78,6 +91,12 @@ COLUMN_LETTERS = {"l": ALIGN_LEFT, "c": ALIGN_CENTER, "r": ALIGN_RIGHT}
 # does not have them. A model makes them when it writes a backslash without an escape,
 # for example in a LaTeX command.
 BROKEN_ESCAPE_CHARACTER = re.compile("[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+# The path of the image file of a figure can have only these characters, because the
+# LaTeX writer does not escape it.
+SAFE_IMAGE_PATH = re.compile(r"[A-Za-z0-9._/-]+")
+# The hint of an error names this many fields, and this many characters of each name.
+MAX_HINT_FIELDS = 8
+MAX_HINT_NAME_CHARACTERS = 40
 # One half of a character outside the Basic Multilingual Plane. A file in UTF-8 cannot
 # have it.
 SURROGATE = re.compile("[\ud800-\udfff]")
@@ -122,7 +141,16 @@ logger = logging.getLogger(__name__)
 
 
 class LayoutFormatError(ValueError):
-    """Layout data does not have the documented shape."""
+    """Layout data does not have the documented shape.
+
+    The message has no text from the data, so a log record can have it. `hint` has more
+    help for the author of the data. It can have field names from the data, so it is
+    only for that author, for example the model that gets a correction request.
+    """
+
+    def __init__(self, message: str, *, hint: str = "") -> None:
+        super().__init__(message)
+        self.hint = hint
 
 
 @dataclass(frozen=True)
@@ -391,16 +419,87 @@ def plain_text(text: str) -> str:
     )
 
 
-def page_layout_from_json(payload: Any) -> PageLayout:
+@dataclass
+class _Reading:
+    """The state of the check of one JSON value."""
+
+    # The value is the reply of a model. The image file of a figure comes from the
+    # pipeline, so a reply has no `image` field.
+    reply: bool = False
+    # Each object that has text in a field that the layout does not read: its place, the
+    # fields that the layout reads, and the names of the other fields.
+    other_content: list[tuple[str, Sequence[str], tuple[str, ...]]] = field(default_factory=list)
+
+    def note_other_content(
+        self, raw_object: Mapping[Any, Any], fields: Sequence[str], where: str
+    ) -> None:
+        """Record an object that has text in a field that the layout does not read.
+
+        Such text is content of the page that the layout cannot keep. A field without
+        text, for example a number or a flag, is a hint that the layout ignores.
+        """
+        names = tuple(
+            str(name)
+            for name, value in raw_object.items()
+            if name not in fields and _has_text(value)
+        )
+        if names:
+            self.other_content.append((where, fields, names))
+
+    def other_content_hint(self) -> str:
+        """Return the text that names the fields, for the author of the value."""
+        places: dict[str, list[str]] = {}
+        for where, _, names in self.other_content:
+            for name in names:
+                places.setdefault(name, []).append(where)
+        parts = []
+        for name, wheres in list(places.items())[:MAX_HINT_FIELDS]:
+            quoted = json.dumps(name[:MAX_HINT_NAME_CHARACTERS], ensure_ascii=False)
+            if len(wheres) == 1:
+                parts.append(f"{quoted} in 1 object ({wheres[0]})")
+            else:
+                parts.append(f"{quoted} in {len(wheres)} objects (the first one is {wheres[0]})")
+        if len(places) > MAX_HINT_FIELDS:
+            parts.append(f"and {len(places) - MAX_HINT_FIELDS} more fields")
+        return (
+            "The layout does not read these fields: " + "; ".join(parts) + ". "
+            "This rule is for each object of the reply. Remove these fields from all "
+            "objects, or put their text in a field that the layout reads."
+        )
+
+
+def page_layout_from_json(payload: Any, *, reply: bool = False) -> PageLayout:
     """Return the page layout that a JSON value describes.
 
-    Content of the value does not disappear: the function keeps it or raises
+    Text of the value does not disappear: the function keeps it or raises
     `LayoutFormatError`. A backend can then ask its model for a correct value. The function
     accepts a value that has one clear meaning, for example an integer where the page
-    prints digits. It ignores a formatting hint that it does not know.
+    prints digits. It ignores a field that has no text and that the layout does not read.
+
+    `reply` is True for the reply of a model. A figure of a reply has no `image` field.
 
     An error message has no text from the value, so a log record can have the message.
+    The `hint` of the error can have field names of the value.
     """
+    reading = _Reading(reply=reply)
+    try:
+        layout = _parse_page(payload, reading)
+    except LayoutFormatError as error:
+        if reading.other_content and not error.hint:
+            # The author of the value gets all the defects that the check found.
+            error.hint = reading.other_content_hint()
+        raise
+    if reading.other_content:
+        where, fields, _ = reading.other_content[0]
+        raise LayoutFormatError(
+            f"{where} has text in a field that the layout does not read; "
+            "its fields are: " + ", ".join(fields),
+            hint=reading.other_content_hint(),
+        )
+    return layout
+
+
+def _parse_page(payload: Any, reading: _Reading) -> PageLayout:
     if isinstance(payload, list):
         # A value that is only the array of the blocks.
         payload = {"blocks": payload}
@@ -409,16 +508,16 @@ def page_layout_from_json(payload: Any) -> PageLayout:
     raw_blocks = payload.get("blocks")
     if not isinstance(raw_blocks, list):
         raise LayoutFormatError("the page layout must have a blocks array")
-    _reject_other_content(payload, PAGE_FIELDS, "the page layout")
+    reading.note_other_content(payload, PAGE_FIELDS, "the page layout")
     blocks: list[Block] = []
     for block_index, raw_block in enumerate(raw_blocks, start=1):
-        block = _parse_block(raw_block, f"block {block_index}")
+        block = _parse_block(raw_block, f"block {block_index}", reading)
         if block is not None:
             blocks.append(block)
     return PageLayout(
         blocks=tuple(blocks),
         page_top=_parse_page_top(payload.get("page_top")),
-        content_box=_parse_content_box(payload.get("content_box")),
+        content_box=_parse_content_box(payload.get("content_box"), reading),
     )
 
 
@@ -431,22 +530,24 @@ def _parse_page_top(value: Any) -> str:
     return side
 
 
-def _parse_content_box(value: Any) -> Box | None:
-    """Return the box of the printed area, or `None` for a value that is not a usable box.
+def _parse_content_box(value: Any, reading: _Reading) -> Box | None:
+    """Return the box of the printed area, or `None` for numbers that are not a usable box.
 
-    The box is only a hint for the width of an illustration, so a value that is not usable
-    is not a reason to reject the layout of a page.
+    The box is only a hint for the width of an illustration, so numbers that are not
+    usable are not a reason to reject the layout of a page. Text is not a hint.
     """
     if value is None:
         return None
     try:
-        return _parse_box(value, "content_box")
+        return _parse_box(value, "content_box", reading)
     except LayoutFormatError as error:
+        if _has_text(value):
+            raise
         logger.info("Ignoring the content_box of a page layout: %s", error)
         return None
 
 
-def _parse_block(raw_block: Any, where: str) -> Block | None:
+def _parse_block(raw_block: Any, where: str, reading: _Reading) -> Block | None:
     """Return one block, or `None` for a block that has no content."""
     if not isinstance(raw_block, Mapping):
         raise LayoutFormatError(f"{where} must be an object")
@@ -467,20 +568,32 @@ def _parse_block(raw_block: Any, where: str) -> Block | None:
         block_type = "paragraph"
     else:
         where = f"{where} ({block_type})"
-    _reject_other_content(raw_block, BLOCK_FIELDS[block_type], where)
+    fields = BLOCK_FIELDS[block_type]
+    if reading.reply and block_type == "figure":
+        fields = tuple(name for name in fields if name != "image")
+    reading.note_other_content(raw_block, fields, where)
     if block_type == "table":
-        return _parse_table(raw_block, where)
+        return _parse_table(raw_block, where, reading)
     if block_type == "list":
-        return _parse_list(raw_block, where)
+        return _parse_list(raw_block, where, reading)
     if block_type == "figure":
+        image = None if reading.reply else _parse_optional_text(raw_block, "image", where)
+        if image is not None and not SAFE_IMAGE_PATH.fullmatch(image):
+            raise LayoutFormatError(
+                f"{where} image must be the path of an image file, with only ASCII letters, "
+                "digits, and the characters . _ / -; a caption has the text of a figure"
+            )
         return Figure(
-            box=_parse_box(raw_block.get("box"), f"{where} box"),
+            box=_parse_box(raw_block.get("box"), f"{where} box", reading),
             caption=_parse_optional_text(raw_block, "caption", where),
-            image=_parse_optional_text(raw_block, "image", where),
+            image=image,
         )
 
     text = _parse_optional_text(raw_block, "text", where)
     if text is None:
+        if block_type == "footnote" and _has_text(raw_block.get("mark")):
+            # The mark is text of the page. It must not disappear with the empty block.
+            raise LayoutFormatError(f"{where} has a mark and no text")
         return None
     if block_type == "heading":
         level = raw_block.get("level")
@@ -489,7 +602,7 @@ def _parse_block(raw_block: Any, where: str) -> Block | None:
             level=1
             if level is None
             else min(max(_parse_integer(level, f"{where} level"), 1), MAX_HEADING_LEVEL),
-            align=_parse_block_alignment(raw_block.get("align")),
+            align=_parse_block_alignment(raw_block.get("align"), f"{where} align"),
         )
     if block_type == "quote":
         return Quote(text=text)
@@ -499,7 +612,7 @@ def _parse_block(raw_block: Any, where: str) -> Block | None:
         return PageFurniture(kind=block_type, text=text)
     return Paragraph(
         text=text,
-        align=_parse_block_alignment(raw_block.get("align")),
+        align=_parse_block_alignment(raw_block.get("align"), f"{where} align"),
         continued=_parse_flag(raw_block.get("continued"), f"{where} continued"),
     )
 
@@ -513,19 +626,6 @@ def _has_text(value: Any) -> bool:
     if isinstance(value, list):
         return any(_has_text(item) for item in value)
     return False
-
-
-def _reject_other_content(raw_object: Mapping[str, Any], fields: Sequence[str], where: str) -> None:
-    """Raise an error for an object that has text in a field that the layout does not read.
-
-    Such text is content of the page that the layout cannot keep. A field without text,
-    for example a number or a flag, is a hint that the layout ignores.
-    """
-    if any(_has_text(value) for name, value in raw_object.items() if name not in fields):
-        raise LayoutFormatError(
-            f"{where} has text in a field that the layout does not read; "
-            "its fields are: " + ", ".join(fields)
-        )
 
 
 def _is_text(value: Any) -> bool:
@@ -558,14 +658,64 @@ def _parse_optional_text(raw_object: Mapping[str, Any], name: str, where: str) -
     return _parse_text(value, f"{where} {name}") or None
 
 
-def _parse_alignment(value: Any) -> str | None:
-    return ALIGNMENTS.get(value.strip().lower()) if isinstance(value, str) else None
+def _parse_alignment(value: Any, where: str) -> str | None:
+    """Return the alignment that a value names, or `None` for a value that names none.
+
+    A value with text that is not an alignment is an error: the text can be content of
+    the page in the wrong field.
+    """
+    name = value.strip().lower() if isinstance(value, str) else None
+    if name in ALIGNMENTS:
+        return ALIGNMENTS[name]
+    if _has_text(value):
+        raise LayoutFormatError(f"{where} must be one of: left, center, right")
+    return None
 
 
-def _parse_block_alignment(value: Any) -> str | None:
+def _parse_block_alignment(value: Any, where: str) -> str | None:
     """Return the alignment of a text block. `None` is the usual alignment."""
-    align = _parse_alignment(value)
+    align = _parse_alignment(value, where)
     return None if align == ALIGN_LEFT else align
+
+
+def _parse_columns(value: Any, where: str) -> tuple[str, ...]:
+    """Return the alignment of each column of a table.
+
+    A table of a model can have the heads of its columns in this field. They are
+    content of the page, so text that is not an alignment is an error.
+    """
+    if isinstance(value, str):
+        # One letter for each column, as in a LaTeX table: l, c, or r.
+        entries: list[Any] = [letter for letter in value.lower() if letter not in " |"]
+    elif isinstance(value, list):
+        entries = value
+    else:
+        entries = [value]
+    try:
+        columns = tuple(
+            COLUMN_LETTERS[entry.strip().lower()]
+            if isinstance(entry, str) and entry.strip().lower() in COLUMN_LETTERS
+            else _parse_alignment(entry, where) or ALIGN_LEFT
+            for entry in entries
+        )
+    except LayoutFormatError:
+        raise LayoutFormatError(
+            f"{where} must have only the alignments left, center, and right; write the "
+            "heads of the columns as the first row of the table"
+        ) from None
+    return columns if isinstance(value, (str, list)) else ()
+
+
+def _parse_rules(value: Any, where: str) -> str:
+    """Return the rules of a table. A value with other text is an error."""
+    if isinstance(value, bool):
+        return RULES_HORIZONTAL if value else RULES_NONE
+    name = value.strip().lower() if isinstance(value, str) else None
+    if name in RULE_NAMES:
+        return RULE_NAMES[name]
+    if _has_text(value):
+        raise LayoutFormatError(f"{where} must be one of: " + ", ".join(TABLE_RULES))
+    return RULES_HORIZONTAL
 
 
 def _parse_flag(value: Any, where: str) -> bool:
@@ -604,8 +754,9 @@ def _parse_span(value: Any, where: str) -> int:
     return span
 
 
-def _parse_box(value: Any, where: str) -> Box:
+def _parse_box(value: Any, where: str, reading: _Reading) -> Box:
     if isinstance(value, Mapping):
+        reading.note_other_content(value, BOX_SIDES, where)
         numbers = [value.get(side) for side in BOX_SIDES]
     elif isinstance(value, list) and len(value) == len(BOX_SIDES):
         # The array form has the sides in the sequence of `BOX_SIDES`.
@@ -633,7 +784,7 @@ def _parse_box(value: Any, where: str) -> Box:
     return Box(left=left, top=top, right=right, bottom=bottom)
 
 
-def _parse_list(raw_block: Mapping[str, Any], where: str) -> ListBlock | None:
+def _parse_list(raw_block: Mapping[str, Any], where: str, reading: _Reading) -> ListBlock | None:
     raw_items = raw_block.get("items")
     if not isinstance(raw_items, list):
         raise LayoutFormatError(f"{where} must have an items array")
@@ -643,7 +794,7 @@ def _parse_list(raw_block: Mapping[str, Any], where: str) -> ListBlock | None:
         if isinstance(raw_item, Mapping):
             # The layout has no list in a list. The items of such a list are items of
             # the one list, in reading order.
-            _reject_other_content(raw_item, LIST_ITEM_FIELDS, item_where)
+            reading.note_other_content(raw_item, LIST_ITEM_FIELDS, item_where)
             text = _parse_optional_text(raw_item, "text", item_where) or ""
             marker = _parse_optional_text(raw_item, "marker", item_where)
         elif _is_text(raw_item):
@@ -659,7 +810,7 @@ def _parse_list(raw_block: Mapping[str, Any], where: str) -> ListBlock | None:
     )
 
 
-def _parse_table(raw_block: Mapping[str, Any], where: str) -> Table | None:
+def _parse_table(raw_block: Mapping[str, Any], where: str, reading: _Reading) -> Table | None:
     raw_rows = raw_block.get("rows")
     if not isinstance(raw_rows, list):
         raise LayoutFormatError(f"{where} must have a rows array")
@@ -676,11 +827,13 @@ def _parse_table(raw_block: Mapping[str, Any], where: str) -> Table | None:
             raise LayoutFormatError(f"{where} row {row_index} must be an array of cells")
         rows.append(
             tuple(
-                _parse_cell(raw_cell, f"{where} row {row_index} cell {cell_index}")
+                _parse_cell(raw_cell, f"{where} row {row_index} cell {cell_index}", reading)
                 for cell_index, raw_cell in enumerate(raw_row, start=1)
             )
         )
     caption = _parse_optional_text(raw_block, "caption", where)
+    columns = _parse_columns(raw_block.get("columns"), f"{where} columns")
+    rules = _parse_rules(raw_block.get("rules"), f"{where} rules")
     if not any(rows):
         if caption is not None:
             raise LayoutFormatError(
@@ -695,29 +848,20 @@ def _parse_table(raw_block: Mapping[str, Any], where: str) -> Table | None:
         header_rows = int(bool(raw_header_rows))
     else:
         header_rows = _parse_integer(raw_header_rows, f"{where} header_rows")
-    raw_columns = raw_block.get("columns")
-    if isinstance(raw_columns, str):
-        # One letter for each column, as in a LaTeX table: l, c, or r.
-        raw_columns = [COLUMN_LETTERS.get(letter) for letter in raw_columns.strip().lower()]
-    columns = tuple(
-        _parse_alignment(column) or ALIGN_LEFT
-        for column in (raw_columns if isinstance(raw_columns, list) else ())
-    )
-    rules = raw_block.get("rules")
     return Table(
         rows=tuple(rows),
         caption=caption,
         header_rows=min(max(header_rows, len(header), 0), len(rows)),
         columns=columns,
-        rules=rules if rules in TABLE_RULES else RULES_HORIZONTAL,
+        rules=rules,
     )
 
 
-def _parse_cell(raw_cell: Any, where: str) -> TableCell:
+def _parse_cell(raw_cell: Any, where: str, reading: _Reading) -> TableCell:
     if raw_cell is None:
         return TableCell(text="")
     if isinstance(raw_cell, Mapping):
-        _reject_other_content(raw_cell, CELL_FIELDS, where)
+        reading.note_other_content(raw_cell, CELL_FIELDS, where)
         return TableCell(
             text=_parse_optional_text(raw_cell, "text", where) or "",
             colspan=_parse_span(raw_cell.get("colspan"), f"{where} colspan"),

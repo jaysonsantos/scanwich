@@ -316,7 +316,7 @@ class OpenAICompatibleBackend:
         return _scale_regions(regions, image)
 
     def _parse_layout_reply(self, content: str, attempt: int) -> PageLayout:
-        layout = page_layout_from_json(_parse_json_payload(content))
+        layout = page_layout_from_json(_parse_json_payload(content), reply=True)
         self._log_corrected_reply(attempt)
         return layout
 
@@ -745,6 +745,11 @@ def _correction_prompt(error: Exception) -> str:
         )
     else:
         defect = str(error)
+        # The hint of the layout check names the fields of the reply that are wrong. Only
+        # the model gets it: a log record has the message of the error and not the hint.
+        hint = getattr(error, "hint", "")
+        if hint:
+            defect = f"{defect}. {hint}"
     return (
         f"Your last reply cannot be used: {defect}\n"
         "Return the complete JSON object again, in the shape that the first message gives. "

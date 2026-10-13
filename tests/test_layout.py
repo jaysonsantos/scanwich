@@ -313,19 +313,20 @@ class PageLayoutJsonTests(TestCase):
             PageLayout(blocks=(Paragraph("P"),)),
         )
 
-    def test_ignores_formatting_hints_that_it_does_not_know(self) -> None:
+    def test_ignores_hints_that_have_no_text(self) -> None:
         layout = page_layout_from_json(
             {
                 "blocks": [
-                    {"type": "heading", "level": 9, "text": "H", "align": "diagonal"},
+                    {"type": "heading", "level": 9, "text": "H", "align": 3},
                     {"type": "paragraph", "text": "P", "align": "left"},
                     {
                         "type": "table",
-                        "rules": "dotted",
+                        "rules": None,
                         "header_rows": 7,
-                        "columns": ["centre", "upside down"],
-                        "rows": [["a", "b"]],
+                        "columns": [None, 2, "centre"],
+                        "rows": [["a", "b", "c"]],
                     },
+                    {"type": "table", "columns": 3, "rows": [["a"]]},
                     # A field without text is a hint, not content.
                     {"type": "quote", "text": "Q", "id": 4, "confidence": 0.5, "bold": True},
                     {"type": "paragraph", "text": "P", "box": [1, 2, 3, 4], "note": " "},
@@ -339,18 +340,204 @@ class PageLayoutJsonTests(TestCase):
                 Heading("H", level=3),
                 Paragraph("P"),
                 Table(
-                    rows=((TableCell("a"), TableCell("b")),),
+                    rows=((TableCell("a"), TableCell("b"), TableCell("c")),),
                     header_rows=1,
-                    columns=("center", "left"),
+                    columns=("left", "left", "center"),
                 ),
+                Table(rows=((TableCell("a"),),)),
                 Quote("Q"),
                 Paragraph("P"),
             ),
         )
 
+    def test_reads_the_names_of_alignments_and_rules(self) -> None:
+        cases: list[tuple[dict[str, Any], Any]] = [
+            ({"type": "paragraph", "text": "P", "align": "Middle"}, Paragraph("P", align="center")),
+            ({"type": "paragraph", "text": "P", "align": "end"}, Paragraph("P", align="right")),
+            # The usual alignment of a paragraph.
+            ({"type": "paragraph", "text": "P", "align": "justify"}, Paragraph("P")),
+            ({"type": "paragraph", "text": "P", "align": "start"}, Paragraph("P")),
+            ({"type": "heading", "text": "H", "align": "justified"}, Heading("H")),
+            (
+                {"type": "table", "columns": ["l", "R", "centre", "justify"], "rows": [["a"]]},
+                Table(rows=((TableCell("a"),),), columns=("left", "right", "center", "left")),
+            ),
+            (
+                # The column specification of a LaTeX table.
+                {"type": "table", "columns": "l | c|r", "rows": [["a"]]},
+                Table(rows=((TableCell("a"),),), columns=("left", "center", "right")),
+            ),
+            (
+                {"type": "table", "rules": "All", "rows": [["a"]]},
+                Table(rows=((TableCell("a"),),), rules="grid"),
+            ),
+            (
+                {"type": "table", "rules": "vertical", "rows": [["a"]]},
+                Table(rows=((TableCell("a"),),), rules="columns"),
+            ),
+            (
+                {"type": "table", "rules": False, "rows": [["a"]]},
+                Table(rows=((TableCell("a"),),), rules="none"),
+            ),
+            (
+                {"type": "table", "rules": True, "rows": [["a"]]},
+                Table(rows=((TableCell("a"),),), rules="horizontal"),
+            ),
+        ]
+        for raw_block, block in cases:
+            with self.subTest(raw_block=raw_block):
+                self.assertEqual(blocks_of(raw_block), (block,))
+
+    def test_rejects_text_in_a_field_that_it_reads_but_cannot_keep(self) -> None:
+        # A model can put content of the page in a field that has a different purpose.
+        # The text must not disappear, and it must not become a default value.
+        columns = (
+            "block 1 (table) columns must have only the alignments left, center, and right; "
+            "write the heads of the columns as the first row of the table"
+        )
+        box_shape = "must be an object with the numbers left, top, right, bottom"
+        cases: list[tuple[Any, str]] = [
+            (
+                # The heads of the columns, as many table formats have them.
+                {"blocks": [{"type": "table", "columns": ["Part", "Mass"], "rows": [["a", "b"]]}]},
+                columns,
+            ),
+            (
+                {
+                    "blocks": [
+                        {
+                            "type": "table",
+                            "columns": [{"name": "Part", "align": "left"}],
+                            "rows": [["a"]],
+                        }
+                    ]
+                },
+                columns,
+            ),
+            ({"blocks": [{"type": "table", "columns": "Part, Mass", "rows": [["a"]]}]}, columns),
+            (
+                {"blocks": [{"type": "table", "columns": {"1": "Part"}, "rows": [["a"]]}]},
+                columns,
+            ),
+            # The check finds the text also in a table that has no cells.
+            ({"blocks": [{"type": "table", "columns": ["Part"], "rows": []}]}, columns),
+            (
+                {"blocks": [{"type": "table", "rules": "see the note", "rows": [["a"]]}]},
+                "block 1 (table) rules must be one of: none, horizontal, columns, grid",
+            ),
+            (
+                {"blocks": [{"type": "paragraph", "text": "P", "align": "see the note"}]},
+                "block 1 (paragraph) align must be one of: left, center, right",
+            ),
+            (
+                {"blocks": [{"type": "heading", "text": "H", "align": ["center", "A title"]}]},
+                "block 1 (heading) align must be one of: left, center, right",
+            ),
+            ({"content_box": "the full page", "blocks": []}, f"content_box {box_shape}"),
+            (
+                {"blocks": [{"type": "footnote", "mark": "3"}]},
+                "block 1 (footnote) has a mark and no text",
+            ),
+            (
+                {"content_box": {"left": 1, "top": 2, "note": "a stain"}, "blocks": []},
+                f"content_box {box_shape}",
+            ),
+            (
+                # A description of the picture is not the path of an image file.
+                {
+                    "blocks": [
+                        {"type": "figure", "box": [1, 2, 300, 400], "image": "A wheel, drawn"}
+                    ]
+                },
+                (
+                    "block 1 (figure) image must be the path of an image file, with only ASCII "
+                    "letters, digits, and the characters . _ / -; a caption has the text of a figure"
+                ),
+            ),
+        ]
+        for payload, message in cases:
+            self.assert_rejects(payload, message)
+
+    def test_reply_of_a_model_cannot_name_the_image_file_of_a_figure(self) -> None:
+        # The pipeline makes the image file from the box and sets the field. A value in a
+        # reply would disappear.
+        payload = {"blocks": [{"type": "figure", "box": [1, 2, 300, 400], "image": "wheel.jpg"}]}
+        self.assertEqual(
+            page_layout_from_json(payload).blocks,
+            (Figure(box=Box(1, 2, 300, 400), image="wheel.jpg"),),
+        )
+        with self.assertRaises(LayoutFormatError) as raised:
+            page_layout_from_json(payload, reply=True)
+        self.assertEqual(
+            str(raised.exception),
+            "block 1 (figure) has text in a field that the layout does not read; "
+            "its fields are: type, box, caption",
+        )
+        self.assertIn('"image" in 1 object (block 1 (figure))', raised.exception.hint)
+
+    def test_error_hint_names_each_field_that_the_layout_does_not_read(self) -> None:
+        paragraphs = [
+            {"type": "paragraph", "text": f"Paragraph {number}.", "shelfmark": f"b{number}"}
+            for number in range(1, 5)
+        ]
+        table = {"type": "table", "rows": [[{"text": "a", "tone": "dark", "shelfmark": "t"}]]}
+        figure = {
+            "type": "figure",
+            "box": {"left": 1, "top": 2, "right": 300, "bottom": 400, "tone": "x"},
+        }
+        with self.assertRaises(LayoutFormatError) as raised:
+            page_layout_from_json({"remark": "A note.", "blocks": [*paragraphs, table, figure]})
+        # The message is for a log record. It has the first object and no name from the data.
+        self.assertEqual(
+            str(raised.exception),
+            "the page layout has text in a field that the layout does not read; "
+            "its fields are: page_top, content_box, blocks",
+        )
+        # The hint is for the author of the data. It names each field, and tells in how
+        # many objects the field is.
+        self.assertEqual(
+            raised.exception.hint,
+            'The layout does not read these fields: "remark" in 1 object (the page layout); '
+            '"shelfmark" in 5 objects (the first one is block 1 (paragraph)); '
+            '"tone" in 2 objects (the first one is block 5 (table) row 1 cell 1). '
+            "This rule is for each object of the reply. Remove these fields from all objects, "
+            "or put their text in a field that the layout reads.",
+        )
+
+    def test_error_hint_has_a_limited_length(self) -> None:
+        fields = {f"field_{number:02d}_{'x' * 60}": "text" for number in range(12)}
+        with self.assertRaises(LayoutFormatError) as raised:
+            page_layout_from_json({"blocks": [{"type": "quote", "text": "Q", **fields}]})
+        hint = raised.exception.hint
+        # The hint has 8 names of 40 characters, and the number of the other fields.
+        self.assertEqual(hint.count('" in 1 object'), 8)
+        self.assertIn(f'"field_00_{"x" * 31}" in 1 object', hint)
+        self.assertIn("; and 4 more fields. This rule", hint)
+
+    def test_error_for_a_different_defect_also_has_the_hint(self) -> None:
+        # The author of the data gets all the defects that the check found.
+        payload = {
+            "blocks": [
+                {"type": "paragraph", "text": "P", "shelfmark": "b1"},
+                {"type": "figure", "box": [0.1, 0.2, 0.3, 0.4]},
+            ]
+        }
+        with self.assertRaises(LayoutFormatError) as raised:
+            page_layout_from_json(payload)
+        self.assertEqual(
+            str(raised.exception),
+            "block 2 (figure) box must use the 0-to-1000 grid of the image, not a scale of 0 to 1",
+        )
+        self.assertIn('"shelfmark" in 1 object (block 1 (paragraph))', raised.exception.hint)
+        # An error with no field of this type has no hint.
+        with self.assertRaises(LayoutFormatError) as raised:
+            page_layout_from_json({"blocks": [{"type": "figure", "box": [0.1, 0.2, 0.3, 0.4]}]})
+        self.assertEqual(raised.exception.hint, "")
+
     def test_ignores_a_content_box_that_is_not_usable(self) -> None:
-        # The box is only a hint for the width of an illustration.
-        for content_box in ([], [0, 0, 0, 0], [300, 400, 3000, 4500], "private text", {"left": 1}):
+        # The box is only a hint for the width of an illustration. Numbers that are not a
+        # usable box are thus no reason to reject the page. Text is not a hint.
+        for content_box in ([], [0, 0, 0, 0], [300, 400, 3000, 4500], {"left": 1}, 5):
             with (
                 self.subTest(content_box=content_box),
                 self.assertLogs(LOGGER_NAME, level="INFO") as captured_logs,
@@ -361,7 +548,6 @@ class PageLayoutJsonTests(TestCase):
                 self.assertIsNone(layout.content_box)
                 self.assertEqual(layout.blocks, (Paragraph("P"),))
                 self.assertIn("Ignoring the content_box of a page layout", captured_logs.output[0])
-                self.assertNotIn("private text", captured_logs.output[0])
 
     def test_leaves_out_blocks_that_have_no_content(self) -> None:
         layout = page_layout_from_json(
@@ -654,3 +840,4 @@ class PageLayoutJsonTests(TestCase):
             with self.subTest(payload=payload), self.assertRaises(LayoutFormatError) as raised:
                 page_layout_from_json(payload)
             self.assertNotIn("private", str(raised.exception))
+            self.assertNotIn("private", repr(raised.exception))

@@ -26,6 +26,7 @@ from scanwich.layout import (
     RULES_COLUMNS,
     RULES_GRID,
     RULES_NONE,
+    SAFE_IMAGE_PATH,
     STYLE_BOLD,
     STYLE_ITALIC,
     STYLE_SMALL_CAPS,
@@ -270,8 +271,6 @@ DIVIDED_WORD = re.compile(r"\w-$")
 DIVIDED_WORD_COMMENT = (
     "% Scanwich joined the word that the page break divides. Compare it with the source."
 )
-# The writer does not escape the path of an image, so the path can have only these characters.
-SAFE_IMAGE_PATH = re.compile(r"[A-Za-z0-9._/-]+")
 
 MIN_FIGURE_WIDTH = 0.15
 # An illustration is not higher than this part of the text area, so it fits on one page

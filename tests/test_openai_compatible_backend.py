@@ -1133,7 +1133,7 @@ class LayoutRecognitionTests(TestCase):
         # The reply has a nested list. The layout has no place for it, so its text must
         # not disappear.
         secret = "private text of the page"
-        nested = {"marker": "1.", "text": "a", "items": [{"marker": "a)", "text": secret}]}
+        nested = {"marker": "1.", "text": "a", "sublist": [{"marker": "a)", "text": secret}]}
         unusable = json.dumps({"blocks": [{"type": "list", "items": [nested]}]})
         flat = [{"marker": "1.", "text": "a"}, {"marker": "a)", "text": secret}]
         usable = json.dumps({"blocks": [{"type": "list", "items": flat}]})
@@ -1151,12 +1151,78 @@ class LayoutRecognitionTests(TestCase):
             ),
         )
         self.assertEqual(len(completions.calls), 2)
+        # The model gets the name of the field and the place of the object.
         self.assertEqual(
             completions.calls[1]["messages"][3]["content"].split("\n")[0],
             "Your last reply cannot be used: block 1 (list) item 1 has text in a field that "
-            "the layout does not read; its fields are: marker, text",
+            "the layout does not read; its fields are: marker, text. The layout does not read "
+            'these fields: "sublist" in 1 object (block 1 (list) item 1). This rule is for '
+            "each object of the reply. Remove these fields from all objects, or put their "
+            "text in a field that the layout reads.",
         )
-        self.assertNotIn(secret, "\n".join(captured_logs.output))
+        # A log record has no text from the reply: no page text and no field name.
+        log_output = "\n".join(captured_logs.output)
+        self.assertNotIn(secret, log_output)
+        self.assertNotIn("sublist", log_output)
+        self.assertIn(
+            "returned an unusable reply in attempt 1 of 3 (LayoutFormatError: block 1 (list) "
+            "item 1 has text in a field that the layout does not read; its fields are: "
+            "marker, text)",
+            log_output,
+        )
+
+    def test_correction_request_names_a_field_that_each_block_has(self) -> None:
+        # A model that adds one field mostly adds it to each block. A message that names
+        # only the first block lets the model correct one block for each request.
+        blocks = [
+            {"type": "paragraph", "shelfmark": f"b{number}", "text": f"Paragraph {number}."}
+            for number in range(1, 5)
+        ]
+        unusable = json.dumps({"page_top": "top", "blocks": blocks})
+        completions = FakeCompletions(unusable)
+
+        with (
+            self.assertLogs("scanwich", level="DEBUG") as captured_logs,
+            self.assertRaises(LayoutFormatError) as raised,
+        ):
+            self.recognize_layout(completions)
+
+        self.assertEqual(len(completions.calls), DEFAULT_MAX_ATTEMPTS)
+        for request in completions.calls[1:]:
+            self.assertIn(
+                'The layout does not read these fields: "shelfmark" in 4 objects (the first '
+                "one is block 1 (paragraph)). This rule is for each object of the reply.",
+                request["messages"][-1]["content"],
+            )
+        # The error of the conversion and the log records do not name the field.
+        self.assertEqual(
+            str(raised.exception),
+            "block 1 (paragraph) has text in a field that the layout does not read; "
+            "its fields are: type, text, align, continued",
+        )
+        self.assertNotIn("shelfmark", "\n".join(captured_logs.output))
+
+    def test_reply_cannot_name_the_image_file_of_a_figure(self) -> None:
+        # The pipeline makes the image file from the box. Text in an image field of a
+        # reply would disappear.
+        box = {"left": 100, "top": 200, "right": 800, "bottom": 900}
+        unusable = json.dumps({"blocks": [{"type": "figure", "box": box, "image": "A wheel"}]})
+        usable = json.dumps({"blocks": [{"type": "figure", "box": box, "caption": "A wheel"}]})
+        completions = FakeCompletions(unusable, usable)
+
+        with self.assertLogs(LOGGER_NAME, level="WARNING"):
+            layout = self.recognize_layout(completions)
+
+        self.assertEqual(
+            layout,
+            PageLayout(blocks=(Figure(box=Box(100, 200, 800, 900), caption="A wheel"),)),
+        )
+        self.assertIn(
+            "block 1 (figure) has text in a field that the layout does not read; its fields "
+            'are: type, box, caption. The layout does not read these fields: "image" in 1 '
+            "object (block 1 (figure)).",
+            completions.calls[1]["messages"][3]["content"],
+        )
 
     def test_returns_the_side_of_a_page_that_is_not_upright(self) -> None:
         layout = self.recognize_layout(FakeCompletions('{"page_top":"right","blocks":[]}'))
