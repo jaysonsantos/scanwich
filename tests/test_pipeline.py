@@ -899,16 +899,20 @@ class FigureBoxTests(TestCase):
             "no part of the first box": (
                 # 210 to 270 across, 335 to 363 down: a different place.
                 FigureLocation(Box(100, 100, 200, 180)),
+                Box(210.0, 335.0, 600.0, 550.0),
+                (95, 140, 395, 440),
                 (
                     "The second box of illustration 1 of page 1 (left 210, top 335, right 270, "
                     "bottom 363) has no part of the box of the page layout (left 300, top 400, "
-                    "right 600, bottom 550); the crop uses the box of the page layout. Compare "
-                    "the illustration with the source"
+                    "right 600, bottom 550); the crop has the two boxes. Compare the "
+                    "illustration with the source"
                 ),
             ),
             "a small part of the first box": (
                 # 420 to 480 across, 440 to 510 down: 9 percent of the area.
                 FigureLocation(Box(450, 400, 550, 600)),
+                first_box,
+                (5, 10, 305, 310),
                 (
                     "The second box of illustration 1 of page 1 (left 420, top 440, right 480, "
                     "bottom 510) is much smaller than the box of the page layout (left 300, top "
@@ -917,17 +921,43 @@ class FigureBoxTests(TestCase):
                 ),
             ),
         }
-        for name, (reply, warning) in cases.items():
+        for name, (reply, final_box, red_pixels, warning) in cases.items():
             backend = self.fixed_box_backend(layout, reply)
             with (
                 self.subTest(name=name),
                 self.assertLogs(LOGGER_NAME, level="WARNING") as captured_logs,
             ):
                 box = self.convert(backend, self.page((300, 400, 600, 550)))
-                self.assertEqual(box, first_box)
+                # The crop has the two boxes, so it has the full red part of the first box.
+                self.assertEqual(box, final_box)
                 self.assertEqual(captured_logs.output, [f"WARNING:{LOGGER_NAME}:{warning}"])
-                # The crop has the full red part.
-                self.assertEqual(red_part(self.crop()), (5, 10, 305, 310))
+                self.assertEqual(red_part(self.crop()), red_pixels)
+
+    def test_correct_second_box_with_no_part_of_the_first_box_is_in_the_crop(self) -> None:
+        # A box of a page layout can be on the caption below a small illustration. The
+        # second request then finds the illustration, and the two boxes have no common
+        # part. The first box alone would lose the full illustration.
+        layout = PageLayout(blocks=(Figure(box=Box(400, 370, 600, 420), caption="Fig. 1"),))
+        backend = FakeFigureBackend(layout)
+
+        with self.assertLogs(LOGGER_NAME, level="WARNING") as captured_logs:
+            box = self.convert(backend, self.page((400, 300, 600, 350)))
+
+        self.assertEqual(backend.part_sizes, [(400, 500)])
+        self.assertEqual(box, Box(400.0, 300.0, 600.0, 420.0))
+        # The crop has the full illustration: 200 units across and 50 units down.
+        self.assertEqual(red_part(self.crop()), (5, 10, 205, 110))
+        self.assertEqual(
+            captured_logs.output,
+            [
+                (
+                    f"WARNING:{LOGGER_NAME}:The second box of illustration 1 of page 1 (left 400, "
+                    "top 300, right 600, bottom 350) has no part of the box of the page layout "
+                    "(left 400, top 370, right 600, bottom 420); the crop has the two boxes. "
+                    "Compare the illustration with the source"
+                )
+            ],
+        )
 
     def test_second_box_that_is_much_larger_gets_a_warning(self) -> None:
         # The backend returns the full part of the page, each time.

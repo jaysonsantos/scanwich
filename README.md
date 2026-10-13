@@ -265,12 +265,11 @@ The `openai-compatible` backend has it.
 - The crop has the new box and a margin of 5 units at each side. The layout JSON also has the new box.
 - An `INFO` log record has the new box and the box of the page layout.
 
-A crop that is too large loses nothing, and a crop that cuts the illustration loses a part of it. Thus each case of doubt gives the larger crop and a `WARNING` log record. Compare that illustration with the source.
+A crop that is too large loses nothing, and a crop that cuts the illustration loses a part of it. Thus each case of doubt gives a `WARNING` log record, and the larger crop when there are two boxes. Compare that illustration with the source.
 
 - The backend still reports a cut side after the last request: the crop goes to the border of the part at that side.
-- A request for the box fails with an error of each type, or the backend finds no illustration in the part: the crop uses the box that the backend gave before. The conversion continues.
-- The new box has no part of the box of the page layout: the crop uses the box of the page layout.
-- The new box has more than 4 times the area of the box of the page layout, or less than a quarter: the crop has the two boxes.
+- The new box has no part of the box of the page layout, or it has more than 4 times its area, or less than a quarter: the crop has the two boxes.
+- A request for the box fails with an error of each type, or the backend finds no illustration in the part: there is only the box that the backend gave before, and the crop uses it. The conversion continues.
 
 The number of requests has these limits:
 

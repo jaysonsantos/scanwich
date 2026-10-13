@@ -432,30 +432,26 @@ def _checked_box(first: Box, second: Box, name: str) -> Box:
     The second box is the better one in most cases. It is in doubt when it has no part
     of the first box, and when its area is very different. A crop that is too large loses
     nothing, and a crop that cuts the illustration loses a part of it. Thus the crop then
-    has the first box also.
+    has the two boxes. The first box alone is not the safe one: a box of a page layout
+    can be on the caption below a small illustration, and the second box is then correct.
     """
     if second == first:
         return first
     overlap_width = min(first.right, second.right) - max(first.left, second.left)
     overlap_height = min(first.bottom, second.bottom) - max(first.top, second.top)
-    if overlap_width <= 0 or overlap_height <= 0:
-        logger.warning(
-            "The second box of %s (%s) has no part of the box of the page layout (%s); the "
-            "crop uses the box of the page layout. Compare the illustration with the source",
-            name,
-            _box_text(second),
-            _box_text(first),
-        )
-        return first
     ratio = (second.width * second.height) / (first.width * first.height)
-    if 1 / FIGURE_BOX_AREA_RATIO <= ratio <= FIGURE_BOX_AREA_RATIO:
+    if overlap_width <= 0 or overlap_height <= 0:
+        doubt = "has no part of"
+    elif 1 / FIGURE_BOX_AREA_RATIO <= ratio <= FIGURE_BOX_AREA_RATIO:
         return second
+    else:
+        doubt = f"is much {'smaller' if ratio < 1 else 'larger'} than"
     logger.warning(
-        "The second box of %s (%s) is much %s than the box of the page layout (%s); the "
-        "crop has the two boxes. Compare the illustration with the source",
+        "The second box of %s (%s) %s the box of the page layout (%s); the crop has the "
+        "two boxes. Compare the illustration with the source",
         name,
         _box_text(second),
-        "smaller" if ratio < 1 else "larger",
+        doubt,
         _box_text(first),
     )
     return Box(
