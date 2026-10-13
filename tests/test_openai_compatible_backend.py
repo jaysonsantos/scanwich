@@ -208,7 +208,7 @@ class OpenAICompatibleBackendTests(TestCase):
         provider_error = {
             "code": 502,
             "message": "Provider returned error",
-            "metadata": {"raw": "upstream reply"},
+            "metadata": {"flagged_input": "private text", "reasons": ["private reason"]},
         }
         self.assertEqual(
             str(self.recognition_error(SimpleNamespace(choices=None, error=provider_error))),
@@ -221,6 +221,35 @@ class OpenAICompatibleBackendTests(TestCase):
         self.assertEqual(len(message) - len(no_choices), PROVIDER_DETAIL_MAX_CHARACTERS)
         for reply in (SimpleNamespace(choices=[]), SimpleNamespace(choices=[], error={})):
             self.assertEqual(str(self.recognition_error(reply)), no_choices)
+
+    def test_reports_named_metadata_of_a_provider_error(self) -> None:
+        no_choices = "OpenAI-compatible service returned no completion choices"
+        metadata: dict[str, Any] = {
+            "raw": {"error": {"type": "invalid_request_error"}},
+            "flagged_input": "private text",
+            "provider_code": "invalid_request",
+            "provider_name": "Example",
+            "error_type": "invalid_request",
+            "model_slug": "provider/model",
+        }
+        provider_error = {"code": 400, "message": "Provider returned error", "metadata": metadata}
+        self.assertEqual(
+            str(self.recognition_error(SimpleNamespace(choices=None, error=provider_error))),
+            f"{no_choices}: provider error code=400, message='Provider returned error', "
+            "error_type='invalid_request', provider_name='Example', "
+            "provider_code='invalid_request', raw={'error': {'type': 'invalid_request_error'}}",
+        )
+        metadata["raw"] = "r" * 2 * PROVIDER_DETAIL_MAX_CHARACTERS
+        message = str(self.recognition_error(SimpleNamespace(choices=[], error=provider_error)))
+        self.assertIn("provider_code='invalid_request', raw='rrr", message)
+        self.assertTrue(message.endswith("r..."))
+        self.assertEqual(len(message) - len(no_choices), PROVIDER_DETAIL_MAX_CHARACTERS)
+        provider_error["metadata"] = {"error_type": "server", "provider_code": None, "raw": None}
+        self.assertEqual(
+            str(self.recognition_error(SimpleNamespace(choices=[], error=provider_error))),
+            f"{no_choices}: provider error code=400, message='Provider returned error', "
+            "error_type='server'",
+        )
 
     def test_reports_native_finish_reason_without_model_output(self) -> None:
         incomplete = "OpenAI-compatible completion ended before OCR was complete: "
@@ -256,7 +285,8 @@ class OpenAICompatibleBackendTests(TestCase):
         )
         self.assertEqual(
             str(self.recognition_error(SimpleNamespace(choices=[choice]))),
-            f"{stopped}: provider error code=502, message='Upstream timeout'",
+            f"{stopped}: provider error code=502, message='Upstream timeout', "
+            "error_type='provider_unavailable'",
         )
         choice.error = {"code": 502, "message": "m" * 2 * PROVIDER_DETAIL_MAX_CHARACTERS}
         message = str(self.recognition_error(SimpleNamespace(choices=[choice])))
