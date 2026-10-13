@@ -169,7 +169,10 @@ For a document name with other characters, a hyphen replaces them, and the name 
 For example, `my book.tex` has the directory `my-book-2c7e412c-figures`. Thus two documents in one directory do not share their illustrations.
 A new conversion replaces the files of the earlier conversion that have a name of the form `page-NNNN-figure-NN.jpg`. It does not remove a file with a different name.
 
-Scanwich writes the document after all pages are complete. A conversion that fails does not change an earlier document.
+Scanwich writes the document after all pages are complete. A conversion that fails does not change an earlier document or its illustrations.
+The new illustrations first go to the figure directory under temporary names. Only when all of them are there do the new illustrations and the new document get their names, and then Scanwich removes the earlier illustrations.
+A temporary name starts with a dot and ends with `.scanwich-new` or `.scanwich-old`. A conversion removes these files.
+If the system stops a conversion in its last step, such files can stay. A file that ends with `.scanwich-old` is then an illustration of the earlier document: remove the dot and the suffix from its name to use it again.
 A conversion fails when a page has no usable layout, and when no page has content. The error message has the number of the page.
 A page with no content in a document that has content gives a `WARNING` log record.
 

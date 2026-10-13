@@ -1,7 +1,10 @@
+import errno
 import hashlib
 import json
 import re
 import shutil
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import replace
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -585,6 +588,187 @@ class LatexConversionTests(TestCase):
         )
         self.assertEqual(
             [path.name for path in figure_directory.iterdir()], ["page-0001-figure-01.jpg"]
+        )
+
+    @contextmanager
+    def full_disk_at_illustration(self, number: int) -> Iterator[None]:
+        """Let the copy of a new illustration to the output directory fail: the disk is full.
+
+        `number` is the illustration that does not arrive. The illustrations before it
+        arrive.
+        """
+        arrived = 0
+
+        def guarded(real: object) -> object:
+            def copy(source: object, destination: object, *args: object, **options: object):
+                nonlocal arrived
+                if self.directory in Path(str(destination)).parents:
+                    arrived += 1
+                    if arrived == number:
+                        raise OSError(errno.ENOSPC, "No space left on device", str(destination))
+                return real(source, destination, *args, **options)  # type: ignore[operator]
+
+            return copy
+
+        with (
+            patch("shutil.move", guarded(shutil.move)),
+            patch("shutil.copyfile", guarded(shutil.copyfile)),
+        ):
+            yield
+
+    def earlier_result(self) -> tuple[Path, Path, bytes, dict[str, bytes]]:
+        """Make a document with 2 illustrations and a file of the user next to them."""
+        output_tex = self.directory / "book.tex"
+        figure_directory = self.directory / "book-figures"
+        layout = PageLayout(
+            blocks=(
+                Paragraph("The earlier text."),
+                Figure(box=Box(0, 0, 500, 500)),
+                Figure(box=Box(500, 0, 1000, 500)),
+            )
+        )
+        convert_to_latex(self.photo(), output_tex, backend=FakeLayoutBackend(layout))
+        (figure_directory / "notes.txt").write_text("a file of the user")
+        files = {path.name: path.read_bytes() for path in figure_directory.iterdir()}
+        self.assertEqual(
+            sorted(files), ["notes.txt", "page-0001-figure-01.jpg", "page-0001-figure-02.jpg"]
+        )
+        return output_tex, figure_directory, output_tex.read_bytes(), files
+
+    def new_backend(self) -> FakeLayoutBackend:
+        """Return a backend for a new conversion: other text and 3 other illustrations."""
+        return FakeLayoutBackend(
+            PageLayout(
+                blocks=(
+                    Paragraph("The new text."),
+                    Figure(box=Box(750, 0, 1000, 250)),
+                    Figure(box=Box(0, 500, 500, 1000)),
+                    Figure(box=Box(250, 250, 750, 750)),
+                )
+            )
+        )
+
+    def test_failure_while_the_illustrations_arrive_keeps_the_earlier_result(self) -> None:
+        # The earlier document includes its illustrations by name. When a new illustration
+        # does not arrive, the earlier document and each earlier illustration must stay.
+        output_tex, figure_directory, earlier_tex, earlier_files = self.earlier_result()
+        for number in (1, 2, 3):
+            with (
+                self.subTest(illustration=number),
+                self.full_disk_at_illustration(number),
+                self.assertRaisesRegex(OSError, "No space left on device"),
+            ):
+                convert_to_latex(self.photo(), output_tex, backend=self.new_backend())
+            self.assertEqual(output_tex.read_bytes(), earlier_tex)
+            self.assertEqual(
+                {path.name: path.read_bytes() for path in figure_directory.iterdir()},
+                earlier_files,
+            )
+            # No temporary file and no temporary directory stays.
+            self.assertEqual(
+                sorted(path.name for path in self.directory.iterdir()),
+                ["book-figures", "book.tex", "photo.png"],
+            )
+
+    def test_failure_of_the_document_step_keeps_the_earlier_result(self) -> None:
+        # The new illustrations are in place when the last step replaces the document.
+        output_tex, figure_directory, earlier_tex, earlier_files = self.earlier_result()
+        real_replace = Path.replace
+
+        def replace_document(source: Path, target: Path) -> Path:
+            if source.name.endswith(".scanwich-tmp"):
+                raise OSError(errno.EIO, "Input/output error", str(target))
+            return real_replace(source, target)
+
+        with (
+            patch.object(Path, "replace", replace_document),
+            self.assertRaisesRegex(OSError, "Input/output error"),
+        ):
+            convert_to_latex(self.photo(), output_tex, backend=self.new_backend())
+
+        self.assertEqual(output_tex.read_bytes(), earlier_tex)
+        self.assertEqual(
+            {path.name: path.read_bytes() for path in figure_directory.iterdir()}, earlier_files
+        )
+        self.assertEqual(
+            sorted(path.name for path in self.directory.iterdir()),
+            ["book-figures", "book.tex", "photo.png"],
+        )
+
+    def test_error_record_names_an_earlier_illustration_that_does_not_come_back(self) -> None:
+        # The document step fails, and then one earlier illustration does not get its
+        # name again. It must stay on the disk, and a log record must name its file.
+        output_tex, figure_directory, earlier_tex, earlier_files = self.earlier_result()
+        real_replace = Path.replace
+        lost = ".page-0001-figure-02.jpg.scanwich-old"
+
+        def replace_with_errors(source: Path, target: Path) -> Path:
+            if source.name.endswith(".scanwich-tmp") or source.name == lost:
+                raise OSError(errno.EIO, "Input/output error", str(target))
+            return real_replace(source, target)
+
+        with (
+            patch.object(Path, "replace", replace_with_errors),
+            self.assertLogs(LOGGER_NAME, level="ERROR") as captured_logs,
+            self.assertRaisesRegex(OSError, "Input/output error"),
+        ):
+            convert_to_latex(self.photo(), output_tex, backend=self.new_backend())
+
+        self.assertEqual(output_tex.read_bytes(), earlier_tex)
+        files = {path.name: path.read_bytes() for path in figure_directory.iterdir()}
+        # The other earlier illustration has its name, and no new illustration stays.
+        self.assertEqual(sorted(files), [lost, "notes.txt", "page-0001-figure-01.jpg"])
+        self.assertEqual(files[lost], earlier_files["page-0001-figure-02.jpg"])
+        self.assertEqual(files["page-0001-figure-01.jpg"], earlier_files["page-0001-figure-01.jpg"])
+        self.assertEqual(
+            captured_logs.output,
+            [
+                (
+                    f"ERROR:{LOGGER_NAME}:Could not put back the illustration "
+                    f"{figure_directory / 'page-0001-figure-02.jpg'} of the earlier document; it "
+                    f"is the file {figure_directory / lost}"
+                )
+            ],
+        )
+
+    def test_failure_of_a_first_conversion_leaves_no_part_of_a_result(self) -> None:
+        output_tex = self.directory / "book.tex"
+        with (
+            self.full_disk_at_illustration(2),
+            self.assertRaisesRegex(OSError, "No space left on device"),
+        ):
+            convert_to_latex(self.photo(), output_tex, backend=self.new_backend())
+        self.assertEqual([path.name for path in self.directory.iterdir()], ["photo.png"])
+
+    def test_new_result_has_only_the_new_illustrations(self) -> None:
+        output_tex, figure_directory, earlier_tex, earlier_files = self.earlier_result()
+        # A conversion that the system stopped can leave its temporary files.
+        (figure_directory / ".page-0001-figure-01.jpg.scanwich-new").write_bytes(b"stale")
+        (figure_directory / ".page-0007-figure-01.jpg.scanwich-old").write_bytes(b"stale")
+
+        convert_to_latex(self.photo(), output_tex, backend=self.new_backend())
+
+        files = {path.name: path.read_bytes() for path in figure_directory.iterdir()}
+        self.assertEqual(
+            sorted(files),
+            [
+                "notes.txt",
+                "page-0001-figure-01.jpg",
+                "page-0001-figure-02.jpg",
+                "page-0001-figure-03.jpg",
+            ],
+        )
+        self.assertEqual(files["notes.txt"], b"a file of the user")
+        # Each illustration is the new one: the new crops have other sizes.
+        for name in ("page-0001-figure-01.jpg", "page-0001-figure-02.jpg"):
+            self.assertNotEqual(files[name], earlier_files[name])
+        with Image.open(figure_directory / "page-0001-figure-03.jpg") as figure:
+            self.assertEqual(figure.size, (204, 102))
+        self.assertIn("The new text.", output_tex.read_text(encoding="utf-8"))
+        self.assertNotEqual(output_tex.read_bytes(), earlier_tex)
+        self.assertEqual(
+            sorted(path.name for path in self.directory.iterdir()),
+            ["book-figures", "book.tex", "photo.png"],
         )
 
     def test_rejects_arguments_that_cannot_give_a_document(self) -> None:

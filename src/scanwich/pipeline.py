@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import logging
@@ -34,6 +35,15 @@ FIGURE_DIRECTORY_SUFFIX = "-figures"
 # The names that Scanwich gives to the illustrations. A conversion replaces only files
 # with such a name.
 FIGURE_FILE_NAME = re.compile(r"page-\d{4,}-figure-\d{2,}\.jpg")
+# While a conversion puts its result in place, the figure directory has temporary files:
+# a new illustration that waits for its name, and an earlier illustration that the new
+# result replaces. Their names are the name of the illustration with a dot before it and
+# one of these suffixes.
+NEW_FIGURE_SUFFIX = ".scanwich-new"
+OLD_FIGURE_SUFFIX = ".scanwich-old"
+TEMPORARY_FIGURE_FILE_NAME = re.compile(
+    rf"\.{FIGURE_FILE_NAME.pattern}({re.escape(NEW_FIGURE_SUFFIX)}|{re.escape(OLD_FIGURE_SUFFIX)})"
+)
 FIGURE_JPEG_QUALITY = 95
 # Full color resolution keeps the lines of a drawing sharp.
 FIGURE_JPEG_SUBSAMPLING = "4:4:4"
@@ -209,8 +219,9 @@ def convert_to_latex(
         temporary_tex = output_tex.with_name(f".{output_tex.name}.scanwich-tmp")
         try:
             temporary_tex.write_text(render_latex(layouts, flow=flow), encoding="utf-8")
-            figure_count = _replace_figures(work_directory / "figures", figure_directory)
-            temporary_tex.replace(output_tex)
+            figure_count = _install_result(
+                temporary_tex, output_tex, work_directory / "figures", figure_directory
+            )
         finally:
             temporary_tex.unlink(missing_ok=True)
     logger.info("Wrote LaTeX document to %s", output_tex)
@@ -604,23 +615,106 @@ def _figure_files(directory: Path) -> list[Path]:
     )
 
 
-def _replace_figures(new_directory: Path, figure_directory: Path) -> int:
-    """Move the new illustrations to the figure directory, and return their number.
+def _install_result(
+    temporary_tex: Path, output_tex: Path, new_directory: Path, figure_directory: Path
+) -> int:
+    """Put the new document and its illustrations in place, and return their number.
 
-    The function first removes the illustrations of an earlier conversion of the document.
-    It does not remove a file with a different name.
+    An earlier document includes its illustrations by name, so the document and the
+    illustrations are one result. A failure must not leave a part of the new result in
+    the place of the earlier one. The function has three steps:
+
+    1. It copies each new illustration to the figure directory, under a temporary name.
+       This is the step that needs space on the disk. The earlier result does not change.
+    2. It gives a temporary name to each earlier illustration, gives the new
+       illustrations their names, and replaces the document. Each of these is a rename
+       in one directory.
+    3. It removes the earlier illustrations.
+
+    When step 1 or step 2 fails, the function puts the earlier result back and raises the
+    error. It does not remove a file of the figure directory with a different name.
     """
-    for old_figure in _figure_files(figure_directory):
-        old_figure.unlink()
     new_figures = _figure_files(new_directory)
+    old_figures = _figure_files(figure_directory)
+    made_directory = bool(new_figures) and not figure_directory.exists()
     if new_figures:
         figure_directory.mkdir(parents=True, exist_ok=True)
+    # A conversion that the system stopped can leave a new illustration here. It is not
+    # a part of a result.
+    _remove_temporary_figures(figure_directory, NEW_FIGURE_SUFFIX)
+    waiting: list[tuple[Path, Path]] = []
+    set_aside: list[tuple[Path, Path]] = []
+    in_place: list[Path] = []
+    try:
         for new_figure in new_figures:
+            figure = figure_directory / new_figure.name
+            temporary = figure.with_name(f".{figure.name}{NEW_FIGURE_SUFFIX}")
+            waiting.append((temporary, figure))
             # The temporary directory can be on a different file system.
-            shutil.move(new_figure, figure_directory / new_figure.name)
-    elif figure_directory.is_dir() and not any(figure_directory.iterdir()):
+            shutil.copyfile(new_figure, temporary)
+        for old_figure in old_figures:
+            temporary = old_figure.with_name(f".{old_figure.name}{OLD_FIGURE_SUFFIX}")
+            old_figure.replace(temporary)
+            set_aside.append((temporary, old_figure))
+        for temporary, figure in waiting:
+            temporary.replace(figure)
+            in_place.append(figure)
+        temporary_tex.replace(output_tex)
+    except BaseException:
+        _restore_earlier_figures(waiting, set_aside, in_place)
+        if made_directory:
+            # The directory is empty when the function made it and removed its files.
+            with contextlib.suppress(OSError):
+                figure_directory.rmdir()
+        raise
+    # The new result is complete. The earlier illustrations have no document now.
+    _remove_temporary_figures(figure_directory, OLD_FIGURE_SUFFIX)
+    if not new_figures and figure_directory.is_dir() and not any(figure_directory.iterdir()):
         figure_directory.rmdir()
     return len(new_figures)
+
+
+def _restore_earlier_figures(
+    waiting: Sequence[tuple[Path, Path]],
+    set_aside: Sequence[tuple[Path, Path]],
+    in_place: Sequence[Path],
+) -> None:
+    """Remove the new illustrations, and give the earlier illustrations their names again.
+
+    The function continues after an error of one file, so that it puts back as much as
+    is possible. An earlier illustration that it cannot put back stays in the figure
+    directory under its temporary name, and an `ERROR` log record names it.
+    """
+    for path in [*in_place, *(temporary for temporary, _ in waiting)]:
+        try:
+            path.unlink(missing_ok=True)
+        except OSError:
+            logger.error("Could not remove the new illustration %s", path)
+    for temporary, old_figure in set_aside:
+        try:
+            temporary.replace(old_figure)
+        except OSError:
+            logger.error(
+                "Could not put back the illustration %s of the earlier document; it is the file %s",
+                old_figure,
+                temporary,
+            )
+
+
+def _remove_temporary_figures(figure_directory: Path, suffix: str) -> None:
+    """Remove the temporary files of illustrations that have this suffix.
+
+    A file that stays is not a defect of the result, so an error is only a warning.
+    """
+    if not figure_directory.is_dir():
+        return
+    for path in figure_directory.iterdir():
+        is_temporary = TEMPORARY_FIGURE_FILE_NAME.fullmatch(path.name) is not None
+        if is_temporary and path.name.endswith(suffix) and path.is_file():
+            try:
+                path.unlink()
+            except OSError:
+                logger.warning("Could not remove the temporary file %s", path)
 
 
 def _write_ocr_json(output_directory: Path, page_number: int, regions: Sequence[Any]) -> None:
