@@ -30,8 +30,10 @@ supported GPU runtime, pass a backend option:
 nix run . -- input.pdf output.pdf --backend-option gpu=true
 ```
 
-Enter the development shell with `nix develop`. Inside it, the packaged `scanwich` command
-is available, or run the default command directly with `nix run .`. With direnv installed,
+Enter the development shell with `nix develop`. The shell has an editable install: the
+`scanwich` and `scanwich-api` commands run the source in `src/` of the working tree.
+The shell does not build the package and does not run the tests.
+Run the packaged command with `nix run .`. With direnv installed,
 run `direnv allow` once and `.envrc` will enter the same default development shell
 automatically.
 
