@@ -704,7 +704,7 @@ class TestApi(TestCase):
         ocr_text = "private letter"
         content = '{"coordinate_system": "normalized", "regions": [{"text": "private" letter"}]}'
         unusable = {"choices": [{"finish_reason": "stop", "message": {"content": content}}]}
-        # The correction request has the reply, and a moderation error repeats request input.
+        # The correction request has the reply, and a provider can repeat request input.
         moderation = {
             "error": {
                 "code": 403,
@@ -712,34 +712,48 @@ class TestApi(TestCase):
                 "metadata": {"reasons": ["other"], "flagged_input": ocr_text},
             }
         }
-        provider_requests: list[httpx.Request] = []
-        client = provider_client(
-            200, [unusable, httpx.Response(403, json=moderation)], provider_requests
+        provider_error = {
+            "error": {"code": 502, "message": f"flagged {ocr_text}", "metadata": {"raw": ocr_text}}
+        }
+        cases = (
+            (
+                httpx.Response(403, json=moderation),
+                (
+                    "OpenAI-compatible request failed for model provider/model in attempt 2 "
+                    "of 3: PermissionDeniedError, HTTP status 403"
+                ),
+            ),
+            # An error with HTTP 200 has no exception from the client.
+            (provider_error, "OpenAI-compatible service returned no completion choices\n"),
         )
-        backend = OpenAICompatibleBackend(languages=["en"], options={"model": "provider/model"})
-        with (
-            patch("scanwich.api.load_backend", return_value=backend),
-            patch.dict(os.environ, {"OPENROUTER_API_KEY": "sk-private-key"}),
-            patch("openai.AsyncOpenAI", client),
-            TestClient(create_app()) as api,
-            self.assertLogs("scanwich", level="WARNING") as logs,
-        ):
-            response = api.post(
-                "/ocr/openai-compatible", files={"file": ("page.png", image_bytes())}
-            )
+        for correction_reply, expected in cases:
+            with self.subTest(expected=expected):
+                provider_requests: list[httpx.Request] = []
+                client = provider_client(200, [unusable, correction_reply], provider_requests)
+                backend = OpenAICompatibleBackend(
+                    languages=["en"], options={"model": "provider/model"}
+                )
+                with (
+                    patch("scanwich.api.load_backend", return_value=backend),
+                    patch.dict(os.environ, {"OPENROUTER_API_KEY": "sk-private-key"}),
+                    patch("openai.AsyncOpenAI", client),
+                    TestClient(create_app()) as api,
+                    self.assertLogs("scanwich", level="WARNING") as logs,
+                ):
+                    response = api.post(
+                        "/ocr/openai-compatible", files={"file": ("page.png", image_bytes())}
+                    )
 
-        self.assertEqual(response.status_code, 502)
-        self.assertEqual(len(provider_requests), 2)
-        self.assertIn(ocr_text.split()[0], provider_requests[1].content.decode())
-        _, record = logs.output
-        self.assertIn(
-            "OCR backend openai-compatible failed: RuntimeError: OpenAI-compatible request failed "
-            "for model provider/model in attempt 2 of 3: PermissionDeniedError, HTTP status 403",
-            record,
-        )
-        for line in logs.output:
-            self.assertNotIn("private", line)
-            self.assertNotIn("flagged", line)
+                self.assertEqual(response.status_code, 502)
+                self.assertEqual(len(provider_requests), 2)
+                self.assertIn(ocr_text.split()[0], provider_requests[1].content.decode())
+                _, record = logs.output
+                self.assertIn(
+                    f"OCR backend openai-compatible failed: RuntimeError: {expected}", record
+                )
+                for line in logs.output:
+                    self.assertNotIn("private", line)
+                    self.assertNotIn("flagged", line)
 
     def test_cost_of_an_unusable_reply_is_logged(self):
         choice = {"finish_reason": "length", "message": {"content": "{"}}

@@ -151,7 +151,8 @@ scanwich input.pdf output.pdf \
 ```
 
 The backend accepts PNG, JPEG, WebP, and GIF page images.
-It rejects a page image that has more pixels than the safe limit of Pillow, which is about 89 million pixels by default.
+It rejects a page image when the decoded image and its copies need more than 512 MiB of memory.
+For an RGB page, that limit is about 44 million pixels. For a page with transparency, it is about 33 million pixels.
 It sends each page image as a JPEG in base64 text to the configured service and its
 selected model provider. Do not use this backend for documents that must remain local.
 The page image file does not change, so the PDF keeps the original image.
@@ -183,7 +184,8 @@ Each correction request has a cost. The session total includes it.
 The backend writes one `WARNING` log record for each unusable reply. The record has the error and no text from the reply.
 If the last reply is also unusable, the page fails with the error of that reply.
 The backend sends no correction request when the request fails, when the provider stops the reply before its end, or when the reply has no text.
-A correction request has text from the model reply. If that request fails, the error has the error type and the HTTP status, and no text from the provider.
+A correction request has text from the model reply, and a provider can repeat request input in an error.
+Thus the error of a failed correction attempt has no text from the provider. It has the error type and the HTTP status, or the `finish_reason`.
 The request for plain text has no JSON, so it has no correction request.
 
 ```text

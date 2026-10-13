@@ -5,7 +5,6 @@ import os
 import random
 import sys
 import uuid
-import warnings
 from collections.abc import Sequence
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -21,7 +20,9 @@ from scanwich.backends.openai_compatible import (
     DEFAULT_MODEL,
     PROVIDER_DETAIL_MAX_CHARACTERS,
     OpenAICompatibleBackend,
+    _conversion_copy_modes,
     _jpeg_mode_image,
+    _working_bytes,
 )
 from scanwich.models import OcrRegion, Point
 
@@ -648,21 +649,90 @@ class OpenAICompatibleBackendTests(TestCase):
         self.assertAlmostEqual(darkest, 127, delta=3)
         self.assertAlmostEqual(lightest, 127, delta=3)
 
-    def test_rejects_an_image_above_the_pixel_limit_before_it_decodes_the_image(self) -> None:
+    def test_rejects_an_image_above_the_memory_limit_before_it_decodes_the_image(self) -> None:
         completions = FakeCompletions("{}")
         with (
-            # Pillow gives a warning above the limit, and an error above two times the limit.
-            patch("PIL.Image.MAX_IMAGE_PIXELS", 150),
-            warnings.catch_warnings(),
-            patch("PIL.Image.Image.convert") as convert,
+            # An RGBA image of 1000x500 pixels needs 16 bytes for each pixel.
+            patch("scanwich.backends.openai_compatible.MAX_IMAGE_WORKING_BYTES", 7 * 1024 * 1024),
+            patch("scanwich.backends.openai_compatible._jpeg_mode_image") as convert,
             self.assertRaisesRegex(
-                RuntimeError, "image of 20x10 pixels is above the limit of 150 pixels"
+                RuntimeError,
+                "image of 1000x500 pixels needs 8 MiB of memory, and the limit is 7 MiB; "
+                "use a lower DPI or a smaller image",
             ),
         ):
-            warnings.simplefilter("ignore", Image.DecompressionBombWarning)
-            self.recognize_replies(completions, image=Image.new("RGBA", (20, 10)))
+            self.recognize_replies(completions, image=Image.new("RGBA", (1000, 500)))
         convert.assert_not_called()
         self.assertEqual(completions.calls, [])
+
+    def test_memory_estimate_has_each_copy_of_the_conversion(self) -> None:
+        transparent_palette = Image.new("P", (10, 10), 0)
+        transparent_palette.info["transparency"] = 0
+        # The source, the copies of the conversion, and two copies for a resize.
+        cases = (
+            (Image.new("L", (10, 10)), 1 + 0 + 2 * 1, "L"),
+            (Image.new("RGB", (10, 10)), 4 + 0 + 2 * 4, "RGB"),
+            (Image.new("1", (10, 10)), 1 + 1 + 2 * 1, "L"),
+            (Image.new("I;16", (10, 10)), 2 + (2 + 1) + 2 * 1, "L"),
+            (Image.new("I", (10, 10)), 4 + (4 + 1) + 2 * 1, "L"),
+            (Image.new("P", (10, 10)), 1 + 4 + 2 * 4, "RGB"),
+            (Image.new("CMYK", (10, 10)), 4 + 4 + 2 * 4, "RGB"),
+            (Image.new("RGBA", (10, 10)), 4 + 4 + 2 * 4, "RGB"),
+            (Image.new("LA", (10, 10)), 4 + (4 + 4) + 2 * 4, "RGB"),
+            (transparent_palette, 1 + (4 + 4) + 2 * 4, "RGB"),
+        )
+        for image, bytes_per_pixel, jpeg_mode in cases:
+            with self.subTest(mode=image.mode, transparency="transparency" in image.info):
+                self.assertEqual(_working_bytes(image), 100 * bytes_per_pixel)
+                self.assertEqual(_jpeg_mode_image(image).mode, jpeg_mode)
+                self.assertEqual((_conversion_copy_modes(image) or (image.mode,))[-1], jpeg_mode)
+
+    def test_correction_attempt_reports_no_provider_text_of_a_completion_error(self) -> None:
+        unusable = '{"coordinate_system": "normalized", "regions": [{"text": "private" letter"}]}'
+        provider_error = {
+            "code": 502,
+            "message": "private letter",
+            "metadata": {"raw": "private letter", "provider_name": "private provider"},
+        }
+        stopped = "OpenAI-compatible completion ended before OCR was complete: "
+        message = SimpleNamespace(content="private letter")
+        cases = (
+            (
+                SimpleNamespace(choices=None, error=provider_error),
+                "OpenAI-compatible service returned no completion choices",
+            ),
+            (
+                SimpleNamespace(
+                    choices=[
+                        SimpleNamespace(
+                            finish_reason="error",
+                            native_finish_reason="private letter",
+                            error=provider_error,
+                            message=message,
+                        )
+                    ]
+                ),
+                f"{stopped}finish_reason='error'",
+            ),
+            (
+                SimpleNamespace(
+                    choices=[SimpleNamespace(finish_reason="private letter", message=message)]
+                ),
+                f"{stopped}finish_reason=unknown",
+            ),
+        )
+        for reply, expected in cases:
+            with self.subTest(expected=expected):
+                replies = iter([FakeCompletions(unusable).create(), reply])
+                completions = SimpleNamespace(create=lambda replies=replies, **_: next(replies))
+                with (
+                    self.assertLogs(LOGGER_NAME, level="WARNING") as logs,
+                    self.assertRaises(RuntimeError) as raised,
+                ):
+                    self.recognize_replies(completions)
+                # The provider can repeat the text of the correction request in its error.
+                self.assertEqual(str(raised.exception), expected)
+                self.assertNotIn("private", "\n".join(logs.output))
 
     def test_scales_16_bit_gray_values_to_8_bits(self) -> None:
         completions = FakeCompletions(json.dumps({"coordinate_system": "pixels", "regions": []}))
