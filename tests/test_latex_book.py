@@ -4,6 +4,8 @@ import asyncio
 import gc
 import hashlib
 import json
+import os
+import shutil
 import signal
 import tempfile
 import threading
@@ -19,7 +21,18 @@ from PIL import Image
 from reportlab.pdfgen import canvas
 
 from scanwich import pipeline
-from scanwich.layout import Box, Figure, FigureLocation, PageLayout, Paragraph
+from scanwich.layout import (
+    Box,
+    Figure,
+    FigureLocation,
+    Footnote,
+    Heading,
+    PageFurniture,
+    PageLayout,
+    Paragraph,
+    Table,
+    TableCell,
+)
 from scanwich.models import OcrRegion
 from scanwich.ocr import (
     AsyncFigureLocator,
@@ -34,6 +47,7 @@ from scanwich.pipeline import (
     DEFAULT_PARALLEL_PAGES,
     NO_REPLY_PAGES,
     PAGE_QUEUE_SIZE,
+    OutputDirectoryError,
     PageLayoutError,
     convert_to_latex,
 )
@@ -599,6 +613,165 @@ class SavedLayoutTests(BookTestCase):
         backend = PageBackend()
         self.convert(inputs, backend)
         self.assertEqual(backend.requests, [1])
+
+    def test_layout_that_scanwich_cannot_read_again_is_not_saved(self) -> None:
+        # A backend can return a layout as an object, without the check of the JSON
+        # form. The next conversion reads the file with that check.
+        text = Paragraph("Text.")
+        layouts = {
+            "text has a control character": PageLayout(blocks=(Paragraph("a \x08 b"),)),
+            "box must use the 0-to-1000 grid of the image, not its pixels": PageLayout(
+                blocks=(text, Figure(box=Box(100, 100, 1500, 2000)))
+            ),
+            "has a mark and no text": PageLayout(blocks=(text, Footnote("", mark="1"))),
+            "position must be one of": PageLayout(
+                blocks=(text, PageFurniture("page_number", "12", "outer"))
+            ),
+        }
+        inputs = self.photos(2)
+        for message, layout in layouts.items():
+            backend = PageBackend({2: layout})
+            with (
+                self.subTest(message=message),
+                self.assertLogs(LOGGER_NAME, level="ERROR"),
+                self.assertRaises(PageLayoutError) as raised,
+            ):
+                self.convert(inputs, backend, ignore_saved_layouts=True)
+            error = str(raised.exception)
+            self.assertIn(
+                f"page 2 ({inputs[1]}): the backend gave a layout for page 2 that Scanwich "
+                "cannot save and read again: block ",
+                error,
+            )
+            self.assertIn(message, error)
+            # The page has no file, so the next conversion sends its request again.
+            self.assertEqual(self.layout_files(), [self.layout_file(inputs[0]).name])
+            self.assertFalse(self.output.exists())
+
+    def test_document_is_from_the_layout_that_the_file_gives(self) -> None:
+        # The check of a layout file can change a layout that a backend returns as an
+        # object. The first conversion and each later one must give the same document.
+        layout = PageLayout(
+            blocks=(
+                Heading("A heading of level 5", level=5),
+                Paragraph("  Text with spaces at its ends.  "),
+                # The document writer does not know this alignment. The check of a layout
+                # file reads it as the usual alignment.
+                Paragraph("A paragraph with a different alignment.", align="justify"),
+                Table(rows=((TableCell("a"), TableCell("b")), (TableCell("c"),))),
+            )
+        )
+        inputs = self.photos(1)
+        self.convert(inputs, PageBackend({1: layout}))
+        first_document = self.document()
+
+        backend = NoRequestBackend()
+        self.convert(inputs, backend)
+
+        self.assertEqual(backend.requests, [])
+        self.assertEqual(self.document(), first_document)
+        self.assertIn("Text with spaces at its ends.", first_document)
+
+    def test_directory_that_scanwich_cannot_write_to_stops_before_the_first_request(self) -> None:
+        # The first file of the layout directory comes after the requests of a page.
+        inputs = self.photos(2)
+        a_file = self.directory / "a-file"
+        a_file.write_text("not a directory")
+        read_only = self.directory / "read-only"
+        read_only.mkdir(mode=0o500)
+        self.addCleanup(read_only.chmod, 0o700)
+        cases = {
+            "the layout directory is a file": {"ocr_output_directory": a_file},
+            "the layout directory is in a file": {"ocr_output_directory": a_file / "layouts"},
+            "the directory of the document is in a file": {"output": a_file / "out" / "book.tex"},
+        }
+        # The system administrator can write to each directory.
+        if os.geteuid() != 0:
+            cases["the layout directory is read-only"] = {"ocr_output_directory": read_only}
+            cases["a new layout directory in a read-only directory"] = {
+                "ocr_output_directory": read_only / "layouts"
+            }
+            cases["the directory of the document is read-only"] = {"output": read_only / "book.tex"}
+        for name, options in cases.items():
+            backend = PageBackend()
+            output = options.pop("output", self.output)
+            options.setdefault("ocr_output_directory", self.layouts)
+            is_layout_directory = "layout" in name.split(" is ")[0]
+            with (
+                self.subTest(case=name),
+                self.assertRaisesRegex(
+                    OutputDirectoryError,
+                    "Scanwich cannot write to the "
+                    + ("layout directory" if is_layout_directory else "directory of the document")
+                    + " /",
+                ),
+            ):
+                convert_to_latex(inputs, output, backend=backend, **options)
+            self.assertEqual(backend.requests, [])
+        self.assertEqual(list(read_only.iterdir()), [])
+        self.assertEqual(a_file.read_text(), "not a directory")
+
+    def test_two_writers_of_one_layout_file_do_not_fail(self) -> None:
+        # Two conversions can have one layout directory, for example a document with
+        # pages and a document with `--flow` from the same files.
+        inputs = self.photos(1)
+        self.convert(inputs, PageBackend())
+        (page,) = pipeline._source_pages(inputs, inputs)
+        layout_file = self.layout_file(inputs[0])
+        record = pipeline._source_record_from_json(
+            json.loads(layout_file.read_text(encoding="utf-8"))["source"]
+        )
+        assert record is not None
+        layout = PageLayout(blocks=(Paragraph(text_of(1)),))
+        errors: list[Exception] = []
+
+        def write() -> None:
+            for _ in range(150):
+                try:
+                    pipeline._write_layout_file(self.layouts, page, record, layout)
+                except Exception as error:
+                    errors.append(error)
+
+        threads = [threading.Thread(target=write) for _ in range(8)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+
+        self.assertEqual(errors, [])
+        # The file is complete, and no temporary file stays.
+        self.assertEqual(self.layout_files(), [layout_file.name])
+        self.assertEqual(
+            json.loads(layout_file.read_text(encoding="utf-8"))["blocks"][0]["text"], text_of(1)
+        )
+
+    def test_two_layout_files_with_one_record_give_a_warning(self) -> None:
+        inputs = self.photos(2)
+        self.convert(inputs, PageBackend())
+        layout_file = self.layout_file(inputs[1])
+        shutil.copy(layout_file, self.layouts / "copy-b.json")
+        layout_file.rename(self.layouts / "copy-a.json")
+
+        backend = PageBackend()
+        with self.assertLogs(LOGGER_NAME, level="WARNING") as captured_logs:
+            self.convert(inputs, backend)
+
+        self.assertEqual(backend.requests, [])
+        self.assertEqual(
+            captured_logs.output,
+            [
+                (
+                    f"WARNING:{LOGGER_NAME}:2 layout files are for page 2 (copy-a.json, "
+                    f"copy-b.json), and none has the usual name {layout_file.name}. The "
+                    "conversion uses copy-a.json. Remove the files that you do not want"
+                )
+            ],
+        )
+        # One file with the record and a different name is the usual case of an input
+        # file with a new name. It gives no warning.
+        (self.layouts / "copy-b.json").unlink()
+        with self.assertNoLogs(LOGGER_NAME, level="WARNING"):
+            self.convert(inputs, backend)
 
     def test_other_files_of_the_layout_directory_stay(self) -> None:
         self.layouts.mkdir()
@@ -1278,4 +1451,4 @@ class RateLimitTests(BookTestCase):
         ):
             self.convert(self.photos(1), backend)
         self.assertEqual(RefusedBoxBackend.boxes, 2)
-        self.assertFalse(self.layouts.exists())
+        self.assertEqual(self.layout_files(), [])

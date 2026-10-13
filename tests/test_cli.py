@@ -269,6 +269,28 @@ class CliTests(TestCase):
             self.assertIn("put -- after the last language code", usage.getvalue())
             convert_pdf.assert_not_called()
 
+    def test_directory_that_the_command_cannot_write_to_is_one_error_line(self) -> None:
+        a_file = self.directory / "a-file"
+        a_file.write_text("not a directory")
+        backend = LayoutCapableBackend()
+        commands = {
+            "the directory of the document": [str(self.photo), str(a_file / "book.tex")],
+            "the layout directory": [
+                str(self.photo),
+                str(self.directory / "book.tex"),
+                "--ocr-output-dir",
+                str(a_file / "layouts"),
+            ],
+        }
+        for name, arguments in commands.items():
+            with self.subTest(directory=name):
+                exit_code, log_output = self.run_main(arguments, backend)
+                self.assertEqual(exit_code, 1)
+                self.assertIn(f"ERROR: Scanwich cannot write to {name} {a_file}", log_output)
+                self.assertNotIn("Traceback", log_output)
+        # The command stops before the backend gets a page.
+        self.assertEqual(backend.image_sizes, [])
+
     def test_stop_of_the_user_is_not_a_traceback(self) -> None:
         output = self.directory / "page.tex"
         with patch("scanwich.cli.convert_to_latex", side_effect=KeyboardInterrupt):

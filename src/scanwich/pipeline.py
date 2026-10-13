@@ -10,6 +10,7 @@ import logging
 import os
 import re
 import shutil
+import uuid
 from collections.abc import Awaitable, Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -149,6 +150,10 @@ class PageLayoutError(RuntimeError):
     """A page, or the full document, has no usable layout."""
 
 
+class OutputDirectoryError(RuntimeError):
+    """Scanwich cannot write to a directory that the conversion needs."""
+
+
 def convert_pdf(
     input_pdf: Path,
     output_pdf: Path,
@@ -251,7 +256,13 @@ def convert_to_latex(
             "LaTeX output needs an OCR backend that recognizes the layout of a page"
         )
 
-    output_tex.parent.mkdir(parents=True, exist_ok=True)
+    # A directory that Scanwich cannot write to must stop the conversion here, before
+    # the first request. The layout directory gets its first file after requests.
+    _check_directory(output_tex.parent, "the directory of the document")
+    layout_directory = None
+    if ocr_output_directory is not None:
+        layout_directory = ocr_output_directory.expanduser().resolve()
+        _check_directory(layout_directory, "the layout directory")
     figure_directory = _figure_directory(output_tex)
     pages = _source_pages(given_paths, input_paths)
     logger.info("The document has %d page(s) from %d input file(s)", len(pages), len(input_paths))
@@ -274,11 +285,7 @@ def convert_to_latex(
             figure_directory_name=figure_directory.name,
             dpi=dpi,
             rotate=rotate,
-            layout_directory=(
-                None
-                if ocr_output_directory is None
-                else ocr_output_directory.expanduser().resolve()
-            ),
+            layout_directory=layout_directory,
             ignore_saved_layouts=ignore_saved_layouts,
             parallel_pages=parallel_pages,
         )
@@ -314,6 +321,19 @@ def convert_to_latex(
         )
     if figure_count:
         logger.info("Wrote %d illustration(s) to %s", figure_count, figure_directory)
+
+
+def _check_directory(directory: Path, name: str) -> None:
+    """Make a directory, and raise `OutputDirectoryError` when a file cannot go there."""
+    probe = directory / f".{uuid.uuid4().hex}{TEMPORARY_SUFFIX}"
+    try:
+        directory.mkdir(parents=True, exist_ok=True)
+        probe.write_bytes(b"")
+        probe.unlink()
+    except OSError as error:
+        raise OutputDirectoryError(
+            f"Scanwich cannot write to {name} {directory}: {error}"
+        ) from error
 
 
 @dataclass(frozen=True)
@@ -547,7 +567,7 @@ class _Conversion:
         # The settings go to a JSON file. This form compares with the form of a file.
         self._settings: dict[str, Any] = json.loads(json.dumps(dict(settings)))
         self._digests: dict[Path, str] = {}
-        self._saved_index: dict[tuple[str, int], Path] = {}
+        self._saved_index: dict[tuple[str, int], list[Path]] = {}
         self._layouts: dict[int, PageLayout] = {}
         # The message of each failed page. The error itself does not stay: its traceback
         # has the frames of the backend, and they hold the request with the page image.
@@ -693,10 +713,20 @@ class _Conversion:
         assert self._layout_directory is not None
         path = self._layout_directory / _layout_file_name(page, digest)
         if not path.is_file():
-            other_path = self._saved_index.get((digest, page.page_of_input))
-            if other_path is None:
+            other_paths = self._saved_index.get((digest, page.page_of_input))
+            if not other_paths:
                 return None
-            path = other_path
+            path = other_paths[0]
+            if len(other_paths) > 1:
+                logger.warning(
+                    "%d layout files are for page %d (%s), and none has the usual name %s. "
+                    "The conversion uses %s. Remove the files that you do not want",
+                    len(other_paths),
+                    page.number,
+                    ", ".join(other_path.name for other_path in other_paths),
+                    _layout_file_name(page, digest),
+                    path.name,
+                )
         return _read_saved_layout(path, page, digest, self._rotate)
 
     async def _read(self, queue: asyncio.Queue[_PageJob | None]) -> None:
@@ -785,7 +815,7 @@ class _Conversion:
             )
             # The layout is complete here. The file is there before the crops start, so
             # that a later failure does not lose a layout that has a cost.
-            path = await asyncio.to_thread(
+            path, layout = await asyncio.to_thread(
                 _write_layout_file, self._layout_directory, page, record, layout
             )
             logger.info("Wrote layout JSON for page %d to %s", page.number, path.name)
@@ -926,9 +956,13 @@ def _source_record_from_json(value: Any) -> _SourceRecord | None:
     )
 
 
-def _saved_layout_index(directory: Path) -> dict[tuple[str, int], Path]:
-    """Return the layout files of a directory, by input file hash and page of the input."""
-    index: dict[tuple[str, int], Path] = {}
+def _saved_layout_index(directory: Path) -> dict[tuple[str, int], list[Path]]:
+    """Return the layout files of a directory, by input file hash and page of the input.
+
+    More than one file can have the same record, for example a copy that a person made.
+    The files of one record are in the sequence of their names.
+    """
+    index: dict[tuple[str, int], list[Path]] = {}
     if not directory.is_dir():
         return index
     for path in sorted(directory.glob(f"*{LAYOUT_FILE_SUFFIX}")):
@@ -941,7 +975,7 @@ def _saved_layout_index(directory: Path) -> dict[tuple[str, int], Path]:
             payload.get(SOURCE_FIELD) if isinstance(payload, dict) else None
         )
         if record is not None:
-            index.setdefault((record.digest, record.page), path)
+            index.setdefault((record.digest, record.page), []).append(path)
     return index
 
 
@@ -983,26 +1017,40 @@ def _read_saved_layout(
             "--ignore-saved-layouts, to get a new layout"
         )
     try:
-        layout = page_layout_from_json(
-            {name: value for name, value in payload.items() if name != SOURCE_FIELD}
-        )
+        layout = _layout_of_file(payload)
     except LayoutFormatError as error:
         hint = f" {error.hint}" if error.hint else ""
         raise PageLayoutError(
             f"the saved layout {path} is not usable: {error}.{hint} {remedy}"
         ) from None
-    if layout.page_top != PAGE_TOP_UPRIGHT:
-        raise PageLayoutError(
-            f"the saved layout {path} is not usable: page_top must be {PAGE_TOP_UPRIGHT!r} "
-            f"in a saved layout. {remedy}"
-        )
     return _SavedLayout(path=path, layout=layout, record=record)
+
+
+def _layout_of_file(payload: Mapping[str, Any]) -> PageLayout:
+    """Return the layout that the JSON object of a layout file has.
+
+    The function raises `LayoutFormatError` for a layout that a conversion cannot use.
+    """
+    layout = page_layout_from_json(
+        {name: value for name, value in payload.items() if name != SOURCE_FIELD}
+    )
+    if layout.page_top != PAGE_TOP_UPRIGHT:
+        raise LayoutFormatError(f"page_top must be {PAGE_TOP_UPRIGHT!r} in a saved layout")
+    return layout
 
 
 def _write_layout_file(
     directory: Path, page: _SourcePage, record: _SourceRecord, layout: PageLayout
-) -> Path:
-    """Save the layout of a page with the record of its source, and return the file."""
+) -> tuple[Path, PageLayout]:
+    """Save the layout of a page with the record of its source.
+
+    The result is the file, and the layout as a later conversion reads it from the file.
+    The caller makes the document from that layout, so that a later conversion with the
+    saved layout gives the same document.
+
+    A layout that Scanwich cannot read again gives `PageLayoutError`, and no file. A
+    backend can return such a layout as an object, without the check of the JSON form.
+    """
     directory.mkdir(parents=True, exist_ok=True)
     path = directory / _layout_file_name(page, record.digest)
     payload = {
@@ -1016,14 +1064,25 @@ def _write_layout_file(
         },
         **layout.to_json(),
     }
-    # A stop in the middle of the write must not leave a part of a file.
-    temporary = path.with_name(f".{path.name}{TEMPORARY_SUFFIX}")
+    text = _json_text(payload)
     try:
-        temporary.write_text(_json_text(payload), encoding="utf-8")
+        layout_of_file = _layout_of_file(json.loads(text))
+    except LayoutFormatError as error:
+        hint = f" {error.hint}" if error.hint else ""
+        raise PageLayoutError(
+            f"the backend gave a layout for page {page.number} that Scanwich cannot save and "
+            f"read again: {error}.{hint}"
+        ) from None
+    # A stop in the middle of the write must not leave a part of a file. Two conversions
+    # can write the layout of one page at the same time, so each write has a name of
+    # its own for its temporary file.
+    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex[:16]}{TEMPORARY_SUFFIX}")
+    try:
+        temporary.write_text(text, encoding="utf-8")
         temporary.replace(path)
     finally:
         temporary.unlink(missing_ok=True)
-    return path
+    return path, layout_of_file
 
 
 async def _recognize_upright_layout(

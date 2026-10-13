@@ -564,9 +564,9 @@ class LatexConversionTests(TestCase):
         convert_to_latex(self.photo(), output_tex, backend=without_figure)
         self.assertFalse(figure_directory.exists())
 
-    def test_saves_layout_json_that_has_one_half_of_a_character(self) -> None:
+    def test_layout_that_has_one_half_of_a_character(self) -> None:
         # A lone surrogate comes from a JSON escape without its pair. A file in UTF-8
-        # cannot have it.
+        # cannot have it. A backend can return such a layout as an object.
         half = chr(0xD83D)
         layout = PageLayout(
             blocks=(Paragraph(f"a {half} b"), PageFurniture("page_header", f"h {half}"))
@@ -574,17 +574,28 @@ class LatexConversionTests(TestCase):
         output_tex = self.directory / "page.tex"
         json_directory = self.directory / "layout"
 
-        convert_to_latex(
-            self.photo(),
-            output_tex,
-            backend=FakeLayoutBackend(layout),
-            ocr_output_directory=json_directory,
-        )
-
-        (layout_file,) = json_directory.iterdir()
-        self.assertIn('"a \\ud83d b"', layout_file.read_bytes().decode("utf-8"))
-        self.assertEqual(saved_layout(json_directory), layout.to_json())
+        convert_to_latex(self.photo(), output_tex, backend=FakeLayoutBackend(layout))
         self.assertIn("a b", output_tex.read_text(encoding="utf-8"))
+
+        # The check of a layout file refuses such text. A layout that Scanwich saves
+        # must be a layout that it can read again, so the page fails and has no file.
+        output_tex.unlink()
+        with (
+            self.assertLogs(LOGGER_NAME, level="ERROR"),
+            self.assertRaisesRegex(
+                PageLayoutError,
+                "the backend gave a layout for page 1 that Scanwich cannot save and read "
+                "again: block 1 .paragraph. text has one half of a character",
+            ),
+        ):
+            convert_to_latex(
+                self.photo(),
+                output_tex,
+                backend=FakeLayoutBackend(layout),
+                ocr_output_directory=json_directory,
+            )
+        self.assertEqual(list(json_directory.iterdir()), [])
+        self.assertFalse(output_tex.exists())
 
     def test_failure_writes_no_document_and_keeps_the_earlier_one(self) -> None:
         output_tex = self.directory / "book.tex"
