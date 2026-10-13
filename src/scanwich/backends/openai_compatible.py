@@ -400,13 +400,22 @@ class OpenAICompatibleBackend:
         """Log the tokens and the cost that the service reports for one request."""
         usage = getattr(completion, "usage", None)
         tokens = [getattr(usage, name, None) for name in USAGE_TOKEN_FIELDS]
-        if all(isinstance(count, int) and not isinstance(count, bool) for count in tokens):
+        if all(_is_count(count) for count in tokens):
+            # The reasoning tokens are a part of the completion tokens. A model that
+            # reasons much is slow and has a high cost for a short reply.
+            details = getattr(usage, "completion_tokens_details", None)
+            reasoning = (
+                details.get("reasoning_tokens")
+                if isinstance(details, Mapping)
+                else getattr(details, "reasoning_tokens", None)
+            )
             logger.info(
                 "OpenAI-compatible session %s, model %s: usage.prompt_tokens=%d, "
-                "usage.completion_tokens=%d for this request",
+                "usage.completion_tokens=%d%s for this request",
                 self._session_id,
                 self._model,
                 *tokens,
+                f", reasoning_tokens={reasoning}" if _is_count(reasoning) else "",
             )
         self._log_cost(completion)
 
@@ -1098,6 +1107,10 @@ def _clamp_coordinate(
             clamped,
         )
     return clamped
+
+
+def _is_count(value: Any) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 0
 
 
 def _pop_string(options: dict[str, Any], name: str, default: str) -> str:

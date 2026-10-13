@@ -322,6 +322,7 @@ The record has the session ID, the model, the cost of the request, and the total
 The last record of a session thus has the cost of the document. OpenRouter reports the cost in credits.
 A failed request has no `usage.cost`, so the total does not include it.
 When a response has `usage.prompt_tokens` and `usage.completion_tokens`, the backend also writes one `INFO` log record with the two numbers.
+The record also has the reasoning tokens when the response has `usage.completion_tokens_details.reasoning_tokens`. They are a part of the completion tokens.
 
 ```text
 INFO: OpenAI-compatible session 2f0c6f0e-5d0b-4c53-9d57-3f6a4f1f6f0a, model provider/vision-model: usage.cost=0.001500 for this request, total 0.003000 for 2 request(s)

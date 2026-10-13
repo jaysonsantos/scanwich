@@ -416,6 +416,16 @@ class OpenAICompatibleBackendTests(TestCase):
         session_id, records = self.cost_records(
             [
                 SimpleNamespace(prompt_tokens=1800, completion_tokens=950, cost=0.002),
+                SimpleNamespace(
+                    prompt_tokens=1500,
+                    completion_tokens=6200,
+                    completion_tokens_details=SimpleNamespace(reasoning_tokens=5400),
+                ),
+                SimpleNamespace(
+                    prompt_tokens=1500,
+                    completion_tokens=800,
+                    completion_tokens_details={"reasoning_tokens": 0},
+                ),
                 # A usage without the two counts as integers gives no record of tokens.
                 SimpleNamespace(prompt_tokens=1800, cost=0.001),
                 SimpleNamespace(prompt_tokens="1800", completion_tokens=True),
@@ -431,6 +441,12 @@ class OpenAICompatibleBackendTests(TestCase):
             [
                 prefix + "usage.prompt_tokens=1800, usage.completion_tokens=950 for this request",
                 prefix + "usage.cost=0.002000 for this request, total 0.002000 for 1 request(s)",
+                prefix
+                + "usage.prompt_tokens=1500, usage.completion_tokens=6200, reasoning_tokens=5400 "
+                "for this request",
+                prefix
+                + "usage.prompt_tokens=1500, usage.completion_tokens=800, reasoning_tokens=0 "
+                "for this request",
                 prefix + "usage.cost=0.001000 for this request, total 0.003000 for 2 request(s)",
                 prefix + "usage.prompt_tokens=0, usage.completion_tokens=0 for this request",
             ],
