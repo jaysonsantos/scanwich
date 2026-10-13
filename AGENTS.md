@@ -6,7 +6,10 @@ Application code lives in `src/scanwich/`. `cli.py` handles arguments and loggin
 `pipeline.py` coordinates rasterization, OCR, and PDF assembly, and `pdf.py`, `ocr.py`, and
 `models.py` contain focused domain logic. For LaTeX output, `layout.py` has the provider-neutral
 page layout types and their JSON form, `latex.py` writes them as a LaTeX document, and
-`images.py` reads photos and camera raw files. OCR implementations belong in
+`images.py` reads photos and camera raw files. The LaTeX conversion in `pipeline.py` uses
+`asyncio`: one task makes the page images and puts each page in a queue with a maximum size,
+and reader tasks get the layouts. Work that uses the processor goes to a thread with
+`asyncio.to_thread`. OCR implementations belong in
 `src/scanwich/backends/`; expose new providers through the `scanwich.ocr_backends` entry-point
 group in `pyproject.toml`. Tests live in `tests/` and follow the source behavior they cover.
 Container model warm-up code is in `docker/`, while Nix packaging is defined by `flake.nix` and
@@ -53,6 +56,10 @@ of the PDF and reads their text, which needs the font Latin Modern Math for the 
 engines. One page of the source must stay one page of the PDF. CI and the Nix
 build have no TeX engine. When you change `latex.py`, run these tests with an engine, for example
 `nix shell nixpkgs#tectonic -c python -m unittest tests.test_latex -v` in the development shell.
+`tests/test_latex_book.py` covers many input files, saved layouts, and parallel pages. Its
+backends tell a page by the size of its image, and not by the sequence of the requests, because
+the pages are in work at the same time. Keep a test of the sequence of replies free from short
+time limits: run the file some times under processor load when you change it.
 Tests and documentation must not have text or values from a private source document. Use
 invented values.
 

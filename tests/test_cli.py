@@ -144,20 +144,81 @@ class CliTests(TestCase):
 
         self.assertEqual(exit_code, 0)
         # Without `--rotate`, the backend finds the direction of each page. Without
-        # `--flow`, each source page is one page of the document.
+        # `--flow`, each source page is one page of the document. A page with a saved
+        # layout needs no request, and the backend reads 4 pages at the same time.
         convert_to_latex.assert_called_once_with(
-            self.photo,
+            [self.photo],
             output,
             backend=backend,
             dpi=150,
             rotate=None,
             flow=False,
             ocr_output_directory=Path("layout"),
+            ignore_saved_layouts=False,
+            parallel_pages=4,
         )
         with patch("scanwich.cli.convert_to_latex") as convert_to_latex:
-            exit_code, _ = self.run_main([str(self.photo), str(output), "--flow"], backend)
+            exit_code, _ = self.run_main(
+                [
+                    str(self.photo),
+                    str(output),
+                    "--flow",
+                    "--parallel-pages",
+                    "1",
+                    "--ocr-output-dir",
+                    "layout",
+                    "--ignore-saved-layouts",
+                ],
+                backend,
+            )
         self.assertEqual(exit_code, 0)
-        self.assertTrue(convert_to_latex.call_args.kwargs["flow"])
+        options = convert_to_latex.call_args.kwargs
+        self.assertTrue(options["flow"])
+        self.assertTrue(options["ignore_saved_layouts"])
+        self.assertEqual(options["parallel_pages"], 1)
+
+    def test_more_than_one_input_gives_one_latex_document(self) -> None:
+        # The pattern of a shell gives the files of a book as many arguments.
+        second = self.directory / "photo-2.png"
+        Image.new("RGB", (60, 20), "white").save(second)
+        output = self.directory / "book.tex"
+        backend = LayoutCapableBackend()
+
+        exit_code, log_output = self.run_main(
+            [str(self.photo), str(second), str(output), "--parallel-pages", "1"], backend
+        )
+
+        self.assertEqual(exit_code, 0, log_output)
+        self.assertEqual(backend.image_sizes, [(40, 20), (60, 20)])
+        self.assertEqual(output.read_text(encoding="utf-8").count("\\begin{sourcepage}"), 2)
+        # A log record of the work for a page names the page.
+        self.assertIn(
+            "INFO: [page 2/2] Recognizing the layout of page 2/2 with LayoutCapableBackend",
+            log_output,
+        )
+        self.assertIn(f"INFO: [page 1/2] Page 1/2 is {self.photo}\n", log_output)
+        self.assertIn(f"INFO: Wrote LaTeX document to {output.resolve()}", log_output)
+
+    def test_stop_of_the_user_is_not_a_traceback(self) -> None:
+        output = self.directory / "page.tex"
+        with patch("scanwich.cli.convert_to_latex", side_effect=KeyboardInterrupt):
+            exit_code, log_output = self.run_main(
+                [str(self.photo), str(output), "--ocr-output-dir", "layout"],
+                LayoutCapableBackend(),
+            )
+        self.assertEqual(exit_code, 130)
+        self.assertIn(
+            "ERROR: The conversion stopped before its end, so there is no new document. The "
+            "layouts that are complete are in layout: the same command sends requests only "
+            "for the other pages.",
+            log_output,
+        )
+        with patch("scanwich.cli.convert_to_latex", side_effect=KeyboardInterrupt):
+            exit_code, log_output = self.run_main(
+                [str(self.photo), str(output)], LayoutCapableBackend()
+            )
+        self.assertEqual(exit_code, 130)
+        self.assertIn("so there is no new document.\n", log_output)
 
     def test_rejects_commands_that_have_no_meaning(self) -> None:
         cases = {
@@ -170,6 +231,31 @@ class CliTests(TestCase):
             "argument --rotate: invalid choice": [str(self.photo), "page.tex", "--rotate", "45"],
             "--flow applies to LaTeX output only": [str(self.photo), "page.pdf", "--flow"],
             "input and output are required": [str(self.photo)],
+            "a searchable PDF has one input file": [str(self.photo), str(self.photo), "page.pdf"],
+            "--parallel-pages applies to LaTeX output only": [
+                str(self.photo),
+                "page.pdf",
+                "--parallel-pages",
+                "2",
+            ],
+            "the number of parallel pages must be 1 or more": [
+                str(self.photo),
+                "page.tex",
+                "--parallel-pages",
+                "0",
+            ],
+            "--ignore-saved-layouts applies to LaTeX output only": [
+                str(self.photo),
+                "page.pdf",
+                "--ocr-output-dir",
+                "ocr",
+                "--ignore-saved-layouts",
+            ],
+            "--ignore-saved-layouts needs --ocr-output-dir": [
+                str(self.photo),
+                "page.tex",
+                "--ignore-saved-layouts",
+            ],
         }
         for message, arguments in cases.items():
             with self.subTest(message=message):

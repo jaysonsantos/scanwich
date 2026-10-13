@@ -7,7 +7,7 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import replace
 from pathlib import Path
-from tempfile import TemporaryDirectory
+from tempfile import TemporaryDirectory, mkdtemp
 from types import SimpleNamespace
 from unittest import TestCase
 from unittest.mock import patch
@@ -39,6 +39,27 @@ from scanwich.pipeline import (
 LOGGER_NAME = "scanwich.pipeline"
 RED = (255, 0, 0)
 WHITE = (255, 255, 255)
+
+
+def saved_layouts(directory: Path) -> dict[str, dict[str, object]]:
+    """Return the saved layouts of a directory by file name, without their source records."""
+    layouts = {}
+    for path in sorted(directory.iterdir()):
+        layout = json.loads(path.read_text(encoding="utf-8"))
+        del layout["source"]
+        layouts[path.name] = layout
+    return layouts
+
+
+def saved_layout(directory: Path) -> dict[str, object]:
+    """Return the saved layout of a directory that has one layout file."""
+    (layout,) = saved_layouts(directory).values()
+    return layout
+
+
+def digest_part(path: Path) -> str:
+    """Return the part of the hash of a file that the name of its layout file has."""
+    return hashlib.sha256(path.read_bytes()).hexdigest()[:8]
 
 
 class BackendOptionsTests(TestCase):
@@ -208,19 +229,18 @@ class LatexConversionTests(TestCase):
             document,
         )
         self.assertEqual(sorted(path.name for path in output_tex.parent.iterdir()), ["book.tex"])
+        # The layout file of a page has the name of the input file, the page of that
+        # file, and a part of the hash of the file.
+        part = digest_part(input_pdf)
         self.assertEqual(
-            [
-                json.loads(path.read_text(encoding="utf-8"))
-                for path in sorted(json_directory.iterdir())
-            ],
-            [first.to_json(), second.to_json()],
-        )
-        self.assertEqual(
-            sorted(path.name for path in json_directory.iterdir()),
-            ["page-000001.json", "page-000002.json"],
+            saved_layouts(json_directory),
+            {
+                f"input.pdf-page-0001-{part}.json": first.to_json(),
+                f"input.pdf-page-0002-{part}.json": second.to_json(),
+            },
         )
         progress = "\n".join(captured_logs.output)
-        self.assertIn("Rasterized 2 page(s)", progress)
+        self.assertIn("The document has 2 page(s) from 1 input file(s)", progress)
         self.assertIn("Recognizing the layout of page 2/2 with FakeLayoutBackend", progress)
         self.assertIn("Recognized 3 block(s) on page 1", progress)
         self.assertIn("Wrote layout JSON for page 2", progress)
@@ -298,15 +318,11 @@ class LatexConversionTests(TestCase):
             document,
         )
         self.assertIn(f"{{{figure_directory_name}/page-0001-figure-02.jpg}}", document)
-        saved = json.loads((json_directory / "page-000001.json").read_text(encoding="utf-8"))
-        self.assertEqual(
-            [block.get("image") for block in saved["blocks"]],
-            [
-                None,
-                f"{figure_directory_name}/page-0001-figure-01.jpg",
-                f"{figure_directory_name}/page-0001-figure-02.jpg",
-            ],
-        )
+        # The saved layout is for the page, and not for one document: it has the box of
+        # each illustration, and no name of an image file.
+        saved = saved_layout(json_directory)
+        self.assertEqual([block.get("image") for block in saved["blocks"]], [None, None, None])
+        self.assertEqual(saved, layout.to_json())
         progress = "\n".join(captured_logs.output)
         self.assertIn("The page image has 400x200 pixels", progress)
         self.assertIn(f"Wrote 2 illustration(s) to {figure_directory.resolve()}", progress)
@@ -402,8 +418,7 @@ class LatexConversionTests(TestCase):
                     ],
                 )
                 self.assertIn("Text of the page.", output_tex.read_text(encoding="utf-8"))
-                saved = json.loads((json_directory / "page-000001.json").read_text())
-                self.assertEqual(saved["page_top"], "top")
+                self.assertEqual(saved_layout(json_directory)["page_top"], "top")
 
     def test_rotate_fails_for_a_page_that_the_backend_does_not_read(self) -> None:
         # A backend that looks for the direction returns no blocks for a page that is not
@@ -566,9 +581,9 @@ class LatexConversionTests(TestCase):
             ocr_output_directory=json_directory,
         )
 
-        saved = (json_directory / "page-000001.json").read_bytes().decode("utf-8")
-        self.assertIn('"a \\ud83d b"', saved)
-        self.assertEqual(json.loads(saved), layout.to_json())
+        (layout_file,) = json_directory.iterdir()
+        self.assertIn('"a \\ud83d b"', layout_file.read_bytes().decode("utf-8"))
+        self.assertEqual(saved_layout(json_directory), layout.to_json())
         self.assertIn("a b", output_tex.read_text(encoding="utf-8"))
 
     def test_failure_writes_no_document_and_keeps_the_earlier_one(self) -> None:
@@ -875,11 +890,12 @@ class FigureBoxTests(TestCase):
 
     def convert(self, backend: FakeLayoutBackend, page: Path) -> Box:
         """Convert the page, and return the box of its illustration in the layout JSON."""
-        json_directory = self.directory / "layout"
+        # Each conversion has its directory, so that it does not use a saved layout.
+        json_directory = Path(mkdtemp(dir=self.directory, prefix="layout-"))
         convert_to_latex(
             page, self.directory / "page.tex", backend=backend, ocr_output_directory=json_directory
         )
-        saved = json.loads((json_directory / "page-000001.json").read_text(encoding="utf-8"))
+        saved = saved_layout(json_directory)
         (figure,) = [block for block in saved["blocks"] if block["type"] == "figure"]
         return Box(**figure["box"])
 
@@ -1209,7 +1225,7 @@ class FigureBoxTests(TestCase):
                 )
             ],
         )
-        saved = json.loads((self.directory / "layout" / "page-000001.json").read_text())
+        saved = saved_layout(self.directory / "layout")
         boxes = [Box(**block["box"]) for block in saved["blocks"] if block["type"] == "figure"]
         # The last 3 illustrations have the boxes of the page layout.
         self.assertEqual(boxes[12:], [figure.box for figure in figures[12:]])
