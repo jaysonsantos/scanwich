@@ -128,3 +128,40 @@ class AssembleSearchablePdfTests(TestCase):
             self.assertIn("Wasser água", reader.pages[0].extract_text())
             self.assertAlmostEqual(float(reader.pages[0].mediabox.width), 144.0)
             self.assertAlmostEqual(float(reader.pages[0].mediabox.height), 72.0)
+
+    def test_warns_about_regions_of_zero_size(self) -> None:
+        with TemporaryDirectory() as temporary_directory:
+            directory = Path(temporary_directory)
+            image_path = directory / "page.png"
+            output_path = directory / "result.pdf"
+            Image.new("RGB", (600, 300), "white").save(image_path)
+            page = RasterizedPage(
+                image_path=image_path, width_points=144, height_points=72, dpi=300
+            )
+            visible = OcrRegion(
+                text="visible",
+                polygon=(Point(50, 50), Point(300, 50), Point(300, 100), Point(50, 100)),
+            )
+            # A backend that clamps a region below the page puts its four points on the edge.
+            on_the_edge = OcrRegion(
+                text="hidden",
+                polygon=(Point(50, 300), Point(300, 300), Point(300, 300), Point(50, 300)),
+            )
+
+            with self.assertLogs("scanwich.pdf", level="WARNING") as logs:
+                assemble_searchable_pdf(
+                    [page, page], [[visible], [visible, on_the_edge]], output_path
+                )
+
+            self.assertEqual(
+                logs.output,
+                [
+                    (
+                        "WARNING:scanwich.pdf:Page 2: 1 of 2 text region(s) have zero size, "
+                        "so their text is not in the PDF"
+                    )
+                ],
+            )
+            text = PdfReader(output_path).pages[1].extract_text()
+            self.assertIn("visible", text)
+            self.assertNotIn("hidden", text)

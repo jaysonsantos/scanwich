@@ -196,7 +196,7 @@ def assemble_searchable_pdf(
     pdf = canvas.Canvas(str(output_pdf), pageCompression=1)
     pdf.setTitle(output_pdf.stem)
 
-    for page, regions in zip(pages, page_regions, strict=True):
+    for page_number, (page, regions) in enumerate(zip(pages, page_regions, strict=True), start=1):
         with Image.open(page.image_path) as image:
             image_width, image_height = image.size
         scale_x = page.width_points / image_width
@@ -211,13 +211,22 @@ def assemble_searchable_pdf(
             preserveAspectRatio=False,
             mask="auto",
         )
-        for region in regions:
+        drawn_regions = sum(
             _draw_invisible_region(
                 pdf,
                 region,
                 image_height=image_height,
                 scale_x=scale_x,
                 scale_y=scale_y,
+            )
+            for region in regions
+        )
+        if drawn_regions < len(regions):
+            logger.warning(
+                "Page %d: %d of %d text region(s) have zero size, so their text is not in the PDF",
+                page_number,
+                len(regions) - drawn_regions,
+                len(regions),
             )
         pdf.showPage()
 
@@ -241,7 +250,8 @@ def _draw_invisible_region(
     image_height: int,
     scale_x: float,
     scale_y: float,
-) -> None:
+) -> bool:
+    """Draw the text of one region. Return False when the region has zero size and is left out."""
     top_left, top_right, bottom_right, bottom_left = (
         _to_pdf_point(
             point,
@@ -260,7 +270,7 @@ def _draw_invisible_region(
         + math.dist((top_right.x, top_right.y), (bottom_right.x, bottom_right.y))
     ) / 2
     if width <= 0 or height <= 0:
-        return
+        return False
 
     angle = math.degrees(math.atan2(bottom_right.y - bottom_left.y, bottom_right.x - bottom_left.x))
     font_size = max(height, 1.0)
@@ -278,3 +288,4 @@ def _draw_invisible_region(
     text.textOut(region.text)
     pdf.drawText(text)
     pdf.restoreState()
+    return True
