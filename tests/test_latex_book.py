@@ -1,12 +1,14 @@
 """LaTeX output for a book: many input files, saved layouts, and parallel pages."""
 
 import asyncio
+import gc
 import hashlib
 import json
 import signal
 import tempfile
 import threading
 import time
+import weakref
 from collections.abc import Callable, Collection, Mapping
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -25,11 +27,12 @@ from scanwich.ocr import (
     FigureLocator,
     LayoutBackend,
     LayoutSettings,
+    NoReplyError,
     RateLimitError,
 )
 from scanwich.pipeline import (
     DEFAULT_PARALLEL_PAGES,
-    FIRST_FAILED_PAGES,
+    NO_REPLY_PAGES,
     PAGE_QUEUE_SIZE,
     PageLayoutError,
     convert_to_latex,
@@ -65,11 +68,15 @@ class PageBackend:
         layouts: Mapping[int, PageLayout] | None = None,
         *,
         failing: Collection[int] = (),
+        no_reply: Collection[int] = (),
         delay: float = 0.0,
         settings: Mapping[str, object] | None = None,
     ) -> None:
         self.layouts = dict(layouts or {})
+        # The service answers a failing page with a reply that is not usable. It gives
+        # no reply for a page of `no_reply`.
         self.failing = set(failing)
+        self.no_reply = set(no_reply)
         self.delay = delay
         self.settings = settings
         # The pages in the sequence of the requests, and of the replies.
@@ -107,6 +114,8 @@ class PageBackend:
             self.finished.append(page)
         if page in self.failing:
             raise RuntimeError(f"the service did not read page {page}")
+        if page in self.no_reply:
+            raise NoReplyError(f"the service gave no reply for page {page}")
         return self.layouts.get(page, PageLayout(blocks=(Paragraph(text_of(page)),)))
 
     def recognize_layout(self, image_path: Path, *, upright: bool = False) -> PageLayout:
@@ -629,8 +638,9 @@ class FailedPageTests(BookTestCase):
             "1 of 5 page(s) have no layout, so there is no document:\n"
             f"  page 3 ({inputs[2]}): the service did not read page 3\n"
             f"The layouts of the pages that are complete are in {self.layouts.resolve()}. "
-            "Correct the cause, and run the same command again: it sends requests only for "
-            "the pages that have no saved layout.",
+            "The same command again sends requests only for the pages of this list. Read the "
+            "error of each page first: a page that fails again needs a correction of its "
+            "cause.",
         )
         self.assertEqual(
             captured_logs.output,
@@ -680,43 +690,156 @@ class FailedPageTests(BookTestCase):
         )
         self.assertFalse(self.output.exists())
 
-    def test_conversion_starts_no_more_pages_when_its_first_pages_fail(self) -> None:
-        # The cause is then probably the service, the key, or an option.
-        self.assertEqual(FIRST_FAILED_PAGES, 3)
-        inputs = self.photos(7)
-        backend = PageBackend(failing=range(1, 8))
+    def test_pages_that_the_service_answered_do_not_stop_the_conversion(self) -> None:
+        # 3 bad pages at the start of a book, for example a cover and two plates. The
+        # service works, so the other pages get their requests.
+        inputs = self.photos(8)
+        for run in (1, 2, 3):
+            backend = PageBackend(failing={1, 2, 3})
+            with (
+                self.subTest(run=run),
+                self.assertLogs(LOGGER_NAME, level="ERROR"),
+                self.assertRaises(PageLayoutError) as raised,
+            ):
+                self.convert(inputs, backend, parallel_pages=1)
+            # Each run after the first one sends requests only for the 3 bad pages.
+            self.assertEqual(backend.requests, [1, 2, 3, 4, 5, 6, 7, 8] if run == 1 else [1, 2, 3])
+            self.assertEqual(len(self.layout_files()), 5)
+            error = str(raised.exception)
+            self.assertIn("3 of 8 page(s) have no layout, so there is no document:", error)
+            self.assertNotIn("did not start", error)
+            self.assertTrue(
+                error.endswith(
+                    f"The layouts of the pages that are complete are in {self.layouts}. The "
+                    "same command again sends requests only for the pages of this list. Read "
+                    "the error of each page first: a page that fails again needs a correction "
+                    "of its cause."
+                ),
+                error,
+            )
+
+    def test_conversion_starts_no_more_pages_when_the_service_gives_no_reply(self) -> None:
+        # A service that stops in the middle of a book. Without this rule, each later
+        # page waits for its timeout.
+        self.assertEqual(NO_REPLY_PAGES, 3)
+        inputs = self.photos(12)
+        made: list[int] = []
+        make_page_image = pipeline._make_page_image
+
+        def counting(page: object, *arguments: object, **options: object) -> None:
+            made.append(page.number)  # type: ignore[attr-defined]
+            make_page_image(page, *arguments, **options)
+
+        backend = PageBackend(no_reply=range(5, 13))
         with (
+            patch.object(pipeline, "_make_page_image", counting),
             self.assertLogs(LOGGER_NAME, level="ERROR") as captured_logs,
             self.assertRaises(PageLayoutError) as raised,
         ):
             self.convert(inputs, backend, parallel_pages=1)
 
-        self.assertEqual(backend.requests, [1, 2, 3])
-        error = str(raised.exception)
-        self.assertIn("7 of 7 page(s) have no layout, so there is no document:", error)
-        self.assertIn(f"  page 3 ({inputs[2]}): the service did not read page 3\n", error)
-        self.assertIn(
-            "  4 page(s) did not start, because the first 3 pages that needed a request "
-            "failed: 4-7\n",
-            error,
-        )
-        self.assertIn(
-            f"ERROR:{LOGGER_NAME}:The first 3 pages that needed a request failed. The cause "
-            "is probably not a page, so the conversion starts no more pages",
-            captured_logs.output,
-        )
-
-    def test_conversion_continues_when_a_page_got_a_layout_before_the_failures(self) -> None:
-        backend = PageBackend(failing=range(2, 8))
-        with self.assertLogs(LOGGER_NAME, level="ERROR"), self.assertRaises(PageLayoutError):
-            self.convert(self.photos(7), backend, parallel_pages=1)
         self.assertEqual(backend.requests, [1, 2, 3, 4, 5, 6, 7])
+        self.assertEqual(len(self.layout_files()), 4)
+        self.assertEqual(
+            str(raised.exception),
+            "8 of 12 page(s) have no layout, so there is no document:\n"
+            f"  page 5 ({inputs[4]}): the service gave no reply for page 5\n"
+            f"  page 6 ({inputs[5]}): the service gave no reply for page 6\n"
+            f"  page 7 ({inputs[6]}): the service gave no reply for page 7\n"
+            "  5 page(s) did not start: 8-12\n"
+            "The conversion started no more pages, because 3 pages in sequence got no reply "
+            "from the service. The cause is probably the service, the key, the quota, or an "
+            "option, and not a page.\n"
+            f"The layouts of the pages that are complete are in {self.layouts}. When the "
+            "service gives replies again, the same command sends requests only for the pages "
+            "that have no saved layout.",
+        )
+        self.assertEqual(
+            captured_logs.output[-1],
+            f"ERROR:{LOGGER_NAME}:3 pages in sequence got no reply from the service. The cause "
+            "is probably not a page, so the conversion starts no more pages",
+        )
+        # After the stop, the conversion makes no more page images: not more than the
+        # pages that were in the queue.
+        self.assertLessEqual(max(made), 7 + PAGE_QUEUE_SIZE + 1)
 
-        # A page with a saved layout is not a page that got a layout from a request.
-        backend = PageBackend(failing=range(2, 8))
+        # The same rule at the start of a run: the first 4 pages have saved layouts.
+        backend = PageBackend(no_reply=range(5, 13))
         with self.assertLogs(LOGGER_NAME, level="ERROR"), self.assertRaises(PageLayoutError):
-            self.convert(self.photos(7), backend, parallel_pages=1)
-        self.assertEqual(backend.requests, [2, 3, 4])
+            self.convert(inputs, backend, parallel_pages=1)
+        self.assertEqual(backend.requests, [5, 6, 7])
+
+        # When the service gives replies again, the same command completes the book.
+        backend = PageBackend()
+        self.convert(inputs, backend)
+        self.assertEqual(sorted(backend.requests), [5, 6, 7, 8, 9, 10, 11, 12])
+
+    def test_page_with_a_layout_starts_the_count_of_pages_with_no_reply_again(self) -> None:
+        backend = PageBackend(no_reply={1, 2, 4, 5, 7, 8})
+        with (
+            self.assertLogs(LOGGER_NAME, level="ERROR"),
+            self.assertRaisesRegex(PageLayoutError, "6 of 9 page.s. have no layout") as raised,
+        ):
+            self.convert(self.photos(9), backend, parallel_pages=1)
+        self.assertEqual(backend.requests, [1, 2, 3, 4, 5, 6, 7, 8, 9])
+        self.assertNotIn("did not start", str(raised.exception))
+
+    def test_page_with_a_reply_that_is_not_usable_does_not_count(self) -> None:
+        # It also does not start the count again: only a page with a layout does that.
+        backend = PageBackend(no_reply={1, 3, 5}, failing={2, 4})
+        with (
+            self.assertLogs(LOGGER_NAME, level="ERROR"),
+            self.assertRaisesRegex(PageLayoutError, "3 page.s. did not start: 6-8"),
+        ):
+            self.convert(self.photos(8), backend, parallel_pages=1)
+        self.assertEqual(backend.requests, [1, 2, 3, 4, 5])
+
+    def test_service_that_stops_fails_only_the_pages_in_work(self) -> None:
+        readers = 4
+        backend = AsyncPageBackend(no_reply=range(9, 41), delay=0.01)
+        with self.assertLogs(LOGGER_NAME, level="ERROR"), self.assertRaises(PageLayoutError):
+            self.convert(self.photos(40), backend, parallel_pages=readers)
+        self.assertEqual(len(self.layout_files()), 8)
+        # The pages in work when the third page fails have their requests, and no more.
+        self.assertLessEqual(len(backend.requests), 8 + NO_REPLY_PAGES + readers)
+
+    def test_failed_page_keeps_nothing_of_its_request(self) -> None:
+        # The error of a failed page has its traceback, and the frames of a backend hold
+        # the request with the page image: megabytes for each failed page of a book.
+        class Request:
+            """Stands for the image text of a request."""
+
+        requests: list[weakref.ref[Request]] = []
+        alive_at_the_last_page: list[bool] = []
+
+        class HoldingBackend(AsyncPageBackend):
+            async def recognize_layout_async(
+                self, image_path: Path, *, upright: bool = False
+            ) -> PageLayout:
+                page = self.start(image_path, upright)
+                self.in_flight -= 1
+                if page in (1, 6):
+                    if page == 6:
+                        gc.collect()
+                        alive_at_the_last_page.extend(ref() is not None for ref in requests)
+                    return PageLayout(blocks=(Paragraph(text_of(page)),))
+                request = Request()
+                requests.append(weakref.ref(request))
+                raise RuntimeError(f"the service did not read page {page}")
+
+        with (
+            self.assertLogs(LOGGER_NAME, level="ERROR"),
+            self.assertRaises(PageLayoutError) as raised,
+        ):
+            self.convert(self.photos(6), HoldingBackend(), parallel_pages=1)
+
+        self.assertEqual(alive_at_the_last_page, [False, False, False, False])
+        # The error of the conversion has the messages, and not the errors of the pages.
+        self.assertIn("the service did not read page 2", str(raised.exception))
+        self.assertIsNone(raised.exception.__cause__)
+        self.assertIsNone(raised.exception.__context__)
+        gc.collect()
+        self.assertEqual([ref() is not None for ref in requests], [False] * 4)
 
     def test_input_that_is_not_an_image_is_a_failed_page(self) -> None:
         notes = self.pages / "notes.txt"

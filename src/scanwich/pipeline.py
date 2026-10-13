@@ -38,6 +38,7 @@ from scanwich.ocr import (
     FigureLocator,
     LayoutBackend,
     LayoutSettings,
+    NoReplyError,
     OcrBackend,
     RateLimitError,
 )
@@ -111,10 +112,12 @@ DEFAULT_PARALLEL_PAGES = 4
 # time are not more than: one for each reader, the pages in the queue, and the one page
 # that waits for a place in the queue.
 PAGE_QUEUE_SIZE = 1
-# When this many pages fail and no page of the conversion got a layout from a request,
-# the cause is probably not a page: it can be the service, the key, or an option. The
-# conversion then starts no more pages.
-FIRST_FAILED_PAGES = 3
+# When this many pages in sequence fail with no reply from the service, the cause is
+# probably not a page: it can be the service, the key, the quota, or an option. The
+# conversion then starts no more pages. A page that gets a layout from its requests
+# starts the count again. A page with a reply that is not usable does not count: the
+# service works, and the page is the cause.
+NO_REPLY_PAGES = 3
 # The waits in seconds after the service answers that it gets too many requests. All
 # requests of the conversion wait. After the last wait, the request fails.
 RATE_LIMIT_WAITS = (30.0, 60.0, 120.0)
@@ -546,12 +549,15 @@ class _Conversion:
         self._digests: dict[Path, str] = {}
         self._saved_index: dict[tuple[str, int], Path] = {}
         self._layouts: dict[int, PageLayout] = {}
-        self._failures: dict[int, Exception] = {}
-        # The pages that got their layout from requests, the pages whose requests
-        # failed, and the pages that used a saved layout.
+        # The message of each failed page. The error itself does not stay: its traceback
+        # has the frames of the backend, and they hold the request with the page image.
+        self._failures: dict[int, str] = {}
+        # The pages that got their layout from requests, and the pages that used a
+        # saved layout.
         self._read_pages = 0
-        self._failed_readings = 0
         self._saved_pages = 0
+        # The pages in sequence that failed with no reply from the service.
+        self._pages_without_reply = 0
         # The settings of saved layouts that are not the settings of this conversion.
         self._other_settings: dict[str, int] = {}
         self._other_settings_pages = 0
@@ -616,18 +622,25 @@ class _Conversion:
         ]
         not_started = [page.number for page in missing if page.number not in self._failures]
         if not_started:
+            lines.append(f"  {len(not_started)} page(s) did not start: {_page_ranges(not_started)}")
+        saved = f"The layouts of the pages that are complete are in {self._layout_directory}."
+        if self._stop.is_set():
             lines.append(
-                f"  {len(not_started)} page(s) did not start, because the first "
-                f"{FIRST_FAILED_PAGES} pages that needed a request failed: "
-                f"{_page_ranges(not_started)}"
+                f"The conversion started no more pages, because {NO_REPLY_PAGES} pages in "
+                "sequence got no reply from the service. The cause is probably the service, "
+                "the key, the quota, or an option, and not a page."
             )
-        lines.append(
-            f"The layouts of the pages that are complete are in {self._layout_directory}. "
-            "Correct the cause, and run the same command again: it sends requests only for "
-            "the pages that have no saved layout."
-        )
-        first_error = next(iter(self._failures.values()), None)
-        raise PageLayoutError("\n".join(lines)) from first_error
+            lines.append(
+                f"{saved} When the service gives replies again, the same command sends "
+                "requests only for the pages that have no saved layout."
+            )
+        else:
+            lines.append(
+                f"{saved} The same command again sends requests only for the pages of this "
+                "list. Read the error of each page first: a page that fails again needs a "
+                "correction of its cause."
+            )
+        raise PageLayoutError("\n".join(lines))
 
     async def _produce(self, queue: asyncio.Queue[_PageJob | None], readers: int) -> None:
         """Make the page image of each page, and put the page in the queue.
@@ -703,6 +716,8 @@ class _Conversion:
                     self._layouts[job.page.number] = layout
                     if job.saved is None:
                         self._read_pages += 1
+                        # The service gives replies.
+                        self._pages_without_reply = 0
                     else:
                         self._saved_pages += 1
 
@@ -806,6 +821,10 @@ class _Conversion:
         then completes the document, and it sends requests only for the pages that
         failed. A conversion that saves no layouts stops, because each more page has a
         cost and a new run sends its request again.
+
+        The conversion also starts no more pages when the service gives no reply for
+        some pages in sequence. Without this rule, a service that stops in the middle of
+        a book makes each later page wait for its timeout.
         """
         if self._layout_directory is None:
             if self._layouts:
@@ -817,20 +836,20 @@ class _Conversion:
                     len(self._layouts),
                 )
             raise error
-        self._failures[page.number] = error
+        message = str(error)
+        self._failures[page.number] = message
         logger.error(
-            "Page %d/%d (%s) has no layout: %s", page.number, len(self._pages), page.label, error
+            "Page %d/%d (%s) has no layout: %s", page.number, len(self._pages), page.label, message
         )
-        if not read:
+        if not read or not isinstance(error, NoReplyError):
             return
-        self._failed_readings += 1
-        first_pages_failed = not self._read_pages and self._failed_readings >= FIRST_FAILED_PAGES
-        if first_pages_failed and not self._stop.is_set():
+        self._pages_without_reply += 1
+        if self._pages_without_reply >= NO_REPLY_PAGES and not self._stop.is_set():
             self._stop.set()
             logger.error(
-                "The first %d pages that needed a request failed. The cause is probably not "
-                "a page, so the conversion starts no more pages",
-                self._failed_readings,
+                "%d pages in sequence got no reply from the service. The cause is probably "
+                "not a page, so the conversion starts no more pages",
+                self._pages_without_reply,
             )
 
 
