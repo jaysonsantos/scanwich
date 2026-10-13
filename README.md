@@ -156,6 +156,7 @@ For an RGB page, that limit is about 44 million pixels. For a page with transpar
 It sends each page image as a JPEG in base64 text to the configured service and its
 selected model provider. Do not use this backend for documents that must remain local.
 The page image file does not change, so the PDF keeps the original image.
+The JPEG keeps the EXIF orientation of the page image and no other metadata. The backend does not turn the pixels.
 Some providers reject an image when its base64 text is larger than 5 MiB.
 When the JPEG is above that limit, the backend makes the image smaller and writes a `WARNING` log record.
 The regions in the result always use the pixels of the original page image.

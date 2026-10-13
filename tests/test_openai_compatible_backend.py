@@ -744,6 +744,39 @@ class OpenAICompatibleBackendTests(TestCase):
         # Older Pillow versions open a 16-bit gray PNG in this mode.
         self.assertEqual(_jpeg_mode_image(Image.new("I", (4, 4), 32_768)).getextrema(), (128, 128))
 
+    def test_keeps_the_exif_orientation_and_no_other_metadata(self) -> None:
+        orientation_tag, make_tag = 0x0112, 0x010F
+        empty = json.dumps({"coordinate_system": "normalized", "regions": []})
+        noise = random.Random(0).randbytes(400 * 200 * 3)
+        # A normal orientation needs no tag. The limit makes the backend scale the image down.
+        cases = ((6, None, 6), (6, 20_000, 6), (1, None, None), (None, None, None))
+        for orientation, byte_limit, expected in cases:
+            with self.subTest(orientation=orientation, byte_limit=byte_limit):
+                exif = Image.Exif()
+                exif[make_tag] = "private camera"
+                if orientation is not None:
+                    exif[orientation_tag] = orientation
+                completions = FakeCompletions(empty)
+                backend = OpenAICompatibleBackend(languages=["en"], options={})
+                backend._client = SimpleNamespace(chat=SimpleNamespace(completions=completions))
+                limit = byte_limit or 10**9
+                with (
+                    TemporaryDirectory() as temporary_directory,
+                    patch("scanwich.backends.openai_compatible.MAX_IMAGE_BYTES", limit),
+                    self.assertLogs(LOGGER_NAME, level="INFO"),
+                ):
+                    image_path = Path(temporary_directory) / "page"
+                    page = Image.frombytes("RGB", (400, 200), noise)
+                    page.save(image_path, format="JPEG", quality=95, exif=exif)
+                    backend.recognize(image_path)
+
+                sent = sent_image(completions.calls[0])
+                self.assertEqual(sent.getexif().get(orientation_tag), expected)
+                self.assertNotIn(make_tag, sent.getexif())
+                # The backend does not turn the pixels, so the regions fit the page image file.
+                self.assertGreater(sent.width, sent.height)
+                self.assertEqual(sent.size == (400, 200), byte_limit is None)
+
     def test_rejects_an_image_type_that_is_not_in_the_list(self) -> None:
         completions = FakeCompletions("{}")
         fake_client = SimpleNamespace(chat=SimpleNamespace(completions=completions))

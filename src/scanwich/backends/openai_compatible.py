@@ -48,6 +48,9 @@ JPEG_QUALITY = 90
 # Full color resolution keeps the edges of colored text sharp.
 JPEG_SUBSAMPLING = "4:4:4"
 JPEG_MODES = frozenset({"L", "RGB"})
+# The EXIF tag that tells a viewer how to turn the image, and its values that turn it.
+EXIF_ORIENTATION_TAG = 0x0112
+EXIF_TURNED_ORIENTATIONS = range(2, 9)
 # The Pillow modes with integer values start with this name. Of the accepted image types,
 # only a gray PNG with 16 bits for each pixel opens in such a mode.
 INTEGER_MODE = "I"
@@ -446,13 +449,14 @@ def _encode_image(image_path: Path) -> RequestImage:
                     f"is {MAX_IMAGE_WORKING_BYTES // BYTES_PER_MEBIBYTE} MiB; "
                     "use a lower DPI or a smaller image"
                 )
+            orientation = _exif_orientation(page_image)
             image = _jpeg_mode_image(page_image)
-            jpeg = _jpeg_bytes(image)
+            jpeg = _jpeg_bytes(image, orientation)
             while len(jpeg) > MAX_IMAGE_BYTES and image.size != (1, 1):
                 ratio = math.sqrt(MAX_IMAGE_BYTES / len(jpeg)) * IMAGE_SCALE_MARGIN
                 size = (max(1, round(image.width * ratio)), max(1, round(image.height * ratio)))
                 image = image.resize(size, Image.Resampling.LANCZOS)
-                jpeg = _jpeg_bytes(image)
+                jpeg = _jpeg_bytes(image, orientation)
     except OSError as error:
         raise RuntimeError(f"could not read OCR page image {image_path}: {error}") from error
     if image.size != (page_width, page_height):
@@ -539,9 +543,29 @@ def _working_bytes(image: Image.Image) -> int:
     return image.width * image.height * bytes_per_pixel
 
 
-def _jpeg_bytes(image: Image.Image) -> bytes:
+def _exif_orientation(image: Image.Image) -> int | None:
+    """Return the EXIF orientation of the image when it tells a viewer to turn the image."""
+    try:
+        orientation = image.getexif().get(EXIF_ORIENTATION_TAG)
+    except Exception:
+        # Damaged metadata must not stop the OCR of the page. The record has no error text,
+        # because that text can have metadata of the image.
+        logger.debug("Could not read the EXIF data of a page image")
+        return None
+    return orientation if orientation in EXIF_TURNED_ORIENTATIONS else None
+
+
+def _jpeg_bytes(image: Image.Image, orientation: int | None) -> bytes:
+    """Return the image as a JPEG. The JPEG has the EXIF orientation and no other metadata."""
+    options: dict[str, Any] = {}
+    if orientation is not None:
+        # The service got this tag with the page image file before the backend made a JPEG.
+        # Without the tag, the service gets a turned page.
+        exif = Image.Exif()
+        exif[EXIF_ORIENTATION_TAG] = orientation
+        options["exif"] = exif
     output = io.BytesIO()
-    image.save(output, format="JPEG", quality=JPEG_QUALITY, subsampling=JPEG_SUBSAMPLING)
+    image.save(output, format="JPEG", quality=JPEG_QUALITY, subsampling=JPEG_SUBSAMPLING, **options)
     return output.getvalue()
 
 
