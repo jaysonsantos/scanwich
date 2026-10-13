@@ -5,6 +5,7 @@ import os
 import random
 import sys
 import uuid
+import warnings
 from collections.abc import Sequence
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -616,7 +617,11 @@ class OpenAICompatibleBackendTests(TestCase):
         empty = json.dumps({"coordinate_system": "normalized", "regions": []})
         white_palette = Image.new("P", (40, 20), 0)
         white_palette.putpalette([255, 255, 255])
+        transparent_palette = Image.new("P", (40, 20), 0)
+        transparent_palette.putpalette([0, 0, 0])
+        transparent_palette.info["transparency"] = 0
         images = (
+            transparent_palette,
             Image.new("RGBA", (40, 20), (0, 0, 0, 0)),
             Image.new("LA", (40, 20), (0, 0)),
             Image.new("L", (40, 20), 255),
@@ -633,6 +638,31 @@ class OpenAICompatibleBackendTests(TestCase):
                 self.assertEqual(sent.size, (40, 20))
                 darkest, _ = sent.convert("L").getextrema()
                 self.assertGreaterEqual(darkest, 250)
+
+    def test_mixes_partly_transparent_pixels_with_white(self) -> None:
+        completions = FakeCompletions(json.dumps({"coordinate_system": "pixels", "regions": []}))
+        self.recognize_replies(completions, image=Image.new("RGBA", (40, 20), (0, 0, 0, 128)))
+        sent = sent_image(completions.calls[0])
+        self.assertEqual(sent.mode, "RGB")
+        darkest, lightest = sent.convert("L").getextrema()
+        self.assertAlmostEqual(darkest, 127, delta=3)
+        self.assertAlmostEqual(lightest, 127, delta=3)
+
+    def test_rejects_an_image_above_the_pixel_limit_before_it_decodes_the_image(self) -> None:
+        completions = FakeCompletions("{}")
+        with (
+            # Pillow gives a warning above the limit, and an error above two times the limit.
+            patch("PIL.Image.MAX_IMAGE_PIXELS", 150),
+            warnings.catch_warnings(),
+            patch("PIL.Image.Image.convert") as convert,
+            self.assertRaisesRegex(
+                RuntimeError, "image of 20x10 pixels is above the limit of 150 pixels"
+            ),
+        ):
+            warnings.simplefilter("ignore", Image.DecompressionBombWarning)
+            self.recognize_replies(completions, image=Image.new("RGBA", (20, 10)))
+        convert.assert_not_called()
+        self.assertEqual(completions.calls, [])
 
     def test_scales_16_bit_gray_values_to_8_bits(self) -> None:
         completions = FakeCompletions(json.dumps({"coordinate_system": "pixels", "regions": []}))

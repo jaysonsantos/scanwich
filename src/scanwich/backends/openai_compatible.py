@@ -51,6 +51,10 @@ JPEG_MODES = frozenset({"L", "RGB"})
 # only a gray PNG with 16 bits for each pixel opens in such a mode.
 INTEGER_MODE = "I"
 SIXTEEN_BIT_GRAY_STEPS_PER_8_BIT_STEP = 256
+BILEVEL_MODE = "1"
+ALPHA_BAND = "A"
+# Pillow puts the transparent palette entry or the transparent color of a file in this field.
+TRANSPARENCY_INFO = "transparency"
 # A too-large image becomes this much smaller than the size limit needs. The size of a
 # JPEG is not exactly proportional to its number of pixels.
 IMAGE_SCALE_MARGIN = 0.9
@@ -394,6 +398,14 @@ def _encode_image(image_path: Path) -> RequestImage:
                 raise RuntimeError(
                     f"OCR page image has invalid dimensions: {page_width}x{page_height}"
                 )
+            # The size is known before Pillow decodes the pixels. The limit of Pillow for a
+            # safe image also limits the memory of the conversion.
+            pixel_limit = Image.MAX_IMAGE_PIXELS
+            if pixel_limit is not None and page_width * page_height > pixel_limit:
+                raise RuntimeError(
+                    f"OCR page image of {page_width}x{page_height} pixels is above the limit "
+                    f"of {pixel_limit} pixels"
+                )
             mime_type = Image.MIME.get(page_image.format or "")
             if mime_type not in PAGE_IMAGE_MIME_TYPES:
                 raise RuntimeError(
@@ -430,15 +442,24 @@ def _encode_image(image_path: Path) -> RequestImage:
 
 
 def _jpeg_mode_image(image: Image.Image) -> Image.Image:
-    """Return the image in a mode that JPEG has. White replaces transparent pixels."""
+    """Return the image in a mode that JPEG has. White replaces transparent pixels.
+
+    The function makes at most one RGBA copy and one RGB copy of the image.
+    """
     if image.mode in JPEG_MODES:
         return image
     if image.mode.startswith(INTEGER_MODE):
         # Pillow does not scale these values in a conversion. It limits them to 255.
         to_8_bits = 1 / SIXTEEN_BIT_GRAY_STEPS_PER_8_BIT_STEP
         return image.convert(INTEGER_MODE).point(lambda value: value * to_8_bits).convert("L")
+    if image.mode == BILEVEL_MODE:
+        return image.convert("L")
+    if ALPHA_BAND not in image.getbands() and TRANSPARENCY_INFO not in image.info:
+        return image.convert("RGB")
     rgba = image.convert("RGBA")
-    return Image.alpha_composite(Image.new("RGBA", rgba.size, "white"), rgba).convert("RGB")
+    opaque = Image.new("RGB", rgba.size, "white")
+    opaque.paste(rgba, mask=rgba)
+    return opaque
 
 
 def _jpeg_bytes(image: Image.Image) -> bytes:

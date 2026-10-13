@@ -151,6 +151,7 @@ scanwich input.pdf output.pdf \
 ```
 
 The backend accepts PNG, JPEG, WebP, and GIF page images.
+It rejects a page image that has more pixels than the safe limit of Pillow, which is about 89 million pixels by default.
 It sends each page image as a JPEG in base64 text to the configured service and its
 selected model provider. Do not use this backend for documents that must remain local.
 The page image file does not change, so the PDF keeps the original image.
