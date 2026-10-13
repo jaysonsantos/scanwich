@@ -16,6 +16,7 @@ from unittest.mock import ANY, patch
 from PIL import Image
 
 from scanwich.backends.openai_compatible import (
+    DEFAULT_LAYOUT_MODEL,
     DEFAULT_MAX_ATTEMPTS,
     DEFAULT_MODEL,
     PROVIDER_DETAIL_MAX_CHARACTERS,
@@ -1128,8 +1129,10 @@ class LayoutRecognitionTests(TestCase):
             '"mark"',
             "0-to-1000 grid",
             "<fn>mark</fn>",
-            # The place of a running head and of a page number.
-            '{"type":"page_number","text":"...","position":"top-right"}',
+            # The place of a running head and of a page number. The shape names no
+            # place, so that the reply has the place of the page and not that of an example.
+            '{"type":"page_number","text":"...","position":"..."}',
+            "A left page and a right page of a book can have different places.",
             (
                 '"top-left", "top-center", "top-right", "bottom-left", "bottom-center", or '
                 '"bottom-right"'
@@ -1140,10 +1143,9 @@ class LayoutRecognitionTests(TestCase):
             "write its letters as capital letters, also in a caption and in a running head.",
             "Do not change such a line to lowercase letters or to sentence case.",
             "Put only them in <sc>, and write a large capital letter before the tag.",
-            (
-                '"T<sc>ABLE</sc> II. R<sc>ESULTS OF THE TESTS</sc>" and not "Table II. Results '
-                'of the tests".'
-            ),
+            # The examples are two different forms, and not the form of one page.
+            'write "P<sc>ART</sc> O<sc>NE</sc>" and not "Part One".',
+            'write "<sc>THE END OF THE FIRST BOOK</sc>" and not "The end of the first book".',
             "Do not add an accent that the page does not print.",
             "the lines of a centered caption",
             # The writer needs the hyphen to know that the page boundary divides a word.
@@ -1325,12 +1327,12 @@ class LayoutRecognitionTests(TestCase):
             "not its pixels"
         )
         self.assertIn(
-            f"WARNING:{LOGGER_NAME}:OpenAI-compatible model {DEFAULT_MODEL} "
+            f"WARNING:{LOGGER_NAME}:OpenAI-compatible model {DEFAULT_LAYOUT_MODEL} "
             f"returned an unusable reply in attempt 1 of 3 ({defect})",
             captured_logs.output,
         )
         self.assertIn(
-            f"INFO:{LOGGER_NAME}:OpenAI-compatible model {DEFAULT_MODEL} "
+            f"INFO:{LOGGER_NAME}:OpenAI-compatible model {DEFAULT_LAYOUT_MODEL} "
             "corrected its reply in attempt 2 of 3",
             captured_logs.output,
         )
@@ -1463,33 +1465,161 @@ class FigureLocationTests(TestCase):
     def test_returns_none_when_the_image_shows_no_illustration(self) -> None:
         self.assertIsNone(self.locate_figure(FakeCompletions('{"box":null,"cut":[]}')))
 
-    def test_asks_the_model_to_correct_a_box_that_it_cannot_use(self) -> None:
-        # The first box uses the pixels of the image and not the grid.
-        unusable = '{"box":{"left":250,"top":150,"right":2400,"bottom":1700},"cut":[]}'
-        usable = '{"box":{"left":250,"top":150,"right":750,"bottom":640},"cut":[]}'
-        completions = FakeCompletions(unusable, usable)
+    def test_one_call_is_one_request(self) -> None:
+        # The caller has a limit for its calls for one illustration. A correction request
+        # for each call would multiply that limit by the attempts of the backend.
+        replies = {
+            # The box uses the pixels of the image and not the grid.
+            '{"box":{"left":250,"top":150,"right":2400,"bottom":1700},"cut":[]}': (
+                LayoutFormatError,
+                "box must use the 0-to-1000 grid of the image, not its pixels",
+            ),
+            '{"cut":[]}': (LayoutFormatError, "the reply must be a JSON object with a box"),
+            "not JSON": (RuntimeError, "returned invalid JSON"),
+        }
+        for reply, (error_type, message) in replies.items():
+            completions = FakeCompletions(reply, '{"box":[250,150,750,640],"cut":[]}')
+            with (
+                self.subTest(reply=reply),
+                self.assertLogs(LOGGER_NAME, level="WARNING") as captured_logs,
+                self.assertRaisesRegex(error_type, message),
+            ):
+                self.locate_figure(completions)
+            self.assertEqual(len(completions.calls), 1)
+            self.assertIn("returned an unusable reply in attempt 1 of 1 (", captured_logs.output[0])
 
-        with self.assertLogs(LOGGER_NAME, level="INFO") as captured_logs:
-            location = self.locate_figure(completions)
 
-        self.assertEqual(location, FigureLocation(Box(250, 150, 750, 640)))
-        self.assertEqual(len(completions.calls), 2)
-        self.assertIn(
-            "Your last reply cannot be used: box must use the 0-to-1000 grid of the image, "
-            "not its pixels",
-            completions.calls[1]["messages"][3]["content"],
-        )
-        self.assertIn(
-            f"INFO:{LOGGER_NAME}:OpenAI-compatible model {DEFAULT_MODEL} "
-            "corrected its reply in attempt 2 of 3",
-            captured_logs.output,
-        )
+class RequestDefaultsTests(TestCase):
+    """LaTeX output and the searchable PDF have their own default model and effort."""
 
-    def test_fails_when_each_attempt_gives_an_unusable_box(self) -> None:
-        completions = FakeCompletions('{"cut":[]}')
-        with (
-            self.assertLogs(LOGGER_NAME, level="WARNING"),
-            self.assertRaisesRegex(LayoutFormatError, "the reply must be a JSON object with a box"),
-        ):
-            self.locate_figure(completions)
-        self.assertEqual(len(completions.calls), DEFAULT_MAX_ATTEMPTS)
+    def requests(self, options: dict[str, Any]) -> dict[str, dict[str, Any]]:
+        """Return the request of each request type, for a backend with these options."""
+        replies = {
+            "regions": '{"coordinate_system":"normalized","regions":[]}',
+            "layout": '{"page_top":"top","blocks":[]}',
+            "figure": '{"box":null,"cut":[]}',
+        }
+        result = {}
+        with TemporaryDirectory() as temporary_directory:
+            image_path = Path(temporary_directory) / "page.png"
+            Image.new("RGB", (400, 300), "white").save(image_path)
+            for name, reply in replies.items():
+                completions = FakeCompletions(reply)
+                fake_client = SimpleNamespace(chat=SimpleNamespace(completions=completions))
+                fake_openai = SimpleNamespace(OpenAI=lambda _client=fake_client, **_: _client)
+                backend = OpenAICompatibleBackend(languages=["en"], options=options)
+                call = {
+                    "regions": backend.recognize,
+                    "layout": backend.recognize_layout,
+                    "figure": backend.locate_figure,
+                }[name]
+                with (
+                    patch.dict(os.environ, {"OPENROUTER_API_KEY": "test-secret"}),
+                    patch.dict(sys.modules, {"openai": fake_openai}),
+                ):
+                    call(image_path)
+                (result[name],) = completions.calls
+        return result
+
+    def test_latex_requests_have_their_own_model_and_effort(self) -> None:
+        requests = self.requests({})
+        # The requests for text regions did not get a test with the model for layouts.
+        self.assertEqual(DEFAULT_MODEL, "deepseek/deepseek-v4-flash-vision-exp")
+        self.assertEqual(requests["regions"]["model"], DEFAULT_MODEL)
+        self.assertEqual(requests["regions"]["extra_body"], {"reasoning_effort": "low"})
+        for name in ("layout", "figure"):
+            with self.subTest(request=name):
+                self.assertEqual(requests[name]["model"], "~openai/gpt-luna-latest")
+                self.assertEqual(requests[name]["model"], DEFAULT_LAYOUT_MODEL)
+                self.assertEqual(requests[name]["extra_body"], {"reasoning_effort": "medium"})
+
+    def test_option_of_the_caller_is_for_all_requests(self) -> None:
+        requests = self.requests({"model": "provider/vision-model", "reasoning_effort": "high"})
+        for name, request in requests.items():
+            with self.subTest(request=name):
+                self.assertEqual(request["model"], "provider/vision-model")
+                self.assertEqual(request["extra_body"], {"reasoning_effort": "high"})
+        # One option does not change the default of the other option.
+        requests = self.requests({"model": "provider/vision-model"})
+        self.assertEqual(requests["regions"]["extra_body"], {"reasoning_effort": "low"})
+        self.assertEqual(requests["layout"]["extra_body"], {"reasoning_effort": "medium"})
+        requests = self.requests({"reasoning_effort": "low"})
+        self.assertEqual(requests["layout"]["model"], DEFAULT_LAYOUT_MODEL)
+        self.assertEqual(requests["figure"]["extra_body"], {"reasoning_effort": "low"})
+
+    def test_no_effort_and_an_alias_are_for_all_requests(self) -> None:
+        # A value of null sends no effort. That is a value of the caller, not "no value".
+        for name, request in self.requests({"reasoning_effort": None}).items():
+            with self.subTest(request=name):
+                self.assertNotIn("extra_body", request)
+        # The built-in alias is not the default model for layouts: it names a model of
+        # a different endpoint.
+        for name, request in self.requests({"model": "luna"}).items():
+            with self.subTest(request=name):
+                self.assertEqual(request["model"], "gpt-5.6-luna")
+
+    def test_log_records_name_the_model_of_the_request_and_of_the_response(self) -> None:
+        usage = SimpleNamespace(prompt_tokens=1500, completion_tokens=800, cost=0.004)
+
+        class Completions(FakeCompletions):
+            def __init__(self, response_model: object) -> None:
+                super().__init__('{"blocks":[]}')
+                self.response_model = response_model
+
+            def create(self, **request: Any) -> SimpleNamespace:
+                completion = super().create(**request)
+                completion.usage = usage
+                if self.response_model is not None:
+                    completion.model = self.response_model
+                return completion
+
+        cases = {
+            # The model ID of the request is an alias that the provider moves. The
+            # response names the model that made the reply.
+            "openai/gpt-luna-2026-09-30": (
+                "; the response names the model openai/gpt-luna-2026-09-30"
+            ),
+            None: "",
+            # A log record has only the characters of a model ID from the response.
+            "a model\nwith a line break": "",
+            17: "",
+        }
+        for response_model, suffix in cases.items():
+            completions = Completions(response_model)
+            fake_client = SimpleNamespace(chat=SimpleNamespace(completions=completions))
+            fake_openai = SimpleNamespace(OpenAI=lambda _client=fake_client, **_: _client)
+            with TemporaryDirectory() as temporary_directory:
+                image_path = Path(temporary_directory) / "page.png"
+                Image.new("RGB", (400, 300), "white").save(image_path)
+                with (
+                    self.subTest(response_model=response_model),
+                    patch.dict(os.environ, {"OPENROUTER_API_KEY": "test-secret"}),
+                    patch.dict(sys.modules, {"openai": fake_openai}),
+                    patch("uuid.uuid4", return_value=uuid.UUID(int=7)),
+                    self.assertLogs(LOGGER_NAME, level="INFO") as captured_logs,
+                ):
+                    backend = OpenAICompatibleBackend(languages=["en"], options={})
+                    backend.recognize_layout(image_path)
+            prefix = f"INFO:{LOGGER_NAME}:OpenAI-compatible session {uuid.UUID(int=7)}, model "
+            records = [
+                record
+                for record in captured_logs.output
+                if "usage." in record or "client" in record
+            ]
+            self.assertEqual(
+                records,
+                [
+                    (
+                        f"INFO:{LOGGER_NAME}:Initializing OpenAI-compatible client for model "
+                        f"{DEFAULT_LAYOUT_MODEL}"
+                    ),
+                    (
+                        f"{prefix}{DEFAULT_LAYOUT_MODEL}: usage.prompt_tokens=1500, "
+                        f"usage.completion_tokens=800 for this request{suffix}"
+                    ),
+                    (
+                        f"{prefix}{DEFAULT_LAYOUT_MODEL}: usage.cost=0.004000 for this request, "
+                        "total 0.004000 for 1 request(s)"
+                    ),
+                ],
+            )

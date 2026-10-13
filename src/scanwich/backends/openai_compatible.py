@@ -7,6 +7,7 @@ import json
 import logging
 import math
 import os
+import re
 import time
 import uuid
 from collections.abc import Callable, Mapping, Sequence
@@ -38,6 +39,14 @@ DEFAULT_API_KEY_ENV = "OPENROUTER_API_KEY"
 DEFAULT_TIMEOUT_SECONDS = 180.0
 DEFAULT_MAX_TOKENS = 65_536
 DEFAULT_REASONING_EFFORT = "low"
+# The model and the effort of the requests for LaTeX output: the layout of a page and the
+# box of an illustration. With this effort, the model keeps the capital forms and marks
+# the small capitals of a page. The requests for text regions did not get a test with
+# this model, so they keep their defaults.
+DEFAULT_LAYOUT_MODEL = "~openai/gpt-luna-latest"
+DEFAULT_LAYOUT_REASONING_EFFORT = "medium"
+# The characters of a model ID that a log record can have.
+MODEL_ID = re.compile(r"[A-Za-z0-9._:/~@+-]{1,120}")
 # The first request and the requests that ask the model to correct an unusable reply.
 DEFAULT_MAX_ATTEMPTS = 3
 # A correction request shows the model this many characters before a JSON error.
@@ -132,6 +141,9 @@ class OpenAICompatibleBackend:
     def __init__(self, *, languages: Sequence[str], options: Mapping[str, Any]) -> None:
         option_values = dict(options)
         self._languages = tuple(languages)
+        # A model or an effort that the caller gives is for all requests.
+        has_model = "model" in option_values
+        has_reasoning_effort = "reasoning_effort" in option_values
         self._model = _pop_string(option_values, "model", DEFAULT_MODEL)
         aliases = option_values.pop("model_aliases", {})
         if not isinstance(aliases, Mapping) or not all(
@@ -140,6 +152,7 @@ class OpenAICompatibleBackend:
         ):
             raise TypeError("model_aliases must map non-empty aliases to model names")
         self._model = {**DEFAULT_MODEL_ALIASES, **aliases}.get(self._model, self._model)
+        self._layout_model = self._model if has_model else DEFAULT_LAYOUT_MODEL
         self._base_url = _pop_string(option_values, "base_url", DEFAULT_BASE_URL).rstrip("/")
         self._api_key_env = _pop_string(option_values, "api_key_env", DEFAULT_API_KEY_ENV)
         self._timeout = _pop_positive_number(
@@ -156,6 +169,9 @@ class OpenAICompatibleBackend:
             option_values,
             "reasoning_effort",
             DEFAULT_REASONING_EFFORT,
+        )
+        self._layout_reasoning_effort = (
+            self._reasoning_effort if has_reasoning_effort else DEFAULT_LAYOUT_REASONING_EFFORT
         )
         self._max_attempts = _pop_positive_integer(
             option_values,
@@ -175,8 +191,7 @@ class OpenAICompatibleBackend:
     def recognize(self, image_path: Path) -> list[OcrRegion]:
         image = _encode_image(image_path)
         return self._complete(
-            self._request(image),
-            lambda content, attempt: self._parse_reply(content, image, attempt),
+            self._request(image), lambda content: self._parse_reply(content, image)
         )
 
     def recognize_layout(self, image_path: Path, *, upright: bool = False) -> PageLayout:
@@ -203,45 +218,59 @@ class OpenAICompatibleBackend:
         find when the image shows more than one.
         """
         image = _encode_image(image_path)
-        request = self._request(image)
+        request = self._request(image, figure=True)
         request["messages"][1]["content"][0]["text"] = self._figure_prompt(
             width=image.width, height=image.height, estimate=estimate, caption=caption
         )
-        return self._complete(request, self._parse_figure_reply)
+        # One call is one request. The caller has a limit for its calls, and a
+        # correction request for each of them would multiply that limit.
+        return self._complete(request, self._parse_figure_reply, max_attempts=1)
 
-    def _complete(self, request: dict[str, Any], parse: Callable[[str, int], Result]) -> Result:
+    def _complete(
+        self,
+        request: dict[str, Any],
+        parse: Callable[[str], Result],
+        *,
+        max_attempts: int | None = None,
+    ) -> Result:
         """Send a request, and return the result that `parse` makes from the reply.
 
-        `parse` gets the text of the reply and the number of the attempt. When it raises
-        an error for an unusable reply, the model gets a request to correct the reply.
+        When `parse` raises an error for an unusable reply, the model gets a request to
+        correct the reply, until `max_attempts` requests. The default is the limit of the
+        backend.
         """
-        client = self._get_client()
+        model = request["model"]
+        client = self._get_client(model=model)
+        limit = self._max_attempts if max_attempts is None else max_attempts
         attempt = 1
         while True:
-            logger.info("Sending page image to OpenAI-compatible model %s", self._model)
+            logger.info("Sending page image to OpenAI-compatible model %s", model)
             started_at = time.monotonic()
             try:
                 completion = client.chat.completions.create(**request)
             except Exception as error:
                 if attempt > 1:
-                    raise self._correction_request_error(error, attempt) from None
+                    raise self._correction_request_error(error, attempt, model, limit) from None
                 raise RuntimeError(
-                    f"OpenAI-compatible request failed for model {self._model}: {error}"
+                    f"OpenAI-compatible request failed for model {model}: {error}"
                 ) from error
             logger.info(
                 "OpenAI-compatible response received after %.1f seconds",
                 time.monotonic() - started_at,
             )
-            self._log_usage(completion)
+            self._log_usage(completion, model)
             content = self._completion_content(completion, provider_text=attempt == 1)
             try:
-                return parse(content, attempt)
+                result = parse(content)
             except UNUSABLE_REPLY_ERRORS as error:
-                self._log_unusable_reply(error, attempt)
-                if attempt == self._max_attempts:
+                self._log_unusable_reply(error, attempt, model, limit)
+                if attempt == limit:
                     raise
                 request = _correction_request(request, content, error)
                 attempt += 1
+            else:
+                self._log_corrected_reply(attempt, model, limit)
+                return result
 
     async def recognize_async(self, image_path: Path) -> list[OcrRegion]:
         image = await asyncio.to_thread(_encode_image, image_path)
@@ -253,20 +282,25 @@ class OpenAICompatibleBackend:
                 completion = await client.chat.completions.create(**request)
             except Exception as error:
                 if attempt > 1:
-                    raise self._correction_request_error(error, attempt) from None
+                    raise self._correction_request_error(
+                        error, attempt, self._model, self._max_attempts
+                    ) from None
                 raise RuntimeError(
                     f"OpenAI-compatible request failed for model {self._model}"
                 ) from error
-            self._log_usage(completion)
+            self._log_usage(completion, self._model)
             content = self._completion_content(completion, provider_text=attempt == 1)
             try:
-                return self._parse_reply(content, image, attempt)
+                regions = self._parse_reply(content, image)
             except UNUSABLE_REPLY_ERRORS as error:
-                self._log_unusable_reply(error, attempt)
+                self._log_unusable_reply(error, attempt, self._model, self._max_attempts)
                 if attempt == self._max_attempts:
                     raise
                 request = _correction_request(request, content, error)
                 attempt += 1
+            else:
+                self._log_corrected_reply(attempt, self._model, self._max_attempts)
+                return regions
 
     async def aclose(self) -> None:
         if self._async_client is not None:
@@ -284,7 +318,7 @@ class OpenAICompatibleBackend:
             raise RuntimeError(
                 f"OpenAI-compatible request failed for model {self._model}"
             ) from error
-        self._log_usage(completion)
+        self._log_usage(completion, self._model)
         return self._completion_content(completion, allow_empty=True)
 
     def _request(
@@ -294,10 +328,18 @@ class OpenAICompatibleBackend:
         plain_text: bool = False,
         layout: bool = False,
         upright: bool = False,
+        figure: bool = False,
     ) -> dict[str, Any]:
+        """Return the request for one image.
+
+        `layout` is the request for the layout of a page, and `figure` is the request for
+        the box of an illustration. These two are the requests for LaTeX output.
+        """
         width, height = image.width, image.height
+        latex_output = layout or figure
+        reasoning_effort = self._layout_reasoning_effort if latex_output else self._reasoning_effort
         request: dict[str, Any] = {
-            "model": self._model,
+            "model": self._layout_model if latex_output else self._model,
             "messages": [
                 {
                     "role": "system",
@@ -321,8 +363,8 @@ class OpenAICompatibleBackend:
             "max_tokens": self._max_tokens,
             "response_format": {"type": "json_object"},
         }
-        if self._reasoning_effort is not None:
-            request["extra_body"] = {"reasoning_effort": self._reasoning_effort}
+        if reasoning_effort is not None:
+            request["extra_body"] = {"reasoning_effort": reasoning_effort}
         if plain_text:
             request.pop("response_format")
             request["messages"][1]["content"][0]["text"] = (
@@ -339,42 +381,39 @@ class OpenAICompatibleBackend:
 
         return request
 
-    def _parse_reply(self, content: str, image: RequestImage, attempt: int) -> list[OcrRegion]:
+    def _parse_reply(self, content: str, image: RequestImage) -> list[OcrRegion]:
         payload = _parse_json_payload(content)
         regions = _parse_regions(payload, image_width=image.width, image_height=image.height)
-        self._log_corrected_reply(attempt)
         return _scale_regions(regions, image)
 
-    def _parse_layout_reply(self, content: str, attempt: int) -> PageLayout:
-        layout = page_layout_from_json(_parse_json_payload(content), reply=True)
-        self._log_corrected_reply(attempt)
-        return layout
+    def _parse_layout_reply(self, content: str) -> PageLayout:
+        return page_layout_from_json(_parse_json_payload(content), reply=True)
 
-    def _parse_figure_reply(self, content: str, attempt: int) -> FigureLocation | None:
-        location = figure_location_from_json(_parse_json_payload(content))
-        self._log_corrected_reply(attempt)
-        return location
+    def _parse_figure_reply(self, content: str) -> FigureLocation | None:
+        return figure_location_from_json(_parse_json_payload(content))
 
-    def _log_corrected_reply(self, attempt: int) -> None:
+    def _log_corrected_reply(self, attempt: int, model: str, limit: int) -> None:
         if attempt > 1:
             logger.info(
                 "OpenAI-compatible model %s corrected its reply in attempt %d of %d",
-                self._model,
+                model,
                 attempt,
-                self._max_attempts,
+                limit,
             )
 
-    def _log_unusable_reply(self, error: Exception, attempt: int) -> None:
+    def _log_unusable_reply(self, error: Exception, attempt: int, model: str, limit: int) -> None:
         logger.warning(
             "OpenAI-compatible model %s returned an unusable reply in attempt %d of %d (%s: %s)",
-            self._model,
+            model,
             attempt,
-            self._max_attempts,
+            limit,
             type(error).__name__,
             _defect_summary(error),
         )
 
-    def _correction_request_error(self, error: Exception, attempt: int) -> RuntimeError:
+    def _correction_request_error(
+        self, error: Exception, attempt: int, model: str, limit: int
+    ) -> RuntimeError:
         """Return the error for a correction request that failed, without provider text.
 
         A correction request has text from the model reply, and a provider can repeat request
@@ -383,8 +422,8 @@ class OpenAICompatibleBackend:
         status_code = getattr(error, "status_code", None)
         status = f", HTTP status {status_code}" if isinstance(status_code, int) else ""
         return RuntimeError(
-            f"OpenAI-compatible request failed for model {self._model} in attempt {attempt} of "
-            f"{self._max_attempts}: {type(error).__name__}{status}"
+            f"OpenAI-compatible request failed for model {model} in attempt {attempt} of "
+            f"{limit}: {type(error).__name__}{status}"
         )
 
     def _completion_content(
@@ -429,8 +468,13 @@ class OpenAICompatibleBackend:
             )
         return content
 
-    def _log_usage(self, completion: Any) -> None:
-        """Log the tokens and the cost that the service reports for one request."""
+    def _log_usage(self, completion: Any, model: str) -> None:
+        """Log the tokens and the cost that the service reports for one request.
+
+        `model` is the model of the request. A model ID can be an alias that the provider
+        moves to a newer model. The response names the model that made the reply, and
+        the record has that name also.
+        """
         usage = getattr(completion, "usage", None)
         tokens = [getattr(usage, name, None) for name in USAGE_TOKEN_FIELDS]
         if all(_is_count(count) for count in tokens):
@@ -442,17 +486,21 @@ class OpenAICompatibleBackend:
                 if isinstance(details, Mapping)
                 else getattr(details, "reasoning_tokens", None)
             )
+            answered_by = getattr(completion, "model", None)
             logger.info(
                 "OpenAI-compatible session %s, model %s: usage.prompt_tokens=%d, "
-                "usage.completion_tokens=%d%s for this request",
+                "usage.completion_tokens=%d%s for this request%s",
                 self._session_id,
-                self._model,
+                model,
                 *tokens,
                 f", reasoning_tokens={reasoning}" if _is_count(reasoning) else "",
+                f"; the response names the model {answered_by}"
+                if isinstance(answered_by, str) and MODEL_ID.fullmatch(answered_by)
+                else "",
             )
-        self._log_cost(completion)
+        self._log_cost(completion, model)
 
-    def _log_cost(self, completion: Any) -> None:
+    def _log_cost(self, completion: Any, model: str) -> None:
         """Log the cost that the service reports for one request, and the session total."""
         cost = getattr(getattr(completion, "usage", None), "cost", None)
         if isinstance(cost, bool) or not isinstance(cost, (int, float)):
@@ -465,13 +513,14 @@ class OpenAICompatibleBackend:
             "OpenAI-compatible session %s, model %s: usage.cost=%.6f for this request, "
             "total %.6f for %d request(s)",
             self._session_id,
-            self._model,
+            model,
             cost,
             self._session_cost,
             self._session_requests_with_cost,
         )
 
-    def _get_client(self, *, asynchronous: bool = False) -> Any:
+    def _get_client(self, *, asynchronous: bool = False, model: str | None = None) -> Any:
+        """Return the client of the service. `model` is the model of the first request."""
         cached = self._async_client if asynchronous else self._client
         if cached is not None:
             return cached
@@ -481,7 +530,7 @@ class OpenAICompatibleBackend:
             raise RuntimeError(
                 f"the OpenAI-compatible backend requires {self._api_key_env} to be set"
             )
-        logger.info("Initializing OpenAI-compatible client for model %s", self._model)
+        logger.info("Initializing OpenAI-compatible client for model %s", model or self._model)
         try:
             if asynchronous:
                 from openai import AsyncOpenAI as Client
@@ -569,18 +618,19 @@ class OpenAICompatibleBackend:
             "letters, also in a caption and in a running head. Do not change such a line to "
             "lowercase letters or to sentence case. Small capitals are capital forms that "
             "are as high as lowercase letters. Put only them in <sc>, and write a large "
-            "capital letter before the tag. For a caption that the page prints as TABLE II. "
-            "RESULTS OF THE TESTS, with a large T and a large R, write "
-            '"T<sc>ABLE</sc> II. R<sc>ESULTS OF THE TESTS</sc>" and not "Table II. Results '
-            'of the tests".\n\n'
+            "capital letter before the tag. For the words PART ONE with a large P and a "
+            'large O, write "P<sc>ART</sc> O<sc>NE</sc>" and not "Part One". For a line '
+            'that is all in small capitals, write "<sc>THE END OF THE FIRST BOOK</sc>" and '
+            'not "The end of the first book".\n\n'
             'Blocks. "blocks" has the parts of the page in reading order. Each block is one '
             "of these, with only the fields that are shown:\n"
-            '- {"type":"page_header","text":"...","position":"top-center"}, '
-            '{"type":"page_footer","text":"...","position":"bottom-center"}, and '
-            '{"type":"page_number","text":"...","position":"top-right"}: the running head, '
+            '- {"type":"page_header","text":"...","position":"..."}, '
+            '{"type":"page_footer","text":"...","position":"..."}, and '
+            '{"type":"page_number","text":"...","position":"..."}: the running head, '
             "the running foot, and the page number that the page prints outside its text. "
-            '"position" is the place on the page: "top-left", "top-center", "top-right", '
-            '"bottom-left", "bottom-center", or "bottom-right".\n'
+            '"position" is the place where this page prints the block: "top-left", '
+            '"top-center", "top-right", "bottom-left", "bottom-center", or "bottom-right". '
+            "A left page and a right page of a book can have different places.\n"
             '- {"type":"heading","level":1,"text":"..."}: level 1 is a chapter or the main '
             'title, level 2 is a section, and level 3 is a subsection. Add "align":"center" '
             "for a centered heading.\n"
