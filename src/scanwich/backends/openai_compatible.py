@@ -90,6 +90,8 @@ TRUNCATION_MARK = "..."
 FINISH_REASONS = frozenset({"length", "content_filter", "tool_calls", "function_call", "error"})
 # Other metadata fields can repeat the request input, so an error message does not have them.
 PROVIDER_ERROR_METADATA_FIELDS = ("error_type", "provider_name", "provider_code", "raw")
+# The fields of `usage` that have the number of tokens of the request and of the reply.
+USAGE_TOKEN_FIELDS = ("prompt_tokens", "completion_tokens")
 REQUEST_OPTIONS = frozenset({"model"})
 HTTP_REFERER = "https://github.com/jaysonsantos/scanwich"
 APP_TITLE = "Scanwich"
@@ -202,7 +204,7 @@ class OpenAICompatibleBackend:
                 "OpenAI-compatible response received after %.1f seconds",
                 time.monotonic() - started_at,
             )
-            self._log_cost(completion)
+            self._log_usage(completion)
             content = self._completion_content(completion, provider_text=attempt == 1)
             try:
                 return parse(content, attempt)
@@ -227,7 +229,7 @@ class OpenAICompatibleBackend:
                 raise RuntimeError(
                     f"OpenAI-compatible request failed for model {self._model}"
                 ) from error
-            self._log_cost(completion)
+            self._log_usage(completion)
             content = self._completion_content(completion, provider_text=attempt == 1)
             try:
                 return self._parse_reply(content, image, attempt)
@@ -254,7 +256,7 @@ class OpenAICompatibleBackend:
             raise RuntimeError(
                 f"OpenAI-compatible request failed for model {self._model}"
             ) from error
-        self._log_cost(completion)
+        self._log_usage(completion)
         return self._completion_content(completion, allow_empty=True)
 
     def _request(
@@ -393,6 +395,20 @@ class OpenAICompatibleBackend:
                 "OpenAI-compatible service returned an empty or unsupported response"
             )
         return content
+
+    def _log_usage(self, completion: Any) -> None:
+        """Log the tokens and the cost that the service reports for one request."""
+        usage = getattr(completion, "usage", None)
+        tokens = [getattr(usage, name, None) for name in USAGE_TOKEN_FIELDS]
+        if all(isinstance(count, int) and not isinstance(count, bool) for count in tokens):
+            logger.info(
+                "OpenAI-compatible session %s, model %s: usage.prompt_tokens=%d, "
+                "usage.completion_tokens=%d for this request",
+                self._session_id,
+                self._model,
+                *tokens,
+            )
+        self._log_cost(completion)
 
     def _log_cost(self, completion: Any) -> None:
         """Log the cost that the service reports for one request, and the session total."""

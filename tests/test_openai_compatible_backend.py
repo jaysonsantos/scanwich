@@ -176,7 +176,7 @@ class OpenAICompatibleBackendTests(TestCase):
                 for _ in usages:
                     backend.recognize(image_path)
         session_id = client_options["default_headers"]["X-Session-Id"]
-        return session_id, [record for record in logs.output if "usage.cost" in record]
+        return session_id, [record for record in logs.output if "usage." in record]
 
     def test_sends_image_and_converts_normalized_polygons_to_pixels(self) -> None:
         payload = {
@@ -411,6 +411,30 @@ class OpenAICompatibleBackendTests(TestCase):
         self.assertEqual(str(uuid.UUID(session_id)), session_id)
         self.assertNotEqual(second["X-Session-Id"], session_id)
         self.assertIsNone(other_service)
+
+    def test_logs_the_tokens_of_each_request(self) -> None:
+        session_id, records = self.cost_records(
+            [
+                SimpleNamespace(prompt_tokens=1800, completion_tokens=950, cost=0.002),
+                # A usage without the two counts as integers gives no record of tokens.
+                SimpleNamespace(prompt_tokens=1800, cost=0.001),
+                SimpleNamespace(prompt_tokens="1800", completion_tokens=True),
+                SimpleNamespace(prompt_tokens=0, completion_tokens=0),
+            ]
+        )
+
+        prefix = (
+            f"INFO:{LOGGER_NAME}:OpenAI-compatible session {session_id}, model {DEFAULT_MODEL}: "
+        )
+        self.assertEqual(
+            records,
+            [
+                prefix + "usage.prompt_tokens=1800, usage.completion_tokens=950 for this request",
+                prefix + "usage.cost=0.002000 for this request, total 0.002000 for 1 request(s)",
+                prefix + "usage.cost=0.001000 for this request, total 0.003000 for 2 request(s)",
+                prefix + "usage.prompt_tokens=0, usage.completion_tokens=0 for this request",
+            ],
+        )
 
     def test_logs_the_cost_of_each_request_and_the_session_total(self) -> None:
         session_id, records = self.cost_records(
