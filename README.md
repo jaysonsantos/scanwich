@@ -150,7 +150,8 @@ scanwich input.pdf output.pdf \
   --backend-option model=provider/vision-model
 ```
 
-The backend sends each page image as a JPEG in base64 text to the configured service and its
+The backend accepts PNG, JPEG, WebP, and GIF page images.
+It sends each page image as a JPEG in base64 text to the configured service and its
 selected model provider. Do not use this backend for documents that must remain local.
 The page image file does not change, so the PDF keeps the original image.
 Some providers reject an image when its base64 text is larger than 5 MiB.
@@ -180,11 +181,12 @@ The backend does not send the first request again. With a temperature of 0, the 
 Each correction request has a cost. The session total includes it.
 The backend writes one `WARNING` log record for each unusable reply. The record has the error and no text from the reply.
 If the last reply is also unusable, the page fails with the error of that reply.
-The backend sends no correction request when the request fails or when the provider stops the reply before its end.
+The backend sends no correction request when the request fails, when the provider stops the reply before its end, or when the reply has no text.
+A correction request has text from the model reply. If that request fails, the error has the error type and the HTTP status, and no text from the provider.
 The request for plain text has no JSON, so it has no correction request.
 
 ```text
-WARNING: OpenAI-compatible model provider/vision-model returned an unusable reply in attempt 1 of 3 (RuntimeError: OpenAI-compatible service returned invalid JSON: Expecting ',' delimiter: line 1 column 1343 (char 1342)); asking the model to correct it
+WARNING: OpenAI-compatible model provider/vision-model returned an unusable reply in attempt 1 of 3 (RuntimeError: OpenAI-compatible service returned invalid JSON: Expecting ',' delimiter: line 1 column 1343 (char 1342))
 INFO: OpenAI-compatible model provider/vision-model corrected its reply in attempt 2 of 3
 ```
 

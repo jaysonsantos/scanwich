@@ -20,6 +20,7 @@ from scanwich.backends.openai_compatible import (
     DEFAULT_MODEL,
     PROVIDER_DETAIL_MAX_CHARACTERS,
     OpenAICompatibleBackend,
+    _jpeg_mode_image,
 )
 from scanwich.models import OcrRegion, Point
 
@@ -640,6 +641,52 @@ class OpenAICompatibleBackendTests(TestCase):
         darkest, lightest = sent_image(completions.calls[0]).convert("L").getextrema()
         self.assertAlmostEqual(darkest, 128, delta=2)
         self.assertAlmostEqual(lightest, 128, delta=2)
+        # Older Pillow versions open a 16-bit gray PNG in this mode.
+        self.assertEqual(_jpeg_mode_image(Image.new("I", (4, 4), 32_768)).getextrema(), (128, 128))
+
+    def test_rejects_an_image_type_that_is_not_in_the_list(self) -> None:
+        completions = FakeCompletions("{}")
+        fake_client = SimpleNamespace(chat=SimpleNamespace(completions=completions))
+        with TemporaryDirectory() as temporary_directory:
+            image_path = Path(temporary_directory) / "page"
+            # A TIFF can have 32-bit values, and their range is not known.
+            Image.new("I", (10, 10), 200).save(image_path, format="TIFF")
+            backend = OpenAICompatibleBackend(languages=["en"], options={})
+            backend._client = fake_client
+
+            with self.assertRaisesRegex(RuntimeError, "does not support image type image/tiff"):
+                backend.recognize(image_path)
+        self.assertEqual(completions.calls, [])
+
+    def test_failed_correction_request_reports_no_provider_text(self) -> None:
+        class ProviderError(Exception):
+            status_code = 403
+
+        unusable = '{"coordinate_system": "normalized", "regions": [{"text": "private" letter"}]}'
+        replies = iter([FakeCompletions(unusable).create(), ProviderError("private letter")])
+
+        def create(**_: Any) -> SimpleNamespace:
+            reply = next(replies)
+            if isinstance(reply, Exception):
+                raise reply
+            return reply
+
+        completions = SimpleNamespace(create=create)
+        with (
+            self.assertLogs(LOGGER_NAME, level="WARNING") as logs,
+            self.assertRaises(RuntimeError) as raised,
+        ):
+            self.recognize_replies(completions)
+
+        # The provider can repeat the text of the correction request in its error.
+        self.assertEqual(
+            str(raised.exception),
+            f"OpenAI-compatible request failed for model {DEFAULT_MODEL} in attempt 2 of 3: "
+            "ProviderError, HTTP status 403",
+        )
+        self.assertIsNone(raised.exception.__cause__)
+        self.assertTrue(raised.exception.__suppress_context__)
+        self.assertNotIn("private", "\n".join(logs.output))
 
     def test_scales_down_an_image_above_the_size_limit(self) -> None:
         noise = random.Random(0).randbytes(400 * 200 * 3)
@@ -742,8 +789,7 @@ class OpenAICompatibleBackendTests(TestCase):
                     [
                         (
                             f"WARNING:{LOGGER_NAME}:OpenAI-compatible model {DEFAULT_MODEL} "
-                            f"returned an unusable reply in attempt 1 of 3 ({defect}); "
-                            "asking the model to correct it"
+                            f"returned an unusable reply in attempt 1 of 3 ({defect})"
                         ),
                         (
                             f"INFO:{LOGGER_NAME}:OpenAI-compatible model {DEFAULT_MODEL} "
@@ -770,8 +816,12 @@ class OpenAICompatibleBackendTests(TestCase):
                     [len(call["messages"]) for call in completions.calls],
                     [2 * attempt for attempt in range(1, attempts + 1)],
                 )
+                # Each unusable reply has one record, and the last reply too.
                 warnings = [line for line in logs.output if line.startswith("WARNING")]
-                self.assertEqual(len(warnings), attempts - 1)
+                self.assertEqual(
+                    [line.split(" in attempt ")[1].split(" (")[0] for line in warnings],
+                    [f"{attempt} of {attempts}" for attempt in range(1, attempts + 1)],
+                )
                 self.assertNotIn("private", str(raised.exception) + "\n".join(logs.output))
 
     def test_rejects_unknown_and_invalid_options(self) -> None:

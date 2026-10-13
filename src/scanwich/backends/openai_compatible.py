@@ -39,12 +39,16 @@ UNUSABLE_REPLY_ERRORS = (RuntimeError, TypeError)
 MAX_IMAGE_BASE64_BYTES = 5 * 1024 * 1024
 # Base64 writes 4 characters for each 3 bytes.
 MAX_IMAGE_BYTES = MAX_IMAGE_BASE64_BYTES // 4 * 3
+# The image types that the backend accepts for a page.
+PAGE_IMAGE_MIME_TYPES = frozenset({"image/png", "image/jpeg", "image/webp", "image/gif"})
+# The image type that the backend sends.
 IMAGE_MIME_TYPE = "image/jpeg"
 JPEG_QUALITY = 90
 # Full color resolution keeps the edges of colored text sharp.
 JPEG_SUBSAMPLING = "4:4:4"
 JPEG_MODES = frozenset({"L", "RGB"})
-# The Pillow modes of a gray image with 16 bits for each pixel start with this name.
+# The Pillow modes with integer values start with this name. Of the accepted image types,
+# only a gray PNG with 16 bits for each pixel opens in such a mode.
 INTEGER_MODE = "I"
 SIXTEEN_BIT_GRAY_STEPS_PER_8_BIT_STEP = 256
 # A too-large image becomes this much smaller than the size limit needs. The size of a
@@ -142,6 +146,8 @@ class OpenAICompatibleBackend:
             try:
                 completion = client.chat.completions.create(**request)
             except Exception as error:
+                if attempt > 1:
+                    raise self._correction_request_error(error, attempt) from None
                 raise RuntimeError(
                     f"OpenAI-compatible request failed for model {self._model}: {error}"
                 ) from error
@@ -154,9 +160,10 @@ class OpenAICompatibleBackend:
             try:
                 return self._parse_reply(content, image, attempt)
             except UNUSABLE_REPLY_ERRORS as error:
+                self._log_unusable_reply(error, attempt)
                 if attempt == self._max_attempts:
                     raise
-                request = self._correction_request(request, content, error, attempt)
+                request = _correction_request(request, content, error)
                 attempt += 1
 
     async def recognize_async(self, image_path: Path) -> list[OcrRegion]:
@@ -168,6 +175,8 @@ class OpenAICompatibleBackend:
             try:
                 completion = await client.chat.completions.create(**request)
             except Exception as error:
+                if attempt > 1:
+                    raise self._correction_request_error(error, attempt) from None
                 raise RuntimeError(
                     f"OpenAI-compatible request failed for model {self._model}"
                 ) from error
@@ -176,9 +185,10 @@ class OpenAICompatibleBackend:
             try:
                 return self._parse_reply(content, image, attempt)
             except UNUSABLE_REPLY_ERRORS as error:
+                self._log_unusable_reply(error, attempt)
                 if attempt == self._max_attempts:
                     raise
-                request = self._correction_request(request, content, error, attempt)
+                request = _correction_request(request, content, error)
                 attempt += 1
 
     async def aclose(self) -> None:
@@ -253,31 +263,28 @@ class OpenAICompatibleBackend:
             )
         return _scale_regions(regions, image)
 
-    def _correction_request(
-        self, request: dict[str, Any], content: str, error: Exception, attempt: int
-    ) -> dict[str, Any]:
-        """Return the request that shows the model its unusable reply and asks for a new one.
-
-        With a temperature of 0, the model mostly repeats the defect for the same request.
-        Thus the model gets its reply and the defect.
-        """
+    def _log_unusable_reply(self, error: Exception, attempt: int) -> None:
         logger.warning(
-            "OpenAI-compatible model %s returned an unusable reply in attempt %d of %d (%s: %s); "
-            "asking the model to correct it",
+            "OpenAI-compatible model %s returned an unusable reply in attempt %d of %d (%s: %s)",
             self._model,
             attempt,
             self._max_attempts,
             type(error).__name__,
             _defect_summary(error),
         )
-        return {
-            **request,
-            "messages": [
-                *request["messages"],
-                {"role": "assistant", "content": content},
-                {"role": "user", "content": _correction_prompt(error)},
-            ],
-        }
+
+    def _correction_request_error(self, error: Exception, attempt: int) -> RuntimeError:
+        """Return the error for a correction request that failed, without provider text.
+
+        A correction request has text from the model reply, and a provider can repeat request
+        input in its error.
+        """
+        status_code = getattr(error, "status_code", None)
+        status = f", HTTP status {status_code}" if isinstance(status_code, int) else ""
+        return RuntimeError(
+            f"OpenAI-compatible request failed for model {self._model} in attempt {attempt} of "
+            f"{self._max_attempts}: {type(error).__name__}{status}"
+        )
 
     def _completion_content(self, completion: Any, *, allow_empty: bool = False) -> str:
         choices = getattr(completion, "choices", None)
@@ -387,6 +394,12 @@ def _encode_image(image_path: Path) -> RequestImage:
                 raise RuntimeError(
                     f"OCR page image has invalid dimensions: {page_width}x{page_height}"
                 )
+            mime_type = Image.MIME.get(page_image.format or "")
+            if mime_type not in PAGE_IMAGE_MIME_TYPES:
+                raise RuntimeError(
+                    "OpenAI-compatible service does not support image type "
+                    f"{mime_type or 'unknown'}"
+                )
             image = _jpeg_mode_image(page_image)
             jpeg = _jpeg_bytes(image)
             while len(jpeg) > MAX_IMAGE_BYTES and image.size != (1, 1):
@@ -448,6 +461,22 @@ def _scale_regions(regions: list[OcrRegion], image: RequestImage) -> list[OcrReg
         )
         for region in regions
     ]
+
+
+def _correction_request(request: dict[str, Any], content: str, error: Exception) -> dict[str, Any]:
+    """Return the request that shows the model its unusable reply and asks for a new one.
+
+    With a temperature of 0, the model mostly repeats the defect for the same request.
+    Thus the model gets its reply and the defect.
+    """
+    return {
+        **request,
+        "messages": [
+            *request["messages"],
+            {"role": "assistant", "content": content},
+            {"role": "user", "content": _correction_prompt(error)},
+        ],
+    }
 
 
 def _defect_summary(error: Exception) -> str:
