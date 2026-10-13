@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import contextvars
+import functools
 import hashlib
 import inspect
 import json
@@ -12,6 +13,7 @@ import re
 import shutil
 import uuid
 from collections.abc import Awaitable, Callable, Iterator, Mapping, Sequence
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -451,8 +453,9 @@ class _BackendCalls:
     """The requests of one conversion to its backend, from the tasks of an event loop.
 
     A backend with the async methods gets its calls at the same time. A backend with
-    only the synchronous methods gets one call at a time, in a thread: the pipeline does
-    not know that such a backend permits calls from more than one thread.
+    only the synchronous methods gets one call at a time, and all its calls come from
+    one thread: the pipeline does not know that such a backend permits calls from more
+    than one thread. That thread is not the thread that made the backend.
 
     When the service answers that it gets too many requests, all the requests of the
     conversion wait, and the request then goes again.
@@ -460,7 +463,8 @@ class _BackendCalls:
 
     def __init__(self, backend: LayoutBackend) -> None:
         self._backend = backend
-        self._one_call = asyncio.Lock()
+        # The one thread for the calls of a backend with only synchronous methods.
+        self._thread: ThreadPoolExecutor | None = None
         # The time of the event loop before which no request starts.
         self._resume_at = 0.0
         self.locates_figures = isinstance(backend, FigureLocator)
@@ -491,16 +495,35 @@ class _BackendCalls:
         )
 
     async def close(self) -> None:
-        """Let a backend with the async methods close its connections."""
+        """Let a backend with the async methods close its connections.
+
+        An error at this point is not an error of a page, so it is only a warning. It
+        must not replace the error of a page, and it must not stop a complete document.
+        """
         close = getattr(self._backend, "aclose", None)
         if isinstance(self._backend, AsyncLayoutBackend) and callable(close):
-            result = close()
-            if inspect.isawaitable(result):
-                await result
+            try:
+                result = close()
+                if inspect.isawaitable(result):
+                    await result
+            except Exception as error:
+                logger.warning(
+                    "The backend did not close its connections (%s: %s)",
+                    type(error).__name__,
+                    error,
+                )
+        if self._thread is not None:
+            # A call that waits for the thread does not start. The thread ends after the
+            # call that is in work.
+            thread, self._thread = self._thread, None
+            await asyncio.to_thread(thread.shutdown, wait=True, cancel_futures=True)
 
     async def _in_thread(self, function: Callable[..., Result], *args: Any, **options: Any) -> Any:
-        async with self._one_call:
-            return await asyncio.to_thread(function, *args, **options)
+        if self._thread is None:
+            self._thread = ThreadPoolExecutor(max_workers=1, thread_name_prefix="scanwich-backend")
+        # The thread gets the context of the task, which has the page for the log records.
+        call = functools.partial(contextvars.copy_context().run, function, *args, **options)
+        return await asyncio.get_running_loop().run_in_executor(self._thread, call)
 
     async def _send(self, call: Callable[[], Awaitable[Result]]) -> Result:
         waits = iter(RATE_LIMIT_WAITS)
@@ -515,8 +538,7 @@ class _BackendCalls:
                 wait = next(waits, None)
                 if wait is None:
                     raise
-                if error.retry_after is not None:
-                    wait = min(max(wait, error.retry_after), MAX_RATE_LIMIT_WAIT)
+                wait = _rate_limit_wait(wait, error.retry_after)
                 self._resume_at = max(self._resume_at, loop.time() + wait)
                 logger.warning(
                     "The service gets too many requests. All pages wait %.0f seconds before "
@@ -527,6 +549,17 @@ class _BackendCalls:
                     # The call had replies before the refusal. The provider continues it,
                     # so that those replies count for its limit of requests.
                     call = error.resume
+
+
+def _rate_limit_wait(wait: float, retry_after: float | None) -> float:
+    """Return the wait in seconds after the service refused a request for the rate.
+
+    `wait` is the wait of the conversion, and `retry_after` is the wait that the service
+    asks for. The longer one is in use, to the maximum.
+    """
+    if retry_after is not None:
+        wait = max(wait, retry_after)
+    return min(wait, MAX_RATE_LIMIT_WAIT)
 
 
 class _Conversion:

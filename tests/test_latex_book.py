@@ -1255,6 +1255,60 @@ class ParallelPagesTests(BookTestCase):
         self.assertEqual(backend.max_in_flight, 1)
         self.assertEqual(self.document().count("\\begin{sourcepage}"), 8)
 
+    def test_backend_with_only_synchronous_methods_gets_its_calls_from_one_thread(self) -> None:
+        # Such a backend can have an object that is for one thread only, for example a
+        # database connection.
+        class ThreadBackend(PageBackend):
+            def __init__(self, *arguments: object, **options: object) -> None:
+                super().__init__(*arguments, **options)  # type: ignore[arg-type]
+                self.threads: list[int] = []
+
+            def recognize_layout(self, image_path: Path, *, upright: bool = False) -> PageLayout:
+                self.threads.append(threading.get_ident())
+                return super().recognize_layout(image_path, upright=upright)
+
+            def locate_figure(self, image_path: Path, **hints: object) -> FigureLocation:
+                self.threads.append(threading.get_ident())
+                return FigureLocation(Box(100, 100, 900, 900))
+
+        figure = PageLayout(blocks=(Paragraph("Text."), Figure(box=Box(250, 250, 750, 750))))
+        threads_before = threading.active_count()
+        backend = ThreadBackend(dict.fromkeys(range(1, 9), figure), delay=0.002)
+        self.convert(self.photos(8), backend, parallel_pages=4)
+
+        self.assertEqual(len(backend.threads), 16)
+        self.assertEqual(len(set(backend.threads)), 1)
+        # The thread is not the thread of the caller, which made the backend.
+        self.assertNotIn(threading.get_ident(), backend.threads)
+        self.assertEqual(threading.active_count(), threads_before)
+
+    def test_error_of_aclose_is_a_warning(self) -> None:
+        class NotClosingBackend(AsyncPageBackend):
+            async def aclose(self) -> None:
+                raise OSError("the connection did not close")
+
+        # A complete conversion gives its document.
+        with self.assertLogs(LOGGER_NAME, level="WARNING") as captured_logs:
+            self.convert(self.photos(2), NotClosingBackend(), ocr_output_directory=None)
+        self.assertEqual(
+            captured_logs.output[-1],
+            f"WARNING:{LOGGER_NAME}:The backend did not close its connections (OSError: the "
+            "connection did not close)",
+        )
+        self.assertIn(text_of(2), self.document())
+
+        # The error of a page stays the error of the conversion.
+        with (
+            self.assertLogs(LOGGER_NAME, level="WARNING"),
+            self.assertRaisesRegex(RuntimeError, "the service did not read page 2"),
+        ):
+            self.convert(
+                self.photos(3),
+                NotClosingBackend(failing={2}),
+                ocr_output_directory=None,
+                parallel_pages=1,
+            )
+
     def test_one_failed_page_does_not_cancel_the_pages_in_work(self) -> None:
         inputs = self.photos(8)
         # The failed page has the first reply, while 3 other pages are in work.
@@ -1392,15 +1446,25 @@ class RateLimitTests(BookTestCase):
         self.assertGreaterEqual(backend.started_at[3] - started, wait)
 
     def test_wait_that_the_service_asks_for(self) -> None:
+        self.assertEqual(pipeline.MAX_RATE_LIMIT_WAIT, 300.0)
+        self.assertEqual(pipeline.RATE_LIMIT_WAITS, (30.0, 60.0, 120.0))
+        # The longer wait is in use, to the maximum.
+        waits = {(30.0, None): 30.0, (30.0, 7.0): 30.0, (30.0, 45.0): 45.0, (60.0, 3600.0): 300.0}
+        for (wait, retry_after), expected in waits.items():
+            with self.subTest(wait=wait, retry_after=retry_after):
+                self.assertEqual(pipeline._rate_limit_wait(wait, retry_after), expected)
+
         class AskingBackend(AsyncPageBackend):
             async def recognize_layout_async(
                 self, image_path: Path, *, upright: bool = False
             ) -> PageLayout:
                 if not self.requests:
                     self.requests.append(1)
-                    raise RateLimitError("too many requests", retry_after=1000.0)
+                    raise RateLimitError("too many requests", retry_after=1.0)
                 return await super().recognize_layout_async(image_path, upright=upright)
 
+        # The service asks for 1.0 second, and the maximum is 0.2 seconds here. When the
+        # maximum is not in use, the test fails after 1 second: it does not wait.
         backend = AskingBackend()
         started = time.monotonic()
         with (
@@ -1410,9 +1474,8 @@ class RateLimitTests(BookTestCase):
         ):
             self.convert(self.photos(1), backend)
 
-        # The wait is the wait of the service, and not more than the maximum.
         self.assertGreaterEqual(backend.started_at[1] - started, 0.2)
-        self.assertLess(backend.started_at[1] - started, 5.0)
+        self.assertLess(backend.started_at[1] - started, 0.8)
 
     def test_page_fails_when_the_service_refuses_after_the_last_wait(self) -> None:
         inputs = self.photos(2)
