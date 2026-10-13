@@ -199,6 +199,76 @@ class CliTests(TestCase):
         self.assertIn(f"INFO: [page 1/2] Page 1/2 is {self.photo}\n", log_output)
         self.assertIn(f"INFO: Wrote LaTeX document to {output.resolve()}", log_output)
 
+    def test_option_can_be_between_the_names(self) -> None:
+        # With Python 3.12 and later, `in.pdf --dpi 72 out.pdf` was a valid command
+        # before the command took more than one input.
+        backend = LayoutCapableBackend()
+        second = self.directory / "photo-2.png"
+        Image.new("RGB", (60, 20), "white").save(second)
+        pdf, tex = self.directory / "page.pdf", self.directory / "book.tex"
+        photo = str(self.photo)
+        commands = {
+            "searchable PDF": ([photo, "--dpi", "150", str(pdf)], [self.photo], pdf),
+            "searchable PDF with a backend option": (
+                [photo, "--backend-option", "gpu=true", str(pdf), "-l", "de", "pt"],
+                [self.photo],
+                pdf,
+            ),
+            "one input": ([photo, "--rotate", "0", str(tex)], [self.photo], tex),
+            "option after the first input": (
+                [photo, "--rotate", "0", str(second), str(tex)],
+                [self.photo, second],
+                tex,
+            ),
+            "option before the output": (
+                [photo, str(second), "--parallel-pages", "2", str(tex), "-l", "fr"],
+                [self.photo, second],
+                tex,
+            ),
+            "language codes that end before the names": (
+                ["-l", "fr", "en", "--", photo, str(second), str(tex)],
+                [self.photo, second],
+                tex,
+            ),
+        }
+        for name, (arguments, inputs, output) in commands.items():
+            with (
+                self.subTest(command=name),
+                patch("scanwich.cli.convert_pdf") as convert_pdf,
+                patch("scanwich.cli.convert_to_latex") as convert_to_latex,
+            ):
+                exit_code, log_output = self.run_main(arguments, backend)
+                self.assertEqual(exit_code, 0, log_output)
+                if output is pdf:
+                    convert_to_latex.assert_not_called()
+                    self.assertEqual(convert_pdf.call_args.args, (self.photo, pdf))
+                else:
+                    convert_pdf.assert_not_called()
+                    self.assertEqual(convert_to_latex.call_args.args, (inputs, tex))
+        self.assertEqual(self.load_backend.call_args.kwargs["languages"], ["fr", "en"])
+
+    def test_name_of_a_file_is_not_a_language_code(self) -> None:
+        # `-l` takes each word after it. Without this check, `a.pdf b.pdf -l de book.tex`
+        # writes the searchable PDF of `a.pdf` to `b.pdf`.
+        commands = [
+            [str(self.photo), "other.pdf", "-l", "de", "book.tex"],
+            [str(self.photo), "-l", "fr", "pages/page.png", "book.tex"],
+            [str(self.photo), "-l", "fr", "book.pdf"],
+        ]
+        for arguments in commands:
+            usage = io.StringIO()
+            with (
+                self.subTest(arguments=arguments[1:]),
+                patch("scanwich.cli.convert_pdf") as convert_pdf,
+                redirect_stderr(usage),
+                self.assertRaises(SystemExit) as raised,
+            ):
+                main(arguments)
+            self.assertEqual(raised.exception.code, 2)
+            self.assertIn("-l takes language codes, and '", usage.getvalue())
+            self.assertIn("put -- after the last language code", usage.getvalue())
+            convert_pdf.assert_not_called()
+
     def test_stop_of_the_user_is_not_a_traceback(self) -> None:
         output = self.directory / "page.tex"
         with patch("scanwich.cli.convert_to_latex", side_effect=KeyboardInterrupt):

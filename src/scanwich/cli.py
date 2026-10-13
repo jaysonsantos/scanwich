@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
 import sys
 from collections.abc import Sequence
 from pathlib import Path
@@ -144,7 +145,9 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
-    args = parser.parse_args(argv)
+    # An option can be between the names: `in.pdf --dpi 72 out.pdf`. The usual parse
+    # function takes the names only when they are together, because they are one argument.
+    args = parser.parse_intermixed_args(argv)
     logging.basicConfig(
         level=logging.INFO,
         format="%(levelname)s: %(page)s%(message)s",
@@ -157,6 +160,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         for name in available_backends():
             print(name)
         return 0
+    for language in args.languages:
+        # `-l` takes each word after it, so `a.pdf b.pdf -l de book.tex` has `b.pdf` as
+        # its output.
+        if "." in language or "/" in language or os.sep in language:
+            parser.error(
+                f"-l takes language codes, and {language!r} is the name of a file. Put the "
+                "names of the files before -l, or put -- after the last language code"
+            )
     if len(args.paths) < 2:
         parser.error("input and output are required unless --list-backends is used")
     *inputs, output = args.paths
