@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import base64
 import logging
+import sys
 from collections.abc import Sequence
 from enum import StrEnum
 from pathlib import Path
@@ -340,6 +341,13 @@ def main() -> None:
     parser.add_argument("--host")
     parser.add_argument("--port", type=int)
     args = parser.parse_args()
+    # Uvicorn configures only its own loggers. Without this handler, Python drops the progress
+    # records and the cost records, because their level is INFO.
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(levelname)s: %(message)s",
+        stream=sys.stderr,
+    )
     config = ApiConfig(**{key: value for key, value in vars(args).items() if value is not None})
     uvicorn.run(create_app(config), host=config.host, port=config.port)
 

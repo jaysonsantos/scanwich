@@ -2,6 +2,7 @@ import asyncio
 import base64
 import io
 import json
+import logging
 import os
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -24,6 +25,7 @@ from scanwich.api import (
     ApiConfig,
     BackendConfig,
     create_app,
+    main,
 )
 from scanwich.backends.openai_compatible import OpenAICompatibleBackend
 from scanwich.models import OcrRegion, Point
@@ -566,6 +568,71 @@ class TestApi(TestCase):
                 self.assertIn(encoded_page, request.content.decode())
                 for private in (api_key, encoded_page, ocr_text):
                     self.assertNotIn(private, record)
+
+    def post_pdf(self, provider_body: dict, *, pages: int, output: str):
+        """Return the response, the provider requests, and the cost records for one PDF."""
+        provider_requests: list[httpx.Request] = []
+        backend = OpenAICompatibleBackend(languages=["en"], options={"model": "provider/model"})
+        with (
+            patch("scanwich.api.load_backend", return_value=backend),
+            patch.dict(os.environ, {"OPENROUTER_API_KEY": "sk-private-key"}),
+            patch("openai.AsyncOpenAI", provider_client(200, provider_body, provider_requests)),
+            TestClient(create_app()) as api,
+            self.assertLogs("scanwich", level="INFO") as logs,
+        ):
+            response = api.post(
+                "/ocr/openai-compatible",
+                data={"output": output},
+                files={"file": ("scan.pdf", pdf_bytes(pages))},
+            )
+        cost_records = [record for record in logs.output if "usage.cost" in record]
+        return response, provider_requests, cost_records
+
+    def test_one_document_is_one_provider_session_with_a_logged_cost(self):
+        content = json.dumps({"coordinate_system": "normalized", "regions": []})
+        choice = {"finish_reason": "stop", "message": {"content": content}}
+        usage = {"prompt_tokens": 1200, "completion_tokens": 300, "total_tokens": 1500}
+        body = {"choices": [choice], "usage": {**usage, "cost": 0.0015}}
+
+        session_ids = []
+        for _ in range(2):
+            response, provider_requests, cost_records = self.post_pdf(
+                body, pages=2, output="pdf+text"
+            )
+            self.assertEqual(response.status_code, 200, response.text)
+            # Each page has one request for the polygons and one request for the plain text.
+            self.assertEqual(len(provider_requests), 4)
+            (session_id,) = {request.headers["x-session-id"] for request in provider_requests}
+            session_ids.append(session_id)
+            self.assertEqual(len(cost_records), 4)
+            for record in cost_records:
+                self.assertIn(f"session {session_id}, model provider/model: ", record)
+                self.assertNotIn("sk-private-key", record)
+            self.assertIn(
+                "usage.cost=0.001500 for this request, total 0.006000 for 4 request(s)",
+                cost_records[-1],
+            )
+        self.assertNotEqual(*session_ids)
+
+    def test_cost_of_an_unusable_reply_is_logged(self):
+        choice = {"finish_reason": "length", "message": {"content": "{"}}
+        body = {"choices": [choice], "usage": {"cost": 0.02}}
+
+        response, _, cost_records = self.post_pdf(body, pages=1, output="pdf")
+
+        self.assertEqual(response.status_code, 502)
+        (record,) = cost_records
+        self.assertIn("usage.cost=0.020000 for this request, total 0.020000", record)
+
+    def test_entry_point_shows_info_records(self):
+        with (
+            patch("sys.argv", ["scanwich-api", "--port", "8123"]),
+            patch("uvicorn.run") as run,
+            patch("logging.basicConfig") as configure,
+        ):
+            main()
+        self.assertEqual(configure.call_args.kwargs["level"], logging.INFO)
+        self.assertEqual(run.call_args.kwargs, {"host": "127.0.0.1", "port": 8123})
 
 
 class TestAsyncBackend(IsolatedAsyncioTestCase):

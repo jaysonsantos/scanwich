@@ -7,6 +7,7 @@ import logging
 import math
 import os
 import time
+import uuid
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
@@ -43,6 +44,8 @@ PROVIDER_ERROR_METADATA_FIELDS = ("error_type", "provider_name", "provider_code"
 REQUEST_OPTIONS = frozenset({"model"})
 HTTP_REFERER = "https://github.com/jaysonsantos/scanwich"
 APP_TITLE = "Scanwich"
+# OpenRouter groups the requests that have the same value of this header.
+SESSION_ID_HEADER = "X-Session-Id"
 
 logger = logging.getLogger(__name__)
 
@@ -83,6 +86,10 @@ class OpenAICompatibleBackend:
             raise TypeError(f"unsupported OpenAI-compatible backend option(s): {unsupported}")
         self._client: Any | None = None
         self._async_client: Any | None = None
+        # One backend instance recognizes the pages of one document, so it is one session.
+        self._session_id = str(uuid.uuid4())
+        self._session_cost = 0.0
+        self._session_requests_with_cost = 0
 
     def recognize(self, image_path: Path) -> list[OcrRegion]:
         width, height, image_data_url = _encode_image(image_path)
@@ -99,6 +106,7 @@ class OpenAICompatibleBackend:
         logger.info(
             "OpenAI-compatible response received after %.1f seconds", time.monotonic() - started_at
         )
+        self._log_cost(completion)
         return self._parse_completion(completion, width, height)
 
     async def recognize_async(self, image_path: Path) -> list[OcrRegion]:
@@ -112,6 +120,7 @@ class OpenAICompatibleBackend:
             raise RuntimeError(
                 f"OpenAI-compatible request failed for model {self._model}"
             ) from error
+        self._log_cost(completion)
         return self._parse_completion(completion, width, height)
 
     async def aclose(self) -> None:
@@ -130,6 +139,7 @@ class OpenAICompatibleBackend:
             raise RuntimeError(
                 f"OpenAI-compatible request failed for model {self._model}"
             ) from error
+        self._log_cost(completion)
         return self._completion_content(completion, allow_empty=True)
 
     def _request(
@@ -201,6 +211,25 @@ class OpenAICompatibleBackend:
             )
         return content
 
+    def _log_cost(self, completion: Any) -> None:
+        """Log the cost that the service reports for one request, and the session total."""
+        cost = getattr(getattr(completion, "usage", None), "cost", None)
+        if isinstance(cost, bool) or not isinstance(cost, (int, float)):
+            return
+        if not math.isfinite(cost) or cost < 0:
+            return
+        self._session_cost += cost
+        self._session_requests_with_cost += 1
+        logger.info(
+            "OpenAI-compatible session %s, model %s: usage.cost=%.6f for this request, "
+            "total %.6f for %d request(s)",
+            self._session_id,
+            self._model,
+            cost,
+            self._session_cost,
+            self._session_requests_with_cost,
+        )
+
     def _get_client(self, *, asynchronous: bool = False) -> Any:
         cached = self._async_client if asynchronous else self._client
         if cached is not None:
@@ -231,6 +260,7 @@ class OpenAICompatibleBackend:
             client_options["default_headers"] = {
                 "HTTP-Referer": HTTP_REFERER,
                 "X-Title": APP_TITLE,
+                SESSION_ID_HEADER: self._session_id,
             }
         client = Client(**client_options)
         if asynchronous:
