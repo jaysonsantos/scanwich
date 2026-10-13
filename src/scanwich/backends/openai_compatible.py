@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import functools
 import io
 import json
 import logging
@@ -27,7 +28,7 @@ from scanwich.layout import (
     plain_text,
 )
 from scanwich.models import OcrRegion, Point
-from scanwich.ocr import RateLimitError
+from scanwich.ocr import NoReplyError, RateLimitError
 
 DEFAULT_MODEL = "deepseek/deepseek-v4-flash-vision-exp"
 DEFAULT_MODEL_ALIASES = {
@@ -316,16 +317,27 @@ class OpenAICompatibleBackend:
         parse: Callable[[str], Result],
         *,
         max_attempts: int | None = None,
+        attempt: int = 1,
     ) -> Result:
         """Send a request with the async client, as `_complete` does.
 
-        A service that answers that it gets too many requests gives `RateLimitError`,
-        so that the caller can make all its requests wait.
+        The errors tell the caller if the service gave a reply:
+
+        - A request that fails gives `NoReplyError`. The cause is then the service or
+          the key, and not the page.
+        - A service that answers that it gets too many requests gives `RateLimitError`,
+          so that the caller can make all its requests wait. Its `resume` sends the
+          refused request again, with `attempt` as its number. Thus the replies before
+          the refusal count for the limit of the attempts.
+        - A reply that the backend cannot use gives an error of a different type.
         """
         model = request["model"]
-        client = self._get_client(asynchronous=True, model=model)
+        try:
+            client = self._get_client(asynchronous=True, model=model)
+        except RuntimeError as error:
+            # No key, or no client package: no request of the conversion can go.
+            raise NoReplyError(str(error)) from error
         limit = self._max_attempts if max_attempts is None else max_attempts
-        attempt = 1
         while True:
             logger.info("Sending page image to OpenAI-compatible model %s", model)
             started_at = time.monotonic()
@@ -337,10 +349,18 @@ class OpenAICompatibleBackend:
                         f"OpenAI-compatible request failed for model {model}: the service "
                         f"gets too many requests (HTTP status {RATE_LIMIT_STATUS})",
                         retry_after=_retry_after_seconds(error),
+                        resume=functools.partial(
+                            self._complete_async,
+                            request,
+                            parse,
+                            max_attempts=max_attempts,
+                            attempt=attempt,
+                        ),
                     ) from error
                 if attempt > 1:
-                    raise self._correction_request_error(error, attempt, model, limit) from None
-                raise RuntimeError(
+                    correction_error = self._correction_request_error(error, attempt, model, limit)
+                    raise NoReplyError(str(correction_error)) from None
+                raise NoReplyError(
                     f"OpenAI-compatible request failed for model {model}: {error}"
                 ) from error
             logger.info(
@@ -348,6 +368,12 @@ class OpenAICompatibleBackend:
                 time.monotonic() - started_at,
             )
             self._log_usage(completion, model)
+            if not getattr(completion, "choices", None):
+                # A provider behind the service failed. The service gave no reply of a model.
+                try:
+                    self._completion_content(completion, provider_text=attempt == 1)
+                except RuntimeError as error:
+                    raise NoReplyError(str(error)) from None
             content = self._completion_content(completion, provider_text=attempt == 1)
             try:
                 result = parse(content)

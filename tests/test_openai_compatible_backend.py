@@ -49,6 +49,7 @@ from scanwich.ocr import (
     FigureLocator,
     LayoutBackend,
     LayoutSettings,
+    NoReplyError,
     OcrBackend,
     RateLimitError,
 )
@@ -1775,12 +1776,118 @@ class AsyncRequestTests(TestCase):
         with self.assertRaises(RuntimeError) as raised:
             self.run_async(completions, "recognize_layout_async")
         self.assertNotIsInstance(raised.exception, RateLimitError)
+        # The service gave no reply. The caller counts such pages.
+        self.assertIsInstance(raised.exception, NoReplyError)
         self.assertEqual(
             str(raised.exception),
             f"OpenAI-compatible request failed for model {DEFAULT_LAYOUT_MODEL}: the text of "
             "the provider",
         )
         self.assertEqual(len(completions.calls), 1)
+
+    def test_error_tells_if_the_service_gave_a_reply(self) -> None:
+        # A page that got a reply does not count for the rule that stops a conversion
+        # when the service gives no reply.
+        no_choices = SimpleNamespace(choices=None, error={"message": "the provider is down"})
+        too_long = SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    finish_reason="length",
+                    native_finish_reason=None,
+                    message=SimpleNamespace(content="{"),
+                )
+            ]
+        )
+
+        class Replies(FakeAsyncCompletions):
+            def __init__(self, reply: object) -> None:
+                super().__init__("")
+                self.reply = reply
+
+            async def create(self, **request: Any) -> Any:
+                self.calls.append(request)
+                if isinstance(self.reply, Exception):
+                    raise self.reply
+                return self.reply
+
+        cases = {
+            "no connection": (ConnectionError("no route"), True),
+            "an HTTP error": (self.service_error(500, {}), True),
+            "no choices in the completion": (no_choices, True),
+            "a completion that stops at the token limit": (too_long, False),
+        }
+        for name, (reply, no_reply) in cases.items():
+            with self.subTest(case=name), self.assertRaises(RuntimeError) as raised:
+                self.run_async(Replies(reply), "recognize_layout_async")
+            self.assertEqual(isinstance(raised.exception, NoReplyError), no_reply)
+        with (
+            self.assertLogs(LOGGER_NAME, level="WARNING"),
+            self.assertRaises(RuntimeError) as raised,
+        ):
+            self.run_async(FakeAsyncCompletions("not JSON"), "recognize_layout_async")
+        self.assertNotIsInstance(raised.exception, NoReplyError)
+
+    def test_request_with_no_key_gives_no_reply(self) -> None:
+        backend = OpenAICompatibleBackend(languages=["en"], options={})
+        with (
+            patch.dict(os.environ, clear=True),
+            self.assertRaisesRegex(NoReplyError, "requires OPENROUTER_API_KEY to be set"),
+        ):
+            asyncio.run(backend.recognize_layout_async(self.image_path))
+
+    def test_refused_request_goes_again_with_the_replies_before_it(self) -> None:
+        # The replies before a refusal have a cost. They count for the limit of 3
+        # requests, so the request after the refusal is the same correction request.
+        refusal = self.service_error(429, {})
+        completions = FakeAsyncCompletions("not JSON", "not JSON", refusal, "not JSON")
+        backend = OpenAICompatibleBackend(languages=["en"], options={})
+        client = SimpleNamespace(chat=SimpleNamespace(completions=completions))
+
+        async def read() -> None:
+            with self.assertRaises(RateLimitError) as raised:
+                await backend.recognize_layout_async(self.image_path, upright=True)
+            self.assertEqual(len(completions.calls), 3)
+            assert raised.exception.resume is not None
+            # The third request fails again, with a reply that has a cost.
+            await raised.exception.resume()
+
+        with (
+            patch.dict(os.environ, {"OPENROUTER_API_KEY": "test-secret"}),
+            patch.dict(sys.modules, {"openai": SimpleNamespace(AsyncOpenAI=lambda **_: client)}),
+            self.assertLogs(LOGGER_NAME, level="WARNING") as captured_logs,
+            self.assertRaisesRegex(RuntimeError, "returned invalid JSON"),
+        ):
+            asyncio.run(read())
+
+        # 4 requests: 3 replies with a cost, and the refusal.
+        self.assertEqual(len(completions.calls), 4)
+        self.assertEqual(completions.calls[3], completions.calls[2])
+        # A correction request has the reply before it and the defect.
+        self.assertEqual([len(call["messages"]) for call in completions.calls], [2, 4, 6, 6])
+        self.assertIn("returned an unusable reply in attempt 3 of 3", captured_logs.output[-1])
+
+    def test_refused_request_with_a_good_reply_after_it(self) -> None:
+        completions = FakeAsyncCompletions(
+            "not JSON", self.service_error(429, {}), self.LAYOUT_REPLY
+        )
+        backend = OpenAICompatibleBackend(languages=["en"], options={})
+        client = SimpleNamespace(chat=SimpleNamespace(completions=completions))
+
+        async def read() -> PageLayout:
+            try:
+                return await backend.recognize_layout_async(self.image_path)
+            except RateLimitError as error:
+                assert error.resume is not None
+                return await error.resume()
+
+        with (
+            patch.dict(os.environ, {"OPENROUTER_API_KEY": "test-secret"}),
+            patch.dict(sys.modules, {"openai": SimpleNamespace(AsyncOpenAI=lambda **_: client)}),
+            self.assertLogs(LOGGER_NAME, level="WARNING"),
+        ):
+            layout = asyncio.run(read())
+        self.assertEqual(layout, PageLayout(blocks=(Paragraph("Text of the page."),)))
+        self.assertEqual(len(completions.calls), 3)
 
     def test_error_of_a_correction_request_has_no_text_of_the_provider(self) -> None:
         completions = FakeAsyncCompletions("not JSON", self.service_error(503, {}))

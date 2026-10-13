@@ -1050,6 +1050,36 @@ class RateLimitTests(BookTestCase):
         )
         self.assertIn(text_of(2), self.document())
 
+    def test_provider_continues_a_call_that_had_replies_before_the_refusal(self) -> None:
+        # A new call of the method starts again at its first request, and each request
+        # before the refusal had a reply with a cost.
+        class ResumingBackend(AsyncPageBackend):
+            resumed = 0
+
+            async def recognize_layout_async(
+                self, image_path: Path, *, upright: bool = False
+            ) -> PageLayout:
+                self.requests.append(1)
+                raise RateLimitError("too many requests", resume=self.resume)
+
+            async def resume(self) -> PageLayout:
+                self.resumed += 1
+                if self.resumed == 1:
+                    raise RateLimitError("too many requests again", resume=self.resume)
+                return PageLayout(blocks=(Paragraph("The reply after the refusal."),))
+
+        backend = ResumingBackend()
+        with (
+            patch("scanwich.pipeline.RATE_LIMIT_WAITS", (0.01, 0.01, 0.01)),
+            self.assertLogs(LOGGER_NAME, level="WARNING") as captured_logs,
+        ):
+            self.convert(self.photos(1), backend)
+
+        self.assertEqual(backend.requests, [1])
+        self.assertEqual(backend.resumed, 2)
+        self.assertEqual(len(captured_logs.output), 2)
+        self.assertIn("The reply after the refusal.", self.document())
+
     def test_all_pages_wait(self) -> None:
         wait = 0.2
         # The service refuses page 1 at once. Page 2 is then in work, and page 3 is not.

@@ -500,6 +500,10 @@ class _BackendCalls:
                     "their next request, and then this request goes again",
                     wait,
                 )
+                if error.resume is not None:
+                    # The call had replies before the refusal. The provider continues it,
+                    # so that those replies count for its limit of requests.
+                    call = error.resume
 
 
 class _Conversion:

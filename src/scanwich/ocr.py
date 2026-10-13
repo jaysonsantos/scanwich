@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
 from importlib.metadata import EntryPoint, entry_points
 from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
@@ -103,17 +103,42 @@ class LayoutSettings(Protocol):
         """
 
 
-class RateLimitError(RuntimeError):
+class NoReplyError(RuntimeError):
+    """The service gave no reply to a request.
+
+    A provider raises this error from a layout request or a figure request when the
+    request failed and the page is not the cause. Examples are a connection that fails,
+    a timeout, an HTTP error status, and a key that is not there. A document writer
+    starts no more pages when some pages in sequence fail with this error.
+
+    A reply that the provider cannot use is a different case: the service works, and
+    the page is the cause. The provider then raises an error of a different type.
+    """
+
+
+class RateLimitError(NoReplyError):
     """The service answers that it gets too many requests.
 
     A provider raises this error from a layout request or a figure request. A document
     writer then makes all its requests wait, and sends the request again. `retry_after`
     is the wait in seconds that the service asks for, when the provider knows it.
+
+    `resume` sends the refused request again and completes the call that raised the
+    error. A provider gives it when the call had replies before the refusal, so that
+    the writer does not start the call again from its first request. Without it, the
+    writer calls the method of the provider again.
     """
 
-    def __init__(self, message: str, *, retry_after: float | None = None) -> None:
+    def __init__(
+        self,
+        message: str,
+        *,
+        retry_after: float | None = None,
+        resume: Callable[[], Awaitable[Any]] | None = None,
+    ) -> None:
         super().__init__(message)
         self.retry_after = retry_after
+        self.resume = resume
 
 
 class OcrBackendFactory(Protocol):
