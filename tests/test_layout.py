@@ -390,6 +390,54 @@ class PageLayoutJsonTests(TestCase):
             with self.subTest(raw_block=raw_block):
                 self.assertEqual(blocks_of(raw_block), (block,))
 
+    def test_reads_the_place_of_a_running_head_and_a_page_number(self) -> None:
+        cases = [
+            ("top-right", "top-right"),
+            ("Top Right", "top-right"),
+            ("right_top", "top-right"),
+            ("bottom, centre", "bottom-center"),
+            ("top/middle", "top-center"),
+            ("bottom-left", "bottom-left"),
+            (None, None),
+            ("", None),
+        ]
+        for value, position in cases:
+            with self.subTest(value=value):
+                block = {"type": "page_number", "text": "23", "position": value}
+                self.assertEqual(blocks_of(block), (PageFurniture("page_number", "23", position),))
+        furniture = PageFurniture("page_header", "A head", "top-center")
+        self.assertEqual(
+            furniture.to_json(), {"type": "page_header", "text": "A head", "position": "top-center"}
+        )
+        self.assertEqual(blocks_of(furniture.to_json()), (furniture,))
+        # A block without a place has no field for it.
+        self.assertEqual(
+            PageFurniture("page_footer", "A foot").to_json(),
+            {"type": "page_footer", "text": "A foot"},
+        )
+        message = (
+            "block 1 (page_number) position must be one of: top-left, top-center, top-right, "
+            "bottom-left, bottom-center, bottom-right"
+        )
+        for value in ("right", "top", "top-right-left", "at the outer corner", "upper right"):
+            self.assert_rejects(
+                {"blocks": [{"type": "page_number", "text": "23", "position": value}]}, message
+            )
+
+    def test_reads_the_double_rule_of_a_table(self) -> None:
+        table = Table(rows=((TableCell("a"),),), rules="columns", double_rule=True)
+        raw_table = {"type": "table", "rules": "columns", "double_rule": True, "rows": [["a"]]}
+        self.assertEqual(blocks_of(raw_table), (table,))
+        self.assertIs(table.to_json()["double_rule"], True)
+        self.assertEqual(blocks_of(table.to_json()), (table,))
+        self.assertEqual(blocks_of({**raw_table, "double_rule": "true"}), (table,))
+        # A table without double rules has no field for them.
+        self.assertNotIn("double_rule", Table(rows=((TableCell("a"),),)).to_json())
+        self.assert_rejects(
+            {"blocks": [{**raw_table, "double_rule": "above and below"}]},
+            "block 1 (table) double_rule must be true or false",
+        )
+
     def test_rejects_text_in_a_field_that_it_reads_but_cannot_keep(self) -> None:
         # A model can put content of the page in a field that has a different purpose.
         # The text must not disappear, and it must not become a default value.
@@ -729,14 +777,14 @@ class PageLayoutJsonTests(TestCase):
                 {"blocks": [{"type": "table", "rows": [["a"]], "footnotes": ["* note"]}]},
                 (
                     f"block 1 (table) {other_text} type, caption, header_rows, columns, rules, "
-                    "rows, header"
+                    "double_rule, rows, header"
                 ),
             ),
             (
                 {"blocks": [{"type": "table", "text": "| a | b |", "rows": []}]},
                 (
                     f"block 1 (table) {other_text} type, caption, header_rows, columns, rules, "
-                    "rows, header"
+                    "double_rule, rows, header"
                 ),
             ),
             (

@@ -1,5 +1,10 @@
 """Write page layouts as one LaTeX document.
 
+The document has one page for each page of the source, so a reader can compare the two
+page by page. The content of a source page is in a box, and a box that is too high for
+the page becomes smaller. With `flow`, the text flows as in a usual LaTeX document, and
+the pages of the document are not those of the source.
+
 The writer makes all the LaTeX. The text of a layout is data: the writer escapes each
 character, so the text cannot add a command. The writer also leaves out what stops
 LuaLaTeX, XeLaTeX, and Tectonic, for example a line break that has no line to end.
@@ -9,11 +14,12 @@ that are installed. pdfLaTeX stops at a character that it does not know.
 
 from __future__ import annotations
 
+import itertools
 import re
 import textwrap
 import unicodedata
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from scanwich.layout import (
     ALIGN_CENTER,
@@ -59,7 +65,6 @@ STYLE_COMMANDS = (
     (STYLE_UNDERLINE, "underline"),
     (STYLE_BOLD, "textbf"),
     (STYLE_ITALIC, "textit"),
-    (STYLE_SMALL_CAPS, "textsc"),
 )
 ALIGNMENT_ENVIRONMENTS = {ALIGN_CENTER: "center", ALIGN_RIGHT: "flushright"}
 ALIGNMENT_DECLARATIONS = {
@@ -271,6 +276,16 @@ DIVIDED_WORD = re.compile(r"\w-$")
 DIVIDED_WORD_COMMENT = (
     "% Scanwich joined the word that the page break divides. Compare it with the source."
 )
+# In a document that keeps the pages of the source, the complete word is on the first of
+# the two pages. A search then finds the word, and a copy of the text has it in one piece.
+MOVED_WORD_COMMENT = (
+    "% The page boundary of the source divides the last word of this paragraph. The\n"
+    "% complete word is here, and the next page starts after it. Compare it with the source."
+)
+# The first part of a paragraph: the text before its first space.
+FIRST_WORD = re.compile(r"(\S+)\s*(.*)", re.DOTALL)
+# A tag or a character entity of the inline markup.
+MARKUP_CHARACTERS = frozenset("<>&")
 
 MIN_FIGURE_WIDTH = 0.15
 # An illustration is not higher than this part of the text area, so it fits on one page
@@ -289,8 +304,10 @@ WIDEST_CHARACTER_EM = 1.0
 CAPITAL_LETTER_EM = 0.75
 DIGIT_EM = 0.5
 OTHER_CHARACTER_EM = 0.53
-# The width of the line of the document class.
+# The width of the line of the document class, which a document with `flow` has, and the
+# width of the line of a document that keeps the pages of the source.
 LINE_EM = 32.0
+PAGED_LINE_EM = 38.0
 # The space that LaTeX puts at the two sides of the text of a cell, and the smaller space
 # of a table that does not fit in the line without it.
 COLUMN_PADDING_EM = 1.1
@@ -300,6 +317,7 @@ COMPACT_COLUMN_PADDING = "\\setlength{\\tabcolsep}{3pt}"
 MIN_CELL_EM = 1.0
 MAX_CELL_EM = 15.0
 CELL_LINE_BREAK = re.compile(r"<br\s*/?>", re.IGNORECASE)
+FOOTNOTE_REFERENCE = re.compile(r"<fn>(.*?)</fn>", re.IGNORECASE | re.DOTALL)
 # A table with more columns than this gets columns as wide as their text. Its cells
 # do not wrap.
 MAX_WRAPPED_COLUMNS = 12
@@ -308,6 +326,8 @@ MAX_COLUMN_SPAN = 40
 CONTEXT_TEXT = "text"
 CONTEXT_CELL = "cell"
 CONTEXT_CAPTION = "caption"
+# The line at the top or at the bottom of a page: a running head or a page number.
+CONTEXT_PAGE_LINE = "page line"
 # LaTeX loses or moves a footnote that starts in a table or in the box of a caption. Thus
 # the text of these parts keeps the reference marks of the source.
 MARK_CONTEXTS = frozenset({CONTEXT_CELL, CONTEXT_CAPTION})
@@ -316,6 +336,8 @@ LINE_BREAKS = {
     CONTEXT_CAPTION: "\\\\",
     # In a table cell, `\\` ends the row.
     CONTEXT_CELL: "\\newline{}",
+    # The line has one row.
+    CONTEXT_PAGE_LINE: "\\quad{}",
 }
 
 PREAMBLE_START = """\
@@ -339,6 +361,64 @@ PREAMBLE_START = """\
 TABLE_PACKAGES = """\
 \\usepackage{array}
 \\usepackage{longtable}
+"""
+# The layout that keeps the pages of the source. A4 paper has a text area of 420pt by
+# 672pt, which holds more than the text area of the document class.
+PAGED_LAYOUT = """\
+% One page of the source is one page of this document. The content of a source page is in
+% a box. When the box is higher than the text area, the page shows it at a smaller size,
+% and the engine writes a warning that has the number of the source page.
+\\setlength{\\textwidth}{420pt}
+\\setlength{\\textheight}{672pt}
+\\setlength{\\oddsidemargin}{\\dimexpr(\\paperwidth-\\textwidth)/2-1in\\relax}
+\\setlength{\\evensidemargin}{\\oddsidemargin}
+\\setlength{\\topmargin}{\\dimexpr(\\paperheight-\\textheight)/2-1in-\\headheight-\\headsep\\relax}
+\\newsavebox{\\sourcepagebox}
+\\newlength{\\sourceparindent}
+\\setlength{\\sourceparindent}{\\parindent}
+% The running head, the running foot, and the page number of a source page. Each command
+% has the text at the left, at the center, and at the right of its line.
+\\newcommand{\\sourcehead}{}
+\\newcommand{\\sourcefoot}{}
+\\newcommand{\\sourcepagehead}[3]{\\gdef\\sourcehead{\\rlap{#1}\\hfil#2\\hfil\\llap{#3}}}
+\\newcommand{\\sourcepagefoot}[3]{\\gdef\\sourcefoot{\\rlap{#1}\\hfil#2\\hfil\\llap{#3}}}
+\\makeatletter
+\\newcommand{\\ps@sourcepage}{%
+  \\renewcommand{\\@oddhead}{\\sourcehead}\\renewcommand{\\@evenhead}{\\sourcehead}%
+  \\renewcommand{\\@oddfoot}{\\sourcefoot}\\renewcommand{\\@evenfoot}{\\sourcefoot}}
+\\makeatother
+\\pagestyle{sourcepage}
+\\newenvironment{sourcepage}[1]{%
+  \\gdef\\sourcepagenumber{#1}%
+  \\begin{lrbox}{\\sourcepagebox}%
+  \\begin{minipage}[b]{\\textwidth}%
+  \\setlength{\\parindent}{\\sourceparindent}%
+}{%
+  \\end{minipage}%
+  \\end{lrbox}%
+  \\noindent
+  \\ifdim\\dimexpr\\ht\\sourcepagebox+\\dp\\sourcepagebox\\relax>\\textheight
+    \\PackageWarningNoLine{scanwich}{Source page \\sourcepagenumber\\space is at
+      \\the\\numexpr\\dimexpr\\textheight\\relax*100/\\dimexpr\\ht\\sourcepagebox+\\dp\\sourcepagebox\\relax\\relax
+      \\space percent of its size: its content is too high for one page}%
+    \\makebox[\\textwidth][c]{\\resizebox*{!}{\\textheight}{\\usebox{\\sourcepagebox}}}%
+  \\else
+    \\usebox{\\sourcepagebox}%
+  \\fi
+  \\clearpage
+  \\gdef\\sourcehead{}\\gdef\\sourcefoot{}%
+}
+"""
+SMALL_CAPS_COMMAND = """\
+% Small capitals are capital letters at a smaller size. Thus the document does not print a
+% lowercase letter where the source prints a capital form: not in bold or italic text, and
+% not with a font that has no small capitals. The text of the PDF has the capital letters.
+% For the small capitals of the font, use this definition:
+% \\renewcommand{\\sourcesmallcaps}[1]{\\textsc{\\MakeLowercase{#1}}}
+\\makeatletter
+\\DeclareRobustCommand{\\sourcesmallcaps}[1]{{%
+  \\fontsize{\\dimexpr 0.8\\dimexpr\\f@size pt\\relax\\relax}{\\f@baselineskip}\\selectfont #1}}
+\\makeatother
 """
 SYMBOL_COMMAND = """\
 % The text font does not have some characters, for example a prime mark. With LuaLaTeX,
@@ -372,11 +452,22 @@ SOURCE_FOOTNOTE_COMMAND = """\
 \\newcommand{\\sourcefootnotetext}[2]{%
   \\begingroup\\renewcommand{\\thefootnote}{#1}\\footnotetext{#2}\\endgroup}
 """
+# In the box of a source page, LaTeX takes the mark of a footnote from `\thempfn`.
+PAGED_FOOTNOTE_COMMAND = """\
+% A footnote keeps the reference mark of the source. Its text is below the content of its
+% source page.
+\\newcommand{\\sourcefootnotetext}[2]{%
+  \\begingroup\\renewcommand{\\thempfn}{#1}\\footnotetext{#2}\\endgroup}
+"""
 
 
-def render_latex(pages: Sequence[PageLayout]) -> str:
-    """Return one LaTeX document that has the blocks of all pages in sequence."""
-    writer = _DocumentWriter()
+def render_latex(pages: Sequence[PageLayout], *, flow: bool = False) -> str:
+    """Return one LaTeX document that has the blocks of all pages in sequence.
+
+    Each source page is one page of the document. With `flow`, the text flows: a paragraph
+    continues across a page boundary of the source, and the document has its own pages.
+    """
+    writer = _DocumentWriter(flow=flow)
     for page_number, page in enumerate(pages, start=1):
         writer.add_page(page_number, page)
     return writer.document()
@@ -403,6 +494,43 @@ def escape_text(text: str) -> str:
         elif unicodedata.category(character) not in REMOVED_CATEGORIES:
             result.append(character)
     return "".join(result)
+
+
+def _small_caps(text: str) -> str:
+    """Return the LaTeX that prints a text in small capitals.
+
+    The text has the small capitals as capital letters, as the page prints them. A text
+    that also has lowercase letters uses those for the small capitals, and its capital
+    letters are then large capitals. The LaTeX has capital letters in the two cases, so a
+    lowercase letter does not replace a capital form of the source. Digits and punctuation
+    keep their size.
+    """
+
+    def is_letter(character: str) -> bool:
+        # A character that the writer prints with other LaTeX, for example a Greek letter
+        # that is a symbol, keeps that LaTeX.
+        return character.isalpha() and character not in ESCAPES and character not in GREEK_SYMBOLS
+
+    lowercase_is_small = any(character.islower() for character in text if is_letter(character))
+
+    def is_small(character: str) -> bool:
+        if not is_letter(character):
+            return False
+        return character.islower() if lowercase_is_small else character.isupper()
+
+    # The parts of the text, in sequence: letters in small capitals, and other text.
+    parts: list[tuple[bool, str]] = []
+    for small, characters in itertools.groupby(text, key=is_small):
+        part = "".join(characters)
+        if small and len(parts) >= 2 and parts[-2][0] and not parts[-1][1].strip(" "):
+            # A space between two words in small capitals is a part of them.
+            parts[-2:] = [(True, parts[-2][1] + parts[-1][1] + part)]
+        else:
+            parts.append((small, part))
+    return "".join(
+        f"\\sourcesmallcaps{{{escape_text(part.upper())}}}" if small else escape_text(part)
+        for small, part in parts
+    )
 
 
 def _prints(text: str) -> bool:
@@ -451,7 +579,8 @@ class _PlacedCell:
 
 
 class _DocumentWriter:
-    def __init__(self) -> None:
+    def __init__(self, *, flow: bool = False) -> None:
+        self._flow = flow
         self._chunks: list[str] = []
         self._has_figures = False
         self._has_tables = False
@@ -464,20 +593,25 @@ class _DocumentWriter:
 
     def document(self) -> str:
         preamble = [PREAMBLE_START]
-        if self._has_figures:
+        # The box of a source page needs the package to become smaller.
+        if self._has_figures or not self._flow:
             preamble.append("\\usepackage{graphicx}\n")
         if self._has_tables:
-            preamble.append(TABLE_PACKAGES)
+            preamble.append(TABLE_PACKAGES if self._flow else "\\usepackage{array}\n")
         if self._has_row_spans:
             preamble.append(MULTIROW_PACKAGE)
         # The headings of the source have their own numbers.
         preamble.append("\\setcounter{secnumdepth}{0}\n")
+        if not self._flow:
+            preamble.append(PAGED_LAYOUT)
         if self._has_source_footnotes:
-            preamble.append(SOURCE_FOOTNOTE_COMMAND)
+            preamble.append(SOURCE_FOOTNOTE_COMMAND if self._flow else PAGED_FOOTNOTE_COMMAND)
         chunks = list(self._chunks)
         if all(line.startswith("%") for chunk in chunks for line in chunk.split("\n")):
             chunks.append(NO_CONTENT)
         body = "\n\n".join(chunks)
+        if "\\sourcesmallcaps{" in body:
+            preamble.append(SMALL_CAPS_COMMAND)
         if "\\sourcesymbol{" in body:
             preamble.append(SYMBOL_COMMAND)
         return "".join(preamble) + "\n\\begin{document}\n\n" + body + "\n\n\\end{document}\n"
@@ -491,18 +625,85 @@ class _DocumentWriter:
             None,
         )
         first = None if first_index is None else blocks[first_index]
-        if (
+        continues = (
             isinstance(first, Paragraph)
             and first.continued
             and first.align is None
             and self._open_paragraph is not None
-        ):
+        )
+        if not self._flow:
+            if continues:
+                blocks[first_index] = self._complete_divided_word(first)
+            self._open_paragraph = None
+            # The first comment line has the number of the source page. The lines of the
+            # page print its running head and its page number.
+            start = [comment[0], *self._page_lines(page), f"\\begin{{sourcepage}}{{{page_number}}}"]
+            self._chunks.append("\n".join(start))
+            for block in blocks:
+                self._add_block(block, page, footnotes)
+            self._chunks.append("\\end{sourcepage}")
+            return
+        if continues:
             del blocks[first_index]
             self._continue_paragraph(first, comment, footnotes)
         else:
             self._chunks.append("\n".join(comment))
         for block in blocks:
             self._add_block(block, page, footnotes)
+
+    def _page_lines(self, page: PageLayout) -> list[str]:
+        """Return the commands for the running head, the running foot, and the page number.
+
+        A block without a place gets the usual place of its type. A page number without
+        a place is at the top right when it comes before the content of the page.
+        """
+        texts: dict[str, dict[str, list[str]]] = {
+            edge: {side: [] for side in ("left", "center", "right")} for edge in ("top", "bottom")
+        }
+        before_content = True
+        for block in page.blocks:
+            if not isinstance(block, PageFurniture):
+                before_content = False
+                continue
+            if block.position is not None:
+                edge, side = block.position.split("-")
+            elif block.kind == PAGE_NUMBER:
+                edge, side = ("top", "right") if before_content else ("bottom", "center")
+            else:
+                edge, side = ("top" if block.kind == PAGE_HEADER else "bottom"), "center"
+            text = self._inline(block.text, None, CONTEXT_PAGE_LINE)
+            if text:
+                texts[edge][side].append(text)
+        lines = []
+        for edge, command in (("top", "sourcepagehead"), ("bottom", "sourcepagefoot")):
+            parts = ["\\quad{}".join(texts[edge][side]) for side in ("left", "center", "right")]
+            if any(parts):
+                lines.append(f"\\{command}" + "".join(f"{{{part}}}" for part in parts))
+        return lines
+
+    def _complete_divided_word(self, block: Paragraph) -> Paragraph:
+        """Move the end of a word that the page boundary divides to the page before.
+
+        The document keeps the pages of the source, so the paragraph stays in two parts.
+        Only the divided word changes: the complete word is on the first page. The function
+        returns the paragraph without the part that it moved.
+        """
+        assert self._open_paragraph is not None
+        before = self._chunks[self._open_paragraph]
+        match = FIRST_WORD.fullmatch(block.text.strip())
+        if (
+            match is None
+            or not before.endswith("-")
+            or not DIVIDED_WORD.search(self._open_paragraph_text.rstrip())
+            # A hyphen before a capital letter or a digit is a part of the word.
+            or not match.group(1)[:1].islower()
+            # The writer moves only plain text.
+            or MARKUP_CHARACTERS.intersection(match.group(1))
+        ):
+            return block
+        complete = before[:-1].replace("\n", " ") + escape_text(match.group(1))
+        self._chunks[self._open_paragraph] = _wrap(complete) + "\n" + MOVED_WORD_COMMENT
+        return replace(block, text=match.group(2))
 
     def _add_block(self, block: object, page: PageLayout, footnotes: _PageFootnotes) -> None:
         if isinstance(block, Paragraph):
@@ -603,7 +804,11 @@ class _DocumentWriter:
                 "keepaspectratio"
             )
             lines = [f"\\includegraphics[{options}]{{{block.image}}}"]
-            if caption:
+            if caption and not self._flow:
+                # The box of the source page keeps the illustration and its caption on
+                # one page. A box in that box would take the footnotes of the page.
+                lines += ["\\par\\smallskip", caption]
+            elif caption:
                 # LaTeX does not divide a minipage, so the illustration and all lines of
                 # its caption stay on one page.
                 lines = [
@@ -639,7 +844,10 @@ class _DocumentWriter:
         fractions: list[float] = []
         compact = False
         if wraps:
-            fractions, compact = _column_fractions(*_column_text_widths(column_count, owners))
+            fractions, compact = _column_fractions(
+                *_column_text_widths(column_count, owners),
+                line_em=LINE_EM if self._flow else PAGED_LINE_EM,
+            )
 
         def column_spec(column: int, span: int, alignment: str) -> str:
             """Return the column specification of a cell, with the rules at its sides."""
@@ -709,16 +917,33 @@ class _DocumentWriter:
         row_count = len(table.rows)
         # LaTeX repeats the header rows when the table continues on a new page.
         header_rows = table.header_rows if table.header_rows < row_count else 0
-        head = ["\\hline"] if has_rules else []
+        # The rule above the table and the rule below it.
+        outer_rule = "\\hline\\hline" if table.double_rule else "\\hline"
+        head = [outer_rule] if has_rules else []
         body: list[str] = []
         for row in range(row_count):
             lines = head if row < header_rows else body
             lines.append(row_line(row))
             is_last = row == row_count - 1
             if has_rules and (is_last or row == table.header_rows - 1 or table.rules == RULES_GRID):
-                lines.append("\\hline" if is_last else rule_below(row))
+                lines.append(outer_rule if is_last else rule_below(row))
 
         spec = "".join(column_spec(column, 1, alignments[column]) for column in range(column_count))
+        if not self._flow:
+            # The table is in the box of its source page, so it does not continue on a
+            # new page.
+            lines = ["\\begin{center}"]
+            if caption:
+                lines += [_wrap(caption), "\\par\\medskip"]
+            lines += [
+                f"\\begin{{tabular}}{{{spec}}}",
+                *head,
+                *body,
+                "\\end{tabular}",
+                "\\end{center}",
+            ]
+            self._add_table_lines(lines, wraps=wraps, compact=compact)
+            return
         lines = [f"\\begin{{longtable}}{{{spec}}}"]
         if caption:
             # The caption is a row of the table, so it stays on the page of the first rows.
@@ -739,6 +964,9 @@ class _DocumentWriter:
         if caption or header_rows:
             lines.append("\\endhead")
         lines += [*body, "\\end{longtable}"]
+        self._add_table_lines(lines, wraps=wraps, compact=compact)
+
+    def _add_table_lines(self, lines: list[str], *, wraps: bool, compact: bool) -> None:
         if not wraps:
             # A table with this many columns needs small text to fit in the line.
             lines = [f"\\begingroup\\footnotesize{COMPACT_COLUMN_PADDING}", *lines, "\\endgroup"]
@@ -765,7 +993,10 @@ class _DocumentWriter:
                 piece = self._footnote_reference(part.mark, footnotes, context)
                 prints = True
             else:
-                piece = escape_text(part.text)
+                if STYLE_SMALL_CAPS in part.styles:
+                    piece = _small_caps(part.text)
+                else:
+                    piece = escape_text(part.text)
                 prints = _prints(part.text)
                 if prints:
                     for style, command in reversed(STYLE_COMMANDS):
@@ -788,11 +1019,18 @@ class _DocumentWriter:
         the mark, and the footnote comes after the block.
         """
         footnote = footnotes.take(mark) if footnotes is not None else None
+        reference = f"\\textsuperscript{{{escape_text(mark)}}}"
         if footnote is not None and footnotes is not None and context in MARK_CONTEXTS:
             footnotes.waiting.append(footnote)
-        elif footnote is not None:
+        elif footnote is not None and self._flow:
             return f"\\footnote{{{self._inline(footnote.text, None, CONTEXT_TEXT)}}}"
-        return f"\\textsuperscript{{{escape_text(mark)}}}"
+        elif footnote is not None:
+            # The document keeps the pages of the source, so each mark is on the page
+            # that has its footnote. The footnote keeps the mark of the source.
+            self._has_source_footnotes = True
+            text = self._inline(footnote.text, None, CONTEXT_TEXT)
+            return f"{reference}\\sourcefootnotetext{{{escape_text(mark)}}}{{{text}}}"
+        return reference
 
 
 def _wrap(text: str) -> str:
@@ -905,8 +1143,9 @@ def _column_text_widths(
         if placed.colspan != 1:
             continue
         for raw_line in CELL_LINE_BREAK.split(placed.cell.text):
-            # The markup is not text, so the widths are those of the text without it.
-            line = plain_text(raw_line).strip()
+            # The markup is not text, so the widths are those of the text without it. A
+            # reference mark of a footnote is text of the cell.
+            line = plain_text(FOOTNOTE_REFERENCE.sub(r"\1", raw_line)).strip()
             longest_word = max(map(_text_em, line.split()), default=0.0)
             line_widths[placed.column] = max(
                 line_widths[placed.column], min(_text_em(line), MAX_CELL_EM)
@@ -918,7 +1157,7 @@ def _column_text_widths(
 
 
 def _column_fractions(
-    line_widths: Sequence[float], word_widths: Sequence[float]
+    line_widths: Sequence[float], word_widths: Sequence[float], *, line_em: float = LINE_EM
 ) -> tuple[list[float], bool]:
     """Return the width of each column as a part of the line, and True for compact padding.
 
@@ -929,10 +1168,10 @@ def _column_fractions(
     """
     count = len(line_widths)
     for padding in (COLUMN_PADDING_EM, COMPACT_COLUMN_PADDING_EM):
-        if sum(line_widths) + count * padding <= LINE_EM:
-            fractions = [(width + padding) / LINE_EM for width in line_widths]
+        if sum(line_widths) + count * padding <= line_em:
+            fractions = [(width + padding) / line_em for width in line_widths]
             return fractions, padding == COMPACT_COLUMN_PADDING_EM
-    available = LINE_EM - count * COMPACT_COLUMN_PADDING_EM
+    available = line_em - count * COMPACT_COLUMN_PADDING_EM
     if sum(word_widths) <= available:
         # The columns share the space that the longest words do not need.
         spare = available - sum(word_widths)
@@ -943,4 +1182,4 @@ def _column_fractions(
         ]
     else:
         text_widths = [available * word / sum(word_widths) for word in word_widths]
-    return [(width + COMPACT_COLUMN_PADDING_EM) / LINE_EM for width in text_widths], True
+    return [(width + COMPACT_COLUMN_PADDING_EM) / line_em for width in text_widths], True

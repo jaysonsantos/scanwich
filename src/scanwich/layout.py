@@ -67,6 +67,12 @@ PAGE_HEADER = "page_header"
 PAGE_FOOTER = "page_footer"
 PAGE_NUMBER = "page_number"
 PAGE_FURNITURE_KINDS = (PAGE_HEADER, PAGE_FOOTER, PAGE_NUMBER)
+# The places of a running head, a running foot, and a page number on the page.
+POSITION_EDGES = ("top", "bottom")
+POSITION_SIDES = ("left", "center", "right")
+POSITIONS = tuple(f"{edge}-{side}" for edge in POSITION_EDGES for side in POSITION_SIDES)
+POSITION_WORDS = {"middle": "center", "centre": "center", "centered": "center"}
+POSITION_SEPARATORS = re.compile(r"[\s_,/-]+")
 # The fields that the layout reads from each JSON object. Text in a different field is
 # content that the layout cannot keep, so it is an error.
 PAGE_FIELDS = ("page_top", "content_box", "blocks")
@@ -75,12 +81,21 @@ BLOCK_FIELDS = {
     "paragraph": ("type", "text", "align", "continued"),
     "quote": ("type", "text"),
     "list": ("type", "ordered", "items"),
-    "table": ("type", "caption", "header_rows", "columns", "rules", "rows", "header"),
+    "table": (
+        "type",
+        "caption",
+        "header_rows",
+        "columns",
+        "rules",
+        "double_rule",
+        "rows",
+        "header",
+    ),
     "figure": ("type", "box", "caption", "image"),
     "footnote": ("type", "mark", "text"),
-    PAGE_HEADER: ("type", "text"),
-    PAGE_FOOTER: ("type", "text"),
-    PAGE_NUMBER: ("type", "text"),
+    PAGE_HEADER: ("type", "text", "position"),
+    PAGE_FOOTER: ("type", "text", "position"),
+    PAGE_NUMBER: ("type", "text", "position"),
 }
 BLOCK_TYPES = frozenset(BLOCK_FIELDS)
 LIST_ITEM_FIELDS = ("marker", "text")
@@ -267,6 +282,8 @@ class Table:
     # The alignment of each column. A column without a value is left-aligned.
     columns: tuple[str, ...] = ()
     rules: str = RULES_HORIZONTAL
+    # The rule above the table and the rule below it are double rules.
+    double_rule: bool = False
 
     def to_json(self) -> dict[str, Any]:
         return _without_defaults(
@@ -276,6 +293,7 @@ class Table:
                 "header_rows": self.header_rows,
                 "columns": list(self.columns) or None,
                 "rules": self.rules,
+                "double_rule": self.double_rule or None,
                 "rows": [[cell.to_json() for cell in row] for row in self.rows],
             }
         )
@@ -329,9 +347,12 @@ class PageFurniture:
 
     kind: str
     text: str
+    # The place of the text on the page, one of `POSITIONS`. `None` is a place that the
+    # layout does not know.
+    position: str | None = None
 
     def to_json(self) -> dict[str, Any]:
-        return {"type": self.kind, "text": self.text}
+        return _without_defaults({"type": self.kind, "text": self.text, "position": self.position})
 
 
 Block = Heading | Paragraph | Quote | ListBlock | Table | Figure | Footnote | PageFurniture
@@ -648,7 +669,11 @@ def _parse_block(raw_block: Any, where: str, reading: _Reading) -> Block | None:
     if block_type == "footnote":
         return Footnote(text=text, mark=_parse_optional_text(raw_block, "mark", where) or "")
     if block_type in PAGE_FURNITURE_KINDS:
-        return PageFurniture(kind=block_type, text=text)
+        return PageFurniture(
+            kind=block_type,
+            text=text,
+            position=_parse_position(raw_block.get("position"), f"{where} position"),
+        )
     return Paragraph(
         text=text,
         align=_parse_block_alignment(raw_block.get("align"), f"{where} align"),
@@ -708,6 +733,27 @@ def _parse_alignment(value: Any, where: str) -> str | None:
         return ALIGNMENTS[name]
     if _has_text(value):
         raise LayoutFormatError(f"{where} must be one of: left, center, right")
+    return None
+
+
+def _parse_position(value: Any, where: str) -> str | None:
+    """Return the place of a running head or a page number, or `None` for no value.
+
+    A place has an edge of the page and a side: "top-right". The two words can be in
+    each sequence. A value with other text is an error.
+    """
+    if isinstance(value, str):
+        words = [
+            POSITION_WORDS.get(word, word)
+            for word in POSITION_SEPARATORS.split(value.strip().lower())
+            if word
+        ]
+        edges = [word for word in words if word in POSITION_EDGES]
+        sides = [word for word in words if word in POSITION_SIDES]
+        if len(edges) == 1 and len(sides) == 1 and len(words) == 2:
+            return f"{edges[0]}-{sides[0]}"
+    if _has_text(value):
+        raise LayoutFormatError(f"{where} must be one of: " + ", ".join(POSITIONS))
     return None
 
 
@@ -893,6 +939,7 @@ def _parse_table(raw_block: Mapping[str, Any], where: str, reading: _Reading) ->
         header_rows=min(max(header_rows, len(header), 0), len(rows)),
         columns=columns,
         rules=rules,
+        double_rule=_parse_flag(raw_block.get("double_rule"), f"{where} double_rule"),
     )
 
 

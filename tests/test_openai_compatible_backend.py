@@ -1128,6 +1128,29 @@ class LayoutRecognitionTests(TestCase):
             '"mark"',
             "0-to-1000 grid",
             "<fn>mark</fn>",
+            # The place of a running head and of a page number.
+            '{"type":"page_number","text":"...","position":"top-right"}',
+            (
+                '"top-left", "top-center", "top-right", "bottom-left", "bottom-center", or '
+                '"bottom-right"'
+            ),
+            '"double_rule":true',
+            # A lost tag must not change a capital form to a lowercase letter.
+            "Capital forms. Write each letter in the case that the page prints.",
+            "write its letters as capital letters, also in a caption and in a running head.",
+            "Do not change such a line to lowercase letters or to sentence case.",
+            "Put only them in <sc>, and write a large capital letter before the tag.",
+            (
+                '"T<sc>ABLE</sc> II. R<sc>ESULTS OF THE TESTS</sc>" and not "Table II. Results '
+                'of the tests".'
+            ),
+            "Do not add an accent that the page does not print.",
+            "the lines of a centered caption",
+            # The writer needs the hyphen to know that the page boundary divides a word.
+            (
+                "When the last line of the page ends with such a hyphen, keep that hyphen at "
+                "the end of the text: the rest of the word is on the next page."
+            ),
             # The model does not read a page that is not upright.
             'Return only {"page_top":"<side>","blocks":[]}.',
             'Return {"page_top":"top","blocks":[]} for a page that has no content.',

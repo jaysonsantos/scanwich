@@ -77,6 +77,14 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--flow",
+        action="store_true",
+        help=(
+            "LaTeX output: let the text flow across the pages of the document (default: "
+            "each source page is one page of the document)"
+        ),
+    )
+    parser.add_argument(
         "--ocr-output-dir",
         type=Path,
         help="also save per-page JSON files: OCR regions, or the page layout for LaTeX output",
@@ -107,6 +115,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     latex_output = args.output.suffix.lower() == LATEX_SUFFIX
     if args.rotate is not None and not latex_output:
         parser.error("--rotate applies to LaTeX output only")
+    if args.flow and not latex_output:
+        parser.error("--flow applies to LaTeX output only")
 
     try:
         options = parse_backend_options(args.backend_option)
@@ -141,6 +151,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 backend=backend,
                 dpi=args.dpi,
                 rotate=args.rotate,
+                flow=args.flow,
                 ocr_output_directory=args.ocr_output_dir,
             )
     except (FileNotFoundError, PdfPipelineError, TypeError, ValueError, RuntimeError) as error:

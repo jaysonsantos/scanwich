@@ -127,13 +127,16 @@ def convert_to_latex(
     backend: LayoutBackend,
     dpi: int | None = None,
     rotate: int | None = None,
+    flow: bool = False,
     ocr_output_directory: Path | None = None,
 ) -> None:
     """Write a PDF or a photo of a page as one LaTeX document.
 
     The illustrations go to a directory next to the document. `rotate` is the direction
     of the pages: the function turns each page image clockwise by that angle before
-    recognition. Without it, the backend finds the direction of each page.
+    recognition. Without it, the backend finds the direction of each page. Each source
+    page is one page of the document. With `flow`, the text flows across the pages of the
+    document.
 
     The function raises `PageLayoutError` when a page has no usable layout, and when no
     page has content. It then writes no document.
@@ -198,7 +201,7 @@ def convert_to_latex(
         # The file is in the directory of the document, so the last step only renames it.
         temporary_tex = output_tex.with_name(f".{output_tex.name}.scanwich-tmp")
         try:
-            temporary_tex.write_text(render_latex(layouts), encoding="utf-8")
+            temporary_tex.write_text(render_latex(layouts, flow=flow), encoding="utf-8")
             figure_count = _replace_figures(work_directory / "figures", figure_directory)
             temporary_tex.replace(output_tex)
         finally:

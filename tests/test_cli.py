@@ -143,15 +143,21 @@ class CliTests(TestCase):
             )
 
         self.assertEqual(exit_code, 0)
-        # Without `--rotate`, the backend finds the direction of each page.
+        # Without `--rotate`, the backend finds the direction of each page. Without
+        # `--flow`, each source page is one page of the document.
         convert_to_latex.assert_called_once_with(
             self.photo,
             output,
             backend=backend,
             dpi=150,
             rotate=None,
+            flow=False,
             ocr_output_directory=Path("layout"),
         )
+        with patch("scanwich.cli.convert_to_latex") as convert_to_latex:
+            exit_code, _ = self.run_main([str(self.photo), str(output), "--flow"], backend)
+        self.assertEqual(exit_code, 0)
+        self.assertTrue(convert_to_latex.call_args.kwargs["flow"])
 
     def test_rejects_commands_that_have_no_meaning(self) -> None:
         cases = {
@@ -162,6 +168,7 @@ class CliTests(TestCase):
                 "90",
             ],
             "argument --rotate: invalid choice": [str(self.photo), "page.tex", "--rotate", "45"],
+            "--flow applies to LaTeX output only": [str(self.photo), "page.pdf", "--flow"],
             "input and output are required": [str(self.photo)],
         }
         for message, arguments in cases.items():

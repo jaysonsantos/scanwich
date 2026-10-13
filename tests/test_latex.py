@@ -2,6 +2,7 @@ import random
 import re
 import shutil
 import subprocess
+from collections.abc import Sequence
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest import TestCase, skipUnless
@@ -11,6 +12,7 @@ from PIL import Image
 
 from scanwich.latex import (
     MAX_WRAPPED_COLUMNS,
+    MOVED_WORD_COMMENT,
     SOURCE_LINE_WIDTH,
     _column_fractions,
     _column_text_widths,
@@ -38,7 +40,8 @@ from scanwich.layout import (
 UNICODE_ENGINES = {
     "lualatex": ["-interaction=nonstopmode", "-halt-on-error"],
     "xelatex": ["-interaction=nonstopmode", "-halt-on-error"],
-    "tectonic": [],
+    # Tectonic writes the log file only with this option.
+    "tectonic": ["--keep-logs"],
 }
 PDFLATEX_OPTIONS = ["-interaction=nonstopmode", "-halt-on-error"]
 COMPILE_TIMEOUT_SECONDS = 300
@@ -46,9 +49,14 @@ COMPILE_TIMEOUT_SECONDS = 300
 FIGURE_IMAGE = "figures/figure.jpg"
 
 
+def render_flow(pages: Sequence[PageLayout]) -> str:
+    """Return the document with flowing text: its pages are not those of the source."""
+    return render_latex(pages, flow=True)
+
+
 def body(*blocks: object, **page_options: object) -> str:
     """Return the LaTeX between the start and the end of a document with one page."""
-    return document_body(render_latex([PageLayout(blocks=tuple(blocks), **page_options)]))
+    return document_body(render_flow([PageLayout(blocks=tuple(blocks), **page_options)]))
 
 
 def document_body(document: str) -> str:
@@ -116,7 +124,7 @@ class EscapeTextTests(TestCase):
         )
 
     def test_document_defines_the_symbol_command_only_when_it_uses_it(self) -> None:
-        with_symbol = render_latex([PageLayout(blocks=(Paragraph("58\u2032"),))])
+        with_symbol = render_flow([PageLayout(blocks=(Paragraph("58\u2032"),))])
         # With a Unicode engine, the character comes from a font that has it, so the text
         # of the PDF has the character. A math command is the alternative.
         self.assertIn(
@@ -125,7 +133,7 @@ class EscapeTextTests(TestCase):
             with_symbol,
         )
         self.assertEqual(with_symbol.count("\\newcommand{\\sourcesymbol}[2]{\\ensuremath{#2}}"), 2)
-        without_symbol = render_latex([PageLayout(blocks=(Paragraph("58 minutes"),))])
+        without_symbol = render_flow([PageLayout(blocks=(Paragraph("58 minutes"),))])
         self.assertNotIn("sourcesymbol", without_symbol)
 
     def test_writes_a_greek_letter_that_is_alone_as_a_math_symbol(self) -> None:
@@ -186,7 +194,7 @@ class BlockTests(TestCase):
                 )
             ),
             [
-                "\\textbf{b} \\textit{i} \\underline{u} \\textsc{Sc}",
+                "\\textbf{b} \\textit{i} \\underline{u} S\\sourcesmallcaps{C}",
                 "x\\textsuperscript{2} H\\textsubscript{2}O \\textbf{\\textit{both}}",
             ],
         )
@@ -231,7 +239,7 @@ class BlockTests(TestCase):
         )
 
     def test_text_cannot_add_latex_to_the_document(self) -> None:
-        document = render_latex(
+        document = render_flow(
             [
                 PageLayout(
                     blocks=(
@@ -257,7 +265,7 @@ class BlockTests(TestCase):
 
 class PageTests(TestCase):
     def test_marks_the_start_of_each_source_page_with_a_comment(self) -> None:
-        document = render_latex(
+        document = render_flow(
             [
                 PageLayout(
                     blocks=(
@@ -283,7 +291,7 @@ class PageTests(TestCase):
         )
 
     def test_joins_a_paragraph_that_continues_on_the_next_page(self) -> None:
-        document = render_latex(
+        document = render_flow(
             [
                 PageLayout(blocks=(Paragraph("The start of a sentence"),)),
                 PageLayout(
@@ -305,7 +313,7 @@ class PageTests(TestCase):
         )
 
     def test_joins_a_word_that_the_page_break_divides(self) -> None:
-        document = render_latex(
+        document = render_flow(
             [
                 PageLayout(blocks=(Paragraph("A divided sen-"),)),
                 PageLayout(blocks=(Paragraph("tence.", continued=True),)),
@@ -323,7 +331,7 @@ class PageTests(TestCase):
         )
 
     def test_keeps_a_hyphen_before_a_capital_letter(self) -> None:
-        document = render_latex(
+        document = render_flow(
             [
                 PageLayout(blocks=(Paragraph("A name: Saint-"),)),
                 PageLayout(blocks=(Paragraph("Denis.", continued=True),)),
@@ -335,7 +343,7 @@ class PageTests(TestCase):
         )
 
     def test_continues_a_paragraph_across_a_figure_and_a_table(self) -> None:
-        document = render_latex(
+        document = render_flow(
             [
                 PageLayout(
                     blocks=(
@@ -357,7 +365,7 @@ class PageTests(TestCase):
     def test_does_not_continue_across_other_blocks(self) -> None:
         for block in (Heading("H"), Quote("Q"), Paragraph("C", align="center")):
             with self.subTest(block=type(block).__name__):
-                document = render_latex(
+                document = render_flow(
                     [
                         PageLayout(blocks=(Paragraph("Before"), block)),
                         PageLayout(blocks=(Paragraph("after.", continued=True),)),
@@ -398,7 +406,7 @@ class FootnoteTests(TestCase):
         )
 
     def test_keeps_a_footnote_that_has_no_reference_mark(self) -> None:
-        document = render_latex(
+        document = render_flow(
             [
                 PageLayout(
                     blocks=(
@@ -423,7 +431,7 @@ class FootnoteTests(TestCase):
         )
 
     def test_footnote_marks_are_those_of_one_page(self) -> None:
-        document = render_latex(
+        document = render_flow(
             [
                 PageLayout(blocks=(Paragraph("One<fn>1</fn>."), Footnote("Page one.", mark="1"))),
                 PageLayout(blocks=(Paragraph("Two<fn>1</fn>."), Footnote("Page two.", mark="1"))),
@@ -433,7 +441,7 @@ class FootnoteTests(TestCase):
         self.assertIn("Two\\footnote{Page two.}.", document)
 
     def test_table_keeps_the_marks_and_its_footnotes_come_after_it(self) -> None:
-        document = render_latex(
+        document = render_flow(
             [
                 PageLayout(
                     blocks=(
@@ -453,7 +461,7 @@ class FootnoteTests(TestCase):
         self.assertEqual(cell_footnote, "\\sourcefootnotetext{{*}}{Note of a cell.}")
 
     def test_caption_of_a_figure_keeps_the_mark(self) -> None:
-        document = render_latex(
+        document = render_flow(
             [
                 PageLayout(
                     blocks=(
@@ -468,7 +476,7 @@ class FootnoteTests(TestCase):
         self.assertIn("\\end{center}\n\n\\sourcefootnotetext{1}{Note of the caption.}", document)
 
     def test_document_without_source_footnotes_has_no_command_for_them(self) -> None:
-        document = render_latex(
+        document = render_flow(
             [PageLayout(blocks=(Paragraph("T<fn>1</fn>"), Footnote("N", mark="1")))]
         )
         self.assertNotIn("sourcefootnotetext", document)
@@ -479,9 +487,7 @@ class FigureTests(TestCase):
         figure = Figure(
             box=Box(300, 400, 700, 600), caption="Fig. 1. <i>A caption</i>", image="b-figures/f.jpg"
         )
-        document = render_latex(
-            [PageLayout(blocks=(figure,), content_box=Box(200, 100, 1000, 900))]
-        )
+        document = render_flow([PageLayout(blocks=(figure,), content_box=Box(200, 100, 1000, 900))])
         self.assertIn("\\usepackage{graphicx}\n", document)
         self.assertEqual(
             document_body(document),
@@ -506,13 +512,13 @@ class FigureTests(TestCase):
             (Box(0, 0, 10, 100), None, "0.15"),
         ):
             with self.subTest(width=width):
-                document = render_latex(
+                document = render_flow(
                     [PageLayout(blocks=(Figure(box=box, image="f.jpg"),), content_box=content_box)]
                 )
                 self.assertIn(f"\\includegraphics[width={width}\\linewidth,", document)
 
     def test_figure_without_an_image_file_keeps_its_caption(self) -> None:
-        document = render_latex(
+        document = render_flow(
             [
                 PageLayout(
                     blocks=(
@@ -534,7 +540,7 @@ class FigureTests(TestCase):
     def test_rejects_an_image_path_that_latex_cannot_read_safely(self) -> None:
         for path in ("a b.jpg", "a}.jpg", "a%.jpg", "\\input.jpg", "b\u00fcch.jpg", ""):
             with self.subTest(path=path), self.assertRaisesRegex(ValueError, "figure image"):
-                render_latex([PageLayout(blocks=(Figure(box=Box(0, 0, 9, 9), image=path),))])
+                render_flow([PageLayout(blocks=(Figure(box=Box(0, 0, 9, 9), image=path),))])
 
 
 class TableTests(TestCase):
@@ -551,7 +557,7 @@ class TableTests(TestCase):
         )
 
     def test_writes_a_table_with_a_caption_and_a_header_that_latex_repeats(self) -> None:
-        document = render_latex(
+        document = render_flow(
             [
                 PageLayout(
                     blocks=(
@@ -578,7 +584,7 @@ class TableTests(TestCase):
                 f"\\begin{{longtable}}{{{spec}}}",
                 # The caption is a row of the table, so it stays on the page of its rows.
                 "\\multicolumn{2}{c}{\\makebox[0pt]{\\parbox[b]{\\linewidth}{\\centering",
-                "\\textsc{Table I.} A caption \\\\ in two lines",
+                "T\\sourcesmallcaps{ABLE} I. A caption \\\\ in two lines",
                 "}}}\\\\[\\medskipamount]",
                 *header,
                 "\\endfirsthead",
@@ -676,7 +682,7 @@ class TableTests(TestCase):
                 )
 
     def test_writes_cells_that_span_columns_and_rows(self) -> None:
-        document = render_latex(
+        document = render_flow(
             [
                 PageLayout(
                     blocks=(
@@ -823,13 +829,350 @@ class TableTests(TestCase):
         self.assertEqual(fractions.index(min(fractions)), len(word_widths) - 1)
 
     def test_leaves_out_a_table_without_cells(self) -> None:
-        document = render_latex([PageLayout(blocks=(Table(rows=((),)),))])
+        document = render_flow([PageLayout(blocks=(Table(rows=((),)),))])
         self.assertNotIn("longtable", document)
+
+
+class SmallCapitalsTests(TestCase):
+    """The document does not print a lowercase letter where the source has a capital form."""
+
+    def test_small_capitals_are_capital_letters_at_a_smaller_size(self) -> None:
+        cases = {
+            # The page prints these letters as small capitals, so the text has capitals.
+            "<sc>BOOK THE FIRST</sc>": "\\sourcesmallcaps{BOOK THE FIRST}",
+            # A large capital letter is before the tag.
+            "B<sc>OOK THE</sc> F<sc>IRST</sc>": (
+                "B\\sourcesmallcaps{OOK THE} F\\sourcesmallcaps{IRST}"
+            ),
+            # A text with lowercase letters uses them for the small capitals. Its capital
+            # letters are large capitals.
+            "<sc>Book the First</sc>": "B\\sourcesmallcaps{OOK THE} F\\sourcesmallcaps{IRST}",
+            "<sc>book</sc>": "\\sourcesmallcaps{BOOK}",
+            # Digits and punctuation keep their size.
+            "<sc>FROM 12 TO 48, END</sc>": (
+                "\\sourcesmallcaps{FROM} 12 \\sourcesmallcaps{TO} 48, \\sourcesmallcaps{END}"
+            ),
+            "<sc>caf\u00e9 \u00e9t\u00e9</sc>": "\\sourcesmallcaps{CAF\u00c9 \u00c9T\u00c9}",
+            "<sc>a & b</sc>": "\\sourcesmallcaps{A} \\& \\sourcesmallcaps{B}",
+            # Without the tag, the capital letters stay capital letters.
+            "BOOK THE FIRST": "BOOK THE FIRST",
+        }
+        for text, expected in cases.items():
+            with self.subTest(text=text):
+                self.assertEqual(blocks_of(body(Paragraph(text))), [expected])
+
+    def test_small_capitals_stay_capitals_in_bold_and_italic_text(self) -> None:
+        # The default font has no bold and no italic small capitals. A font command for
+        # small capitals then prints lowercase letters.
+        self.assertEqual(
+            blocks_of(
+                body(
+                    Heading("C<sc>HAPTER</sc> II"),
+                    Paragraph("<i><sc>ROME</sc></i> <b><sc>x</sc></b>"),
+                )
+            ),
+            [
+                "\\section*{C\\sourcesmallcaps{HAPTER} II}",
+                "\\textit{\\sourcesmallcaps{ROME}} \\textbf{\\sourcesmallcaps{X}}",
+            ],
+        )
+
+    def test_document_defines_the_command_only_when_it_uses_it(self) -> None:
+        definition = "\\DeclareRobustCommand{\\sourcesmallcaps}[1]{{%\n"
+        for flow in (False, True):
+            with self.subTest(flow=flow):
+                with_command = render_latex(
+                    [PageLayout(blocks=(Paragraph("<sc>A</sc>"),))], flow=flow
+                )
+                self.assertEqual(with_command.count(definition), 1)
+                self.assertLess(
+                    with_command.index(definition), with_command.index("\\begin{document}")
+                )
+                without = render_latex([PageLayout(blocks=(Paragraph("A"),))], flow=flow)
+                self.assertNotIn("sourcesmallcaps", without)
+
+
+def page_bodies(*pages: PageLayout) -> list[list[str]]:
+    """Return the blocks of each source page of a document that keeps the pages of the source.
+
+    The first block of a page has its comment, the commands for its running head and its
+    page number, and the start of its box.
+    """
+    text = document_body(render_latex(list(pages)))
+    bodies = []
+    for part in text.split("\n\n\\end{sourcepage}")[:-1]:
+        bodies.append(part.strip("\n").split("\n\n"))
+    return bodies
+
+
+class SourcePageTests(TestCase):
+    """The document that has one page for each page of the source."""
+
+    def test_each_source_page_is_in_a_box_of_its_own(self) -> None:
+        document = render_latex(
+            [
+                PageLayout(blocks=(Heading("A chapter"), Paragraph("First."))),
+                PageLayout(),
+                PageLayout(blocks=(Paragraph("Third."),)),
+            ]
+        )
+        self.assertEqual(
+            document_body(document),
+            "% Source page 1\n\\begin{sourcepage}{1}\n\n\\section*{A chapter}\n\nFirst.\n\n"
+            "\\end{sourcepage}\n\n"
+            # A source page without content is an empty page of the document.
+            "% Source page 2\n\\begin{sourcepage}{2}\n\n\\end{sourcepage}\n\n"
+            "% Source page 3\n\\begin{sourcepage}{3}\n\nThird.\n\n\\end{sourcepage}",
+        )
+        for part in (
+            "\\usepackage{graphicx}\n",
+            "\\newenvironment{sourcepage}[1]{%\n",
+            "\\pagestyle{sourcepage}\n",
+            # A box that is too high becomes smaller, and the engine reports the page.
+            "\\PackageWarningNoLine{scanwich}{Source page \\sourcepagenumber\\space is at\n",
+            "\\resizebox*{!}{\\textheight}{\\usebox{\\sourcepagebox}}",
+        ):
+            with self.subTest(part=part):
+                self.assertEqual(document.count(part), 1)
+        self.assertLess(
+            document.index("\\pagestyle{sourcepage}"), document.index("\\begin{document}")
+        )
+        # The document with flowing text has none of this.
+        self.assertNotIn(
+            "sourcepage", render_latex([PageLayout(blocks=(Paragraph("A"),))], flow=True)
+        )
+
+    def test_document_without_pages_has_one_empty_page(self) -> None:
+        self.assertTrue(document_body(render_latex([])).endswith("\\mbox{}"))
+        self.assertNotIn("\\mbox{}", render_latex([PageLayout()]))
+
+    def test_prints_the_running_head_and_the_page_number_at_their_places(self) -> None:
+        cases: list[tuple[tuple[object, ...], list[str]]] = [
+            (
+                (
+                    PageFurniture("page_header", "<sc>A RUNNING HEAD</sc>", "top-center"),
+                    PageFurniture("page_number", "23", "top-right"),
+                    Paragraph("Text."),
+                ),
+                ["\\sourcepagehead{}{\\sourcesmallcaps{A RUNNING HEAD}}{23}"],
+            ),
+            (
+                (
+                    PageFurniture("page_number", "24", "top-left"),
+                    PageFurniture("page_header", "The chapter", "top-center"),
+                    Paragraph("Text."),
+                    PageFurniture("page_footer", "Sheet 3", "bottom-right"),
+                    PageFurniture("page_footer", "Printed in 1900", "bottom-right"),
+                ),
+                [
+                    "\\sourcepagehead{24}{The chapter}{}",
+                    "\\sourcepagefoot{}{}{Sheet 3\\quad{}Printed in 1900}",
+                ],
+            ),
+            # A block without a place gets the usual place of its type. A page number
+            # is at the top right when it comes before the content, else at the bottom.
+            (
+                (
+                    PageFurniture("page_header", "Head"),
+                    PageFurniture("page_number", "5"),
+                    Paragraph("Text."),
+                    PageFurniture("page_footer", "Foot"),
+                ),
+                ["\\sourcepagehead{}{Head}{5}", "\\sourcepagefoot{}{Foot}{}"],
+            ),
+            ((Paragraph("Text."), PageFurniture("page_number", "6")), ["\\sourcepagefoot{}{6}{}"]),
+            # The text cannot add a command or end the line.
+            (
+                (PageFurniture("page_header", "50 % } \\end{document}<br>next", "top-left"),),
+                [
+                    "\\sourcepagehead{50 \\% \\} \\textbackslash{}end\\{document\\} \\quad{} next}{}{}"
+                ],
+            ),
+            ((Paragraph("Text."),), []),
+        ]
+        for number, (blocks, commands) in enumerate(cases, start=1):
+            with self.subTest(case=number):
+                (page,) = page_bodies(PageLayout(blocks=tuple(blocks)))
+                printed = ["23", "24", "5", "6"][number - 1 : number]
+                comment = "% Source page 1" + (
+                    f" (printed page number: {printed[0]})" if printed else ""
+                )
+                self.assertEqual(
+                    page[0].split("\n"), [comment, *commands, "\\begin{sourcepage}{1}"]
+                )
+
+    def test_paragraph_that_continues_stays_on_its_two_pages(self) -> None:
+        pages = page_bodies(
+            PageLayout(blocks=(Paragraph("The first part of a sentence"),)),
+            PageLayout(blocks=(Paragraph("continues on the next page.", continued=True),)),
+        )
+        self.assertEqual(pages[0][1:], ["The first part of a sentence"])
+        # The second part has no indent, because it starts no paragraph.
+        self.assertEqual(pages[1][1:], ["\\noindent continues on the next page."])
+
+    def test_word_that_the_page_boundary_divides_is_complete_on_the_first_page(self) -> None:
+        # A search finds the word, and a copy of the text has it in one piece.
+        pages = page_bodies(
+            PageLayout(blocks=(Paragraph("The end of the page divides a docu-"), Figure(box=BOX))),
+            PageLayout(blocks=(Paragraph("ment, and the text continues.", continued=True),)),
+        )
+        self.assertEqual(
+            pages[0][1], "The end of the page divides a document,\n" + MOVED_WORD_COMMENT
+        )
+        self.assertEqual(pages[1][1:], ["\\noindent and the text continues."])
+
+        # The word can be all of the text of the second page.
+        pages = page_bodies(
+            PageLayout(blocks=(Paragraph("A docu-"),)),
+            PageLayout(blocks=(Paragraph("ment", continued=True), Paragraph("Next."))),
+        )
+        self.assertEqual(pages[0][1], "A document\n" + MOVED_WORD_COMMENT)
+        self.assertEqual(pages[1][1:], ["Next."])
+
+    def test_keeps_the_division_that_it_cannot_join_safely(self) -> None:
+        cases = {
+            # A hyphen before a capital letter is a part of the word.
+            "a capital letter": ("the Franco-", "Prussian war.", "\\noindent Prussian war."),
+            # The writer moves only plain text.
+            "markup": ("a docu-", "<i>ment</i> here.", "\\noindent \\textit{ment} here."),
+            "no hyphen": ("a document", "that continues.", "\\noindent that continues."),
+            "a dash": ("a pause \u2014", "then more.", "\\noindent then more."),
+        }
+        for name, (first, second, second_latex) in cases.items():
+            with self.subTest(name=name):
+                pages = page_bodies(
+                    PageLayout(blocks=(Paragraph(first),)),
+                    PageLayout(blocks=(Paragraph(second, continued=True),)),
+                )
+                self.assertEqual(pages[0][1:], [escape_text(first)])
+                self.assertEqual(pages[1][1:], [second_latex])
+
+    def test_footnotes_keep_the_marks_of_the_source(self) -> None:
+        document = render_latex(
+            [
+                PageLayout(
+                    blocks=(
+                        Paragraph("A claim.<fn>1</fn> More text.<fn>*</fn>"),
+                        Table(rows=(cells("a<fn>a</fn>"),)),
+                        Footnote("The first note.", mark="1"),
+                        Footnote("The starred note.", mark="*"),
+                        Footnote("The note of the table.", mark="a"),
+                        Footnote("A note without a mark in the text.", mark="7"),
+                    )
+                ),
+                # The marks start again on each page of the source.
+                PageLayout(
+                    blocks=(Paragraph("Text.<fn>1</fn>"), Footnote("Second page.", mark="1"))
+                ),
+            ]
+        )
+        first, second = (page[1:] for page in page_bodies_of(document))
+        self.assertEqual(
+            first[0],
+            "A claim.\\textsuperscript{1}\\sourcefootnotetext{1}{The first note.} More\n"
+            "text.\\textsuperscript{{*}}\\sourcefootnotetext{{*}}{The starred note.}",
+        )
+        self.assertIn("a\\textsuperscript{a} \\\\", first[1])
+        self.assertEqual(
+            first[2:],
+            [
+                "\\sourcefootnotetext{a}{The note of the table.}",
+                "\\sourcefootnotetext{7}{A note without a mark in the text.}",
+            ],
+        )
+        self.assertEqual(second, ["Text.\\textsuperscript{1}\\sourcefootnotetext{1}{Second page.}"])
+        # In the box of a page, LaTeX takes the mark from this command.
+        self.assertIn(
+            "\\begingroup\\renewcommand{\\thempfn}{#1}\\footnotetext{#2}\\endgroup}", document
+        )
+        self.assertNotIn("\\footnote{", document)
+
+    def test_table_is_in_the_box_of_its_page(self) -> None:
+        document = render_latex(
+            [
+                PageLayout(
+                    blocks=(
+                        Table(
+                            rows=(cells("Name", "Value"), cells("a", "1,5")),
+                            caption="T<sc>ABLE</sc> I<br>A caption",
+                            header_rows=1,
+                            columns=("left", "right"),
+                            rules="columns",
+                            double_rule=True,
+                        ),
+                    )
+                )
+            ]
+        )
+        ((_, block),) = page_bodies_of(document)
+        lines = block.split("\n")
+        self.assertEqual(
+            [lines[0], lines[1], lines[2], lines[3][:17], *lines[4:]],
+            [
+                "\\begin{center}",
+                "T\\sourcesmallcaps{ABLE} I \\\\ A caption",
+                "\\par\\medskip",
+                "\\begin{tabular}{>",
+                # The rule above the table and the rule below it are double rules.
+                "\\hline\\hline",
+                "Name & Value \\\\",
+                "\\hline",
+                "a & 1,5 \\\\",
+                "\\hline\\hline",
+                "\\end{tabular}",
+                "\\end{center}",
+            ],
+        )
+        # A column is as wide as its text and its padding, on a line of 38 em.
+        self.assertIn(f"p{{\\dimexpr {(_text_em('Name') + 1.1) / 38:.4f}\\linewidth", lines[3])
+        self.assertIn("\\usepackage{array}\n", document)
+        self.assertNotIn("longtable", document)
+
+    def test_double_rule_is_also_in_the_document_with_flowing_text(self) -> None:
+        table = Table(rows=(cells("a"), cells("b")), header_rows=1, double_rule=True)
+        lines = blocks_of(body(table))[0].split("\n")
+        self.assertEqual(
+            lines[1:],
+            [
+                "\\hline\\hline",
+                "a \\\\",
+                "\\hline",
+                "\\endhead",
+                "b \\\\",
+                "\\hline\\hline",
+                "\\end{longtable}",
+            ],
+        )
+        # A table without rules has no double rule.
+        no_rules = Table(rows=(cells("a"),), rules="none", double_rule=True)
+        self.assertNotIn("hline", body(no_rules))
+
+    def test_illustration_and_its_caption_need_no_box_of_their_own(self) -> None:
+        # A box in the box of the page would take the footnotes of the page.
+        ((_, block),) = page_bodies(
+            PageLayout(blocks=(Figure(box=BOX, caption="Fig. 1<br>A wheel", image="f.jpg"),))
+        )
+        self.assertEqual(
+            block.split("\n"),
+            [
+                "\\begin{center}",
+                "\\includegraphics[width=0.50\\linewidth,height=0.75\\textheight,keepaspectratio]{f.jpg}",
+                "\\par\\smallskip",
+                "Fig. 1 \\\\ A wheel",
+                "\\end{center}",
+            ],
+        )
+
+
+def page_bodies_of(document: str) -> list[list[str]]:
+    """Return the blocks of each source page of a document."""
+    parts = document_body(document).split("\n\n\\end{sourcepage}")[:-1]
+    return [part.strip("\n").split("\n\n") for part in parts]
 
 
 class PreambleTests(TestCase):
     def test_document_of_text_needs_no_package_for_other_content(self) -> None:
-        document = render_latex([PageLayout(blocks=(Paragraph("Text."),))])
+        document = render_flow([PageLayout(blocks=(Paragraph("Text."),))])
         preamble = document[: document.index("\\begin{document}")]
         self.assertIn("\\documentclass[11pt,a4paper]{article}\n", preamble)
         self.assertIn("\\usepackage{fontspec}\n", preamble)
@@ -846,13 +1189,13 @@ class EmptyDocumentTests(TestCase):
         no_content = "% The source has no content. The empty box makes one empty page.\n\\mbox{}"
         for pages in ([], [PageLayout(), PageLayout()], [PageLayout(blocks=(Figure(box=BOX),))]):
             with self.subTest(pages=len(pages)):
-                self.assertTrue(document_body(render_latex(pages)).endswith(no_content))
+                self.assertTrue(document_body(render_flow(pages)).endswith(no_content))
 
     def test_document_with_content_has_no_empty_page(self) -> None:
         for block in (Paragraph("Text."), Footnote("A footnote."), Figure(box=BOX, caption="C")):
             with self.subTest(block=type(block).__name__):
                 self.assertNotIn(
-                    "\\mbox{}", render_latex([PageLayout(), PageLayout(blocks=(block,))])
+                    "\\mbox{}", render_flow([PageLayout(), PageLayout(blocks=(block,))])
                 )
 
 
@@ -904,7 +1247,7 @@ class LineBreakTests(TestCase):
         for name, text in LINE_BREAK_TEXTS.items():
             with self.subTest(text=name):
                 document = document_body(
-                    render_latex([PageLayout(blocks=blocks_with_text(text, "f.jpg"))])
+                    render_flow([PageLayout(blocks=blocks_with_text(text, "f.jpg"))])
                 )
                 self.assertNotRegex(document, REPEATED_LINE_BREAK)
                 # Each text of a block has its two lines, with one line break between them.
@@ -920,7 +1263,7 @@ class LineBreakTests(TestCase):
         for text in ("<br>", " <br> ", "<br>text", "text<br>", "\u2009<br>text<br>\u00a0"):
             with self.subTest(text=text):
                 document = document_body(
-                    render_latex([PageLayout(blocks=blocks_with_text(text, "f.jpg"))])
+                    render_flow([PageLayout(blocks=blocks_with_text(text, "f.jpg"))])
                 )
                 self.assertNotIn("\\\\ ", document)
                 self.assertNotIn("\\newline", document)
@@ -1096,6 +1439,17 @@ class CompilationTests(TestCase):
 
     def compile(self, engine: str, options: list[str], document: str) -> str:
         """Compile a document, and return the text of its PDF with single spaces."""
+        texts, _ = self.compile_pages(engine, options, document)
+        return " ".join(" ".join(texts).split())
+
+    def compile_pages(
+        self, engine: str, options: list[str], document: str
+    ) -> tuple[list[str], str]:
+        """Compile a document. Return the text of each page of its PDF, and the engine output.
+
+        The text of a page has single spaces. The engine output has the terminal text and
+        the log file, with the line breaks of the engine removed.
+        """
         with TemporaryDirectory() as temporary_directory:
             directory = Path(temporary_directory)
             (directory / "figures").mkdir()
@@ -1119,12 +1473,15 @@ class CompilationTests(TestCase):
                 for index in range(len(pdf)):
                     page = pdf[index]
                     text_page = page.get_textpage()
-                    texts.append(text_page.get_text_range())
+                    texts.append(" ".join(text_page.get_text_range().split()))
                     text_page.close()
                     page.close()
             finally:
                 pdf.close()
-        return " ".join(" ".join(texts).split())
+            log_path = directory / "document.log"
+            log = log_path.read_text(errors="replace") if log_path.is_file() else ""
+        # An engine breaks the lines of its messages at a fixed width.
+        return texts, (result.stdout + result.stderr + log).replace("\n", "")
 
     def documents(self, *, unicode_text: bool) -> dict[str, str]:
         """Return the documents that each engine must compile."""
@@ -1146,13 +1503,19 @@ class CompilationTests(TestCase):
         generated = [
             PageLayout(blocks=blocks_with_text(text, FIGURE_IMAGE)) for text in generated_texts()
         ]
+        documents = {
+            "each block type": pages,
+            "line breaks": line_breaks,
+            "generated texts": generated,
+            "no pages": [],
+            "empty pages": [PageLayout(), PageLayout()],
+            "figure without an image file": [PageLayout(blocks=(Figure(box=BOX),))],
+        }
+        # Each document compiles with the pages of the source and with flowing text.
         return {
-            "each block type": render_latex(pages),
-            "line breaks": render_latex(line_breaks),
-            "generated texts": render_latex(generated),
-            "no pages": render_latex([]),
-            "empty pages": render_latex([PageLayout(), PageLayout()]),
-            "figure without an image file": render_latex([PageLayout(blocks=(Figure(box=BOX),))]),
+            f"{name}, {layout}": render_latex(document_pages, flow=layout == "flowing text")
+            for name, document_pages in documents.items()
+            for layout in ("source pages", "flowing text")
         }
 
     def unicode_engines(self) -> list[str]:
@@ -1173,11 +1536,128 @@ class CompilationTests(TestCase):
             with self.subTest(document=name):
                 self.compile("pdflatex", PDFLATEX_OPTIONS, document)
 
+    def all_engines(self) -> dict[str, list[str]]:
+        engines = {engine: UNICODE_ENGINES[engine] for engine in self.unicode_engines()}
+        if shutil.which("pdflatex"):
+            engines["pdflatex"] = PDFLATEX_OPTIONS
+        return engines
+
+    def test_each_source_page_is_one_page_of_the_pdf(self) -> None:
+        filler = "The invented text of this page has no meaning and it only fills the lines. "
+        dense_table = Table(
+            caption="T<sc>ABLE</sc> 4. V<sc>ALUES FOR EACH STEP</sc>",
+            header_rows=1,
+            columns=("center", "center", "center"),
+            rules="columns",
+            double_rule=True,
+            rows=(
+                cells("Step", "Value", "Note<fn>a</fn>"),
+                *(
+                    cells(str(step), f"0,{step * 137 % 1000:03d}", "\u00bb")
+                    for step in range(1, 61)
+                ),
+            ),
+        )
+        pages = [
+            PageLayout(
+                blocks=(
+                    PageFurniture("page_header", "<sc>AN INVENTED BOOK</sc>", "top-center"),
+                    PageFurniture("page_number", "12", "top-right"),
+                    Heading("C<sc>HAPTER</sc> II", align="center"),
+                    Paragraph("firstmarker " + filler * 6 + "A mark.<fn>1</fn> " + filler * 5),
+                    Paragraph(filler * 3 + "The page ends in a docu-"),
+                    Footnote("The footnote of the first page.", mark="1"),
+                )
+            ),
+            # A dense page: a long table, an illustration with a caption, footnotes, and
+            # more text than one page holds at the usual size.
+            PageLayout(
+                blocks=(
+                    PageFurniture("page_number", "13", "top-left"),
+                    Paragraph(
+                        "mentation that continues. densemarker " + filler * 8, continued=True
+                    ),
+                    dense_table,
+                    Footnote("The footnote of the table.", mark="a"),
+                    Figure(box=BOX, caption="Fig. 7<br>An invented drawing", image=FIGURE_IMAGE),
+                    Paragraph(filler * 12 + "Second mark.<fn>2</fn>"),
+                    Footnote("The second footnote.", mark="2"),
+                    PageFurniture("page_footer", "densefoot", "bottom-center"),
+                )
+            ),
+            PageLayout(blocks=(Paragraph("sparsemarker"), PageFurniture("page_number", "14"))),
+            PageLayout(),
+            PageLayout(blocks=(Paragraph("lastmarker"),)),
+        ]
+        document = render_latex(pages)
+        for engine, options in self.all_engines().items():
+            with self.subTest(engine=engine):
+                texts, output = self.compile_pages(engine, options, document)
+                # Five pages of the source are five pages of the PDF, in sequence.
+                self.assertEqual(len(texts), len(pages), output[-2000:])
+                for index, marker in enumerate(
+                    ("firstmarker", "densemarker", "sparsemarker", None, "lastmarker")
+                ):
+                    for other_index, text in enumerate(texts):
+                        if marker is not None:
+                            self.assertEqual(marker in text, other_index == index, (marker, text))
+                self.assertEqual(texts[3], "")
+                # The running head and the printed page number are on the page.
+                self.assertTrue(texts[0].startswith("AN INVENTED BOOK 12 CHAPTER II"), texts[0])
+                self.assertTrue(texts[1].startswith("13 "), texts[1][:40])
+                self.assertTrue(texts[1].endswith("densefoot"), texts[1][-80:])
+                self.assertTrue(texts[2].endswith("14"), texts[2])
+                # The divided word is complete on the first page.
+                self.assertIn("The page ends in a documentation", texts[0])
+                self.assertIn("that continues. densemarker", texts[1])
+                # Each footnote is on the page of its mark, after the text of the page.
+                self.assertTrue(
+                    texts[0].endswith("1The footnote of the first page."), texts[0][-80:]
+                )
+                self.assertLess(
+                    texts[1].index("60 0,220"), texts[1].index("The footnote of the table.")
+                )
+                self.assertLess(
+                    texts[1].index("An invented drawing"),
+                    texts[1].index("The footnote of the table."),
+                )
+                self.assertIn("2The second footnote.", texts[1])
+                # The engine reports the page that is smaller, and no other page.
+                reports = re.findall(
+                    r"Source page (\d+) is at\s+(\d+)\s+percent of its size", output
+                )
+                self.assertEqual({number for number, _ in reports}, {"2"}, output[-2000:])
+                self.assertTrue(all(30 <= int(percent) < 100 for _, percent in reports), reports)
+                self.assertNotIn("Overfull \\vbox", output)
+
+    def test_small_capitals_are_capital_letters_in_the_pdf(self) -> None:
+        # The default font has no bold and no italic small capitals. The text of the PDF
+        # must have the capital forms of the source also there.
+        pages = [
+            PageLayout(
+                blocks=(
+                    Heading("C<sc>HAPTER</sc> II"),
+                    Paragraph(
+                        "<sc>Book the First</sc>, <i><sc>ROME</sc></i> and <b><sc>paris</sc></b>."
+                    ),
+                )
+            )
+        ]
+        for flow in (False, True):
+            document = render_latex(pages, flow=flow)
+            for engine, options in self.all_engines().items():
+                with self.subTest(engine=engine, flow=flow):
+                    (text,) = self.compile_pages(engine, options, document)[0]
+                    # The document with flowing text has a page number of LaTeX.
+                    self.assertEqual(
+                        text.removesuffix(" 1"), "CHAPTER II BOOK THE FIRST, ROME and PARIS."
+                    )
+
     def test_pdf_text_has_the_characters_of_the_source(self) -> None:
         # A search in the PDF and a copy from it must give the characters of the source.
         # The default text font does not have these characters.
         text = "Position 58\u2032 45\u2033 a\u2264b\u2260c \u222b\u2211\u220f \u2202\u03b1 end."
-        document = render_latex([PageLayout(blocks=(Paragraph(text), Table(rows=(cells(text),))))])
+        document = render_flow([PageLayout(blocks=(Paragraph(text), Table(rows=(cells(text),))))])
         for engine in self.unicode_engines():
             with self.subTest(engine=engine):
                 pdf_text = self.compile(engine, UNICODE_ENGINES[engine], document)

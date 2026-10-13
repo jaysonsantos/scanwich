@@ -184,14 +184,22 @@ class LatexConversionTests(TestCase):
         # Each page image has the size of its page at the requested DPI.
         self.assertEqual(backend.image_sizes, [(144, 72), (72, 144)])
         document = output_tex.read_text(encoding="utf-8")
+        # Each page of the PDF is one page of the document. The word that the page
+        # boundary divides is complete on the first page.
         self.assertIn(
-            "% Source page 1 (printed page number: 7)\n\n"
+            "% Source page 1 (printed page number: 7)\n"
+            "\\sourcepagehead{}{}{7}\n"
+            "\\begin{sourcepage}{1}\n\n"
             "\\section*{A chapter}\n\n"
-            "The first page ends in the middle of a sen%\n"
+            "The first page ends in the middle of a sentence,\n"
+            "% The page boundary of the source divides the last word of this paragraph. The\n"
+            "% complete word is here, and the next page starts after it. Compare it with the "
+            "source.\n\n"
+            "\\end{sourcepage}\n\n"
             "% Source page 2\n"
-            "% Scanwich joined the word that the page break divides. "
-            "Compare it with the source.\n"
-            "tence, and stops here.\n\n"
+            "\\begin{sourcepage}{2}\n\n"
+            "\\noindent and stops here.\n\n"
+            "\\end{sourcepage}\n\n"
             "\\end{document}\n",
             document,
         )
@@ -214,6 +222,26 @@ class LatexConversionTests(TestCase):
         self.assertIn("Wrote layout JSON for page 2", progress)
         self.assertIn(f"Wrote LaTeX document to {output_tex.resolve()}", progress)
         self.assertNotIn("illustration", progress)
+
+    def test_flow_gives_a_document_with_its_own_pages(self) -> None:
+        output_tex = self.directory / "page.tex"
+        first = PageLayout(blocks=(Paragraph("The page ends in a sen-"),))
+        second = PageLayout(blocks=(Paragraph("tence.", continued=True),))
+        input_pdf = self.directory / "input.pdf"
+        source = canvas.Canvas(str(input_pdf), pagesize=(144, 72))
+        source.showPage()
+        source.showPage()
+        source.save()
+
+        with self.assertLogs(LOGGER_NAME, level="INFO"):
+            convert_to_latex(
+                input_pdf, output_tex, backend=FakeLayoutBackend(first, second), dpi=72, flow=True
+            )
+
+        document = output_tex.read_text(encoding="utf-8")
+        # The paragraph is one paragraph, and the document has no box for a source page.
+        self.assertIn("The page ends in a sen%\n% Source page 2\n", document)
+        self.assertNotIn("sourcepage", document)
 
     def test_crops_the_illustrations_of_a_photo(self) -> None:
         # The name of the figure directory has only characters that are safe in LaTeX,
@@ -255,7 +283,7 @@ class LatexConversionTests(TestCase):
         self.assertIn(
             "\\includegraphics[width=0.25\\linewidth,height=0.75\\textheight,keepaspectratio]"
             f"{{{figure_directory_name}/page-0001-figure-01.jpg}}\n"
-            "\\par\\smallskip\nFig. 1\n\\end{minipage}\n\\end{center}",
+            "\\par\\smallskip\nFig. 1\n\\end{center}",
             document,
         )
         self.assertIn(f"{{{figure_directory_name}/page-0001-figure-02.jpg}}", document)
@@ -429,7 +457,12 @@ class LatexConversionTests(TestCase):
                 )
             ],
         )
-        self.assertIn("% Source page 1\n\n% Source page 2\n\nText.", output_tex.read_text())
+        # The page without content is an empty page of the document.
+        self.assertIn(
+            "% Source page 1\n\\begin{sourcepage}{1}\n\n\\end{sourcepage}\n\n"
+            "% Source page 2\n\\begin{sourcepage}{2}\n\nText.\n\n\\end{sourcepage}",
+            output_tex.read_text(),
+        )
 
     def test_documents_in_one_directory_do_not_share_their_illustrations(self) -> None:
         backend = FakeLayoutBackend(PageLayout(blocks=(Figure(box=Box(0, 0, 500, 500)),)))

@@ -562,18 +562,33 @@ class OpenAICompatibleBackend:
             "Scope. Read only the page that fills most of the image. Ignore the background, "
             "the binding, fingers, and the visible parts of other pages. Do not translate, "
             "correct, modernize, or complete the text. Keep the spelling, the capital letters, "
-            "the punctuation, the numbers, and the diacritics of the page.\n\n"
+            "the punctuation, the numbers, and the diacritics of the page. Do not add an "
+            "accent that the page does not print.\n\n"
+            "Capital forms. Write each letter in the case that the page prints. A line in "
+            "capitals or in small capitals has capital forms: write its letters as capital "
+            "letters, also in a caption and in a running head. Do not change such a line to "
+            "lowercase letters or to sentence case. Small capitals are capital forms that "
+            "are as high as lowercase letters. Put only them in <sc>, and write a large "
+            "capital letter before the tag. For a caption that the page prints as TABLE II. "
+            "RESULTS OF THE TESTS, with a large T and a large R, write "
+            '"T<sc>ABLE</sc> II. R<sc>ESULTS OF THE TESTS</sc>" and not "Table II. Results '
+            'of the tests".\n\n'
             'Blocks. "blocks" has the parts of the page in reading order. Each block is one '
             "of these, with only the fields that are shown:\n"
-            '- {"type":"page_header","text":"..."}, {"type":"page_footer","text":"..."}, and '
-            '{"type":"page_number","text":"..."}: the running head, the running foot, and the '
-            "page number that the page prints outside its text.\n"
+            '- {"type":"page_header","text":"...","position":"top-center"}, '
+            '{"type":"page_footer","text":"...","position":"bottom-center"}, and '
+            '{"type":"page_number","text":"...","position":"top-right"}: the running head, '
+            "the running foot, and the page number that the page prints outside its text. "
+            '"position" is the place on the page: "top-left", "top-center", "top-right", '
+            '"bottom-left", "bottom-center", or "bottom-right".\n'
             '- {"type":"heading","level":1,"text":"..."}: level 1 is a chapter or the main '
             'title, level 2 is a section, and level 3 is a subsection. Add "align":"center" '
             "for a centered heading.\n"
             '- {"type":"paragraph","text":"..."}: one paragraph. Write its lines as one line '
             "of text, with a space between the lines. When the end of a line divides a word "
-            "with a hyphen, write that word in one piece and without that hyphen. Add "
+            "with a hyphen, write that word in one piece and without that hyphen. When the "
+            "last line of the page ends with such a hyphen, keep that hyphen at the end of "
+            "the text: the rest of the word is on the next page. Add "
             '"align":"center" or "align":"right" for a paragraph that the page centers or '
             'sets flush right. Add "continued":true when the first paragraph of the page '
             "continues a paragraph of the page before.\n"
@@ -589,7 +604,9 @@ class OpenAICompatibleBackend:
             'ditto marks. "columns" has the alignment of each column: "left", "center", or '
             '"right". "rules" tells which rules the table prints: "none", "horizontal" '
             '(rules above the table, below the header, and below the table), "columns" (also '
-            'vertical rules between the columns), or "grid" (a rule around each cell).\n'
+            'vertical rules between the columns), or "grid" (a rule around each cell). Add '
+            '"double_rule":true when the rule above the table and the rule below it are '
+            "double rules.\n"
             f'- {{"type":"figure","box":{box},"caption":"..."}}: an '
             "illustration, photograph, diagram, map, ornament, stamp, or signature. "
             '"box" contains the full picture with its labels, and not its caption. Do not '
@@ -598,10 +615,11 @@ class OpenAICompatibleBackend:
             "mark as the page prints it.\n"
             'Leave out "caption" when there is none.\n\n'
             'Inline markup. In "text", in "caption", and in table cells, use only these tags: '
-            "<b> bold, <i> italic, <u> underlined, <sc> small capitals (write the small "
-            "capitals as lowercase letters), <sup> superscript, <sub> subscript, <br> for a "
-            "line break that the page makes on purpose (verse, an address, the lines of a "
-            "title), and <fn>mark</fn> at the place of a footnote reference mark. <fn> has "
+            "<b> bold, <i> italic, <u> underlined, <sc> small capitals, <sup> superscript, "
+            "<sub> subscript, <br> for a line break that the page makes on purpose (verse, "
+            "an address, the lines of a title, the lines of a centered caption), and "
+            "<fn>mark</fn> at the place of a footnote reference mark. The text in <sc> has "
+            "capital letters, as the paragraph about capital forms tells. <fn> has "
             "only the mark. The text of the footnote is in its footnote block. Do not use "
             "Markdown, LaTeX, or other HTML. Write a formula as plain text with Unicode "
             "characters.\n\n"

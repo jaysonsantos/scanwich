@@ -117,9 +117,30 @@ The document has these parts of the source, in reading order:
 
 - headings, paragraphs, block quotations, and lists;
 - bold, italic, underlined, small-capital, superscript, and subscript text;
-- tables as `longtable` environments, with cells that span columns or rows;
+- tables, with cells that span columns or rows;
 - illustrations as image files, which the document includes with `\includegraphics`;
-- footnotes as LaTeX footnotes.
+- footnotes, with the reference marks of the source;
+- the running head, the running foot, and the printed page number of each page, at their places.
+
+### Pages of the document
+
+Each page of the source is one page of the document, in the same sequence. Thus you can compare the document with the source page by page.
+The paper is A4, and the text area is 420pt by 672pt.
+
+- The content of a source page is in a box, in the `sourcepage` environment. A source page without content is an empty page.
+- When the content is too high for the text area, the page shows it at a smaller size. Thus a source page never becomes two pages.
+  The TeX engine then writes a warning that has the number of the source page and the size, for example `Package scanwich Warning: Source page 12 is at 87 percent of its size`.
+  Scanwich does not start a TeX engine, so the conversion cannot tell you this.
+- The running head and the page number are in the head line or the foot line of the page: at the left, at the center, or at the right. The page number is the printed number of the source.
+- A paragraph that continues on the next page stays in two parts. The second part has no indent.
+- When the page boundary divides a word with a hyphen, the complete word is on the first of the two pages, and the next page starts after it.
+  A search then finds the word, and a copy of the text has it in one piece. A comment line in the document shows the place. Compare that word with the source.
+- A footnote is below the content of its page, with its reference mark of the source.
+- An illustration is at its place in the sequence of the page, at the center of the line.
+
+`--flow` gives a document with flowing text. Its pages are not the pages of the source:
+a paragraph that continues on the next page becomes one paragraph, a table is a `longtable` environment that can continue on a new page, and LaTeX gives new numbers to the footnotes.
+The running head and the page number are then only in a comment line.
 
 Scanwich crops each illustration from the page image.
 The illustrations of `book.tex` are JPEG files of quality 95 in the directory `book-figures` next to the document.
@@ -143,8 +164,12 @@ tectonic book.tex
 
 These engines read all Unicode text.
 pdfLaTeX also compiles the document when the text has only characters that pdfLaTeX knows.
-The document uses the packages `iftex`, `fontspec`, `graphicx`, `array`, and `longtable`.
+The document uses the packages `iftex`, `fontspec`, `graphicx`, and `array`. With `--flow`, it also uses `longtable`.
 It uses `multirow` only when that package is installed.
+
+Small capitals are capital letters at a smaller size, from the command `\sourcesmallcaps` of the document.
+The document thus does not print a lowercase letter where the source has a capital form: not in bold or italic text, and not with a font that has no small capitals.
+The text of the PDF has the capital letters. The preamble of the document shows how to use the small capitals of the font.
 
 The text font of the document does not have some characters, for example a prime mark, a not-equal sign, and Greek letters.
 With LuaLaTeX, XeLaTeX, and Tectonic, such a character comes from the font Latin Modern Math when that font is installed. TeX Live has it in the package `lm-math`.
@@ -167,6 +192,11 @@ The backend does not write LaTeX. This has three effects:
 The module `scanwich.layout` defines the JSON.
 One page has `blocks` in reading order. The block types are `heading`, `paragraph`, `quote`, `list`, `table`, `figure`, `footnote`, `page_header`, `page_footer`, and `page_number`.
 Text can have the tags `<b>`, `<i>`, `<u>`, `<sc>`, `<sup>`, `<sub>`, `<br>`, and `<fn>mark</fn>`.
+The text in `<sc>` has the small capitals as capital letters, as the page prints them, and a large capital letter is before the tag: `C<sc>HAPTER</sc> II`.
+When a model does not give the tag, the document then prints capital letters of the usual size, and not lowercase letters.
+A text in `<sc>` that has lowercase letters uses them for the small capitals, and its capital letters are large capitals.
+A `page_header`, a `page_footer`, and a `page_number` can have a `position`: `top-left`, `top-center`, `top-right`, `bottom-left`, `bottom-center`, or `bottom-right`.
+A table can have `"double_rule": true` for a double rule above the table and below it.
 A box is `{"left": 120, "top": 300, "right": 880, "bottom": 560}` on a 0-to-1000 grid of the page image.
 The names of the sides leave no doubt about their sequence. The check also accepts the array `[left, top, right, bottom]`.
 
@@ -234,12 +264,14 @@ Scanwich uses the blocks of the backend also when the backend reports a differen
 Compare the document with the source. A model can read a character incorrectly.
 These differences are intended:
 
-- A running head and a printed page number are not text of the document. They are in a comment line at the start of each page, for example `% Source page 3 (printed page number: 47)`.
-- A paragraph that continues on the next page becomes one paragraph.
-  When the page break divides a word with a hyphen, Scanwich joins the two parts and adds a comment line. Compare that word with the source.
-- LaTeX gives new numbers to the footnotes, because the pages of the document are not the pages of the source.
-  The footnotes of a table and of a caption keep the marks of the source and come after the block.
-- A table has the rules of one of four styles: no rules, horizontal rules, also rules between the columns, or a rule around each cell. A double rule becomes one rule.
+- The lines of a paragraph are not the lines of the source. LaTeX makes new lines for the width of the text area.
+- A word that the page boundary divides is complete on the first of the two pages. See "Pages of the document".
+- A running head and a page number are at the left, at the center, or at the right of the head line or the foot line. Their distance from the text is that of the document.
+  The start of each page also has a comment line, for example `% Source page 3 (printed page number: 47)`.
+- A table has the rules of one of four styles: no rules, horizontal rules, also rules between the columns, or a rule around each cell.
+  The rule above the table and the rule below it can be double rules. A different double rule becomes one rule.
+- All text has the size of the document. A caption or a note that the source prints in a smaller size is not smaller.
+- A paragraph has the width of the text area, also when the source prints it on a narrow measure.
 - Scanwich estimates the widths of the table columns from the number of characters in the cells.
 - The document has one column. Text that is at the side of an illustration comes after the illustration.
 - A formula is plain text. Scanwich does not write LaTeX math for it.
