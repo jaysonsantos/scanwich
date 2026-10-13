@@ -221,6 +221,12 @@ class LatexConversionTests(TestCase):
         self.assertIn("Recognized 3 block(s) on page 1", progress)
         self.assertIn("Wrote layout JSON for page 2", progress)
         self.assertIn(f"Wrote LaTeX document to {output_tex.resolve()}", progress)
+        # The conversion tells where the signal for a page that is too high comes from.
+        self.assertIn(
+            "Each of the 2 source page(s) is one page of the document. A TeX engine writes a "
+            "warning for a source page that it makes smaller to keep it on one page",
+            progress,
+        )
         self.assertNotIn("illustration", progress)
 
     def test_flow_gives_a_document_with_its_own_pages(self) -> None:
@@ -233,10 +239,11 @@ class LatexConversionTests(TestCase):
         source.showPage()
         source.save()
 
-        with self.assertLogs(LOGGER_NAME, level="INFO"):
+        with self.assertLogs(LOGGER_NAME, level="INFO") as captured_logs:
             convert_to_latex(
                 input_pdf, output_tex, backend=FakeLayoutBackend(first, second), dpi=72, flow=True
             )
+        self.assertNotIn("one page of the document", "\n".join(captured_logs.output))
 
         document = output_tex.read_text(encoding="utf-8")
         # The paragraph is one paragraph, and the document has no box for a source page.

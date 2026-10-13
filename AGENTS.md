@@ -48,8 +48,9 @@ Tests use the standard-library `unittest` framework. Name files `test_*.py`, tes
 option parsing, lazy backend initialization, coordinate conversion, and PDF text extraction when
 those areas change. There is no numeric coverage threshold; new behavior should have direct tests.
 `tests.test_latex.CompilationTests` compiles documents with each of `lualatex`, `xelatex`,
-`tectonic`, and `pdflatex` that is on `PATH`, and skips the others. It also reads the text of
-the PDF, which needs the font Latin Modern Math for the first three engines. CI and the Nix
+`tectonic`, and `pdflatex` that is on `PATH`, and skips the others. It also counts the pages
+of the PDF and reads their text, which needs the font Latin Modern Math for the first three
+engines. One page of the source must stay one page of the PDF. CI and the Nix
 build have no TeX engine. When you change `latex.py`, run these tests with an engine, for example
 `nix shell nixpkgs#tectonic -c python -m unittest tests.test_latex -v` in the development shell.
 Tests and documentation must not have text or values from a private source document. Use

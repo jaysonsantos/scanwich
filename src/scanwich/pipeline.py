@@ -207,6 +207,13 @@ def convert_to_latex(
         finally:
             temporary_tex.unlink(missing_ok=True)
     logger.info("Wrote LaTeX document to %s", output_tex)
+    if not flow:
+        # Scanwich starts no TeX engine, so it does not know the height of a page.
+        logger.info(
+            "Each of the %d source page(s) is one page of the document. A TeX engine "
+            "writes a warning for a source page that it makes smaller to keep it on one page",
+            len(layouts),
+        )
     if figure_count:
         logger.info("Wrote %d illustration(s) to %s", figure_count, figure_directory)
 

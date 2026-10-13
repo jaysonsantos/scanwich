@@ -130,7 +130,7 @@ The paper is A4, and the text area is 420pt by 672pt.
 - The content of a source page is in a box, in the `sourcepage` environment. A source page without content is an empty page.
 - When the content is too high for the text area, the page shows it at a smaller size. Thus a source page never becomes two pages.
   The TeX engine then writes a warning that has the number of the source page and the size, for example `Package scanwich Warning: Source page 12 is at 87 percent of its size`.
-  Scanwich does not start a TeX engine, so the conversion cannot tell you this.
+  Scanwich does not start a TeX engine, so the conversion cannot tell you which page this is. Its log tells you to read the warnings of the engine.
 - The running head and the page number are in the head line or the foot line of the page: at the left, at the center, or at the right. The page number is the printed number of the source.
 - A paragraph that continues on the next page stays in two parts. The second part has no indent.
 - When the page boundary divides a word with a hyphen, the complete word is on the first of the two pages, and the next page starts after it.
