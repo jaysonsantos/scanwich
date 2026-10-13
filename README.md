@@ -109,6 +109,22 @@ scanwich page.ARW page.tex --ocr-backend openai-compatible -l de --rotate 90
 
 The input is a PDF, an image that Pillow can read, or a camera raw file.
 A PDF with many pages becomes one document. An image is one page.
+
+### Model for LaTeX output
+
+For LaTeX output, the `openai-compatible` backend uses the model `~openai/gpt-luna-latest` with the reasoning effort `medium`, on OpenRouter.
+You do not give these two values. The searchable PDF and the HTTP API keep their own defaults, see "OpenAI-compatible vision backend".
+
+- **Why this effort:** with `low`, the model writes a line in small capitals as lowercase letters. With `medium`, it keeps the capital forms and marks the small capitals.
+- **Cost and time:** on one test page, a photo of 24 megapixels with one drawing, a conversion needed 2 requests, about 0.005 USD, and about 50 seconds. A page with no illustration needs 1 request.
+- **Your own values:** `--backend-option model=...` and `--backend-option reasoning_effort=...` replace the defaults for all requests. A different `base_url` needs a `model` of that service.
+- **The alias `luna` is a different model ID.** It is `gpt-5.6-luna`, for a Hermes endpoint. See "Hermes and Luna".
+
+`~openai/gpt-luna-latest` is an alias. The provider moves it to a newer model. That has these effects:
+
+- A later conversion of the same book can give different text, different formatting, a different cost, and a different time. Scanwich cannot make it the same.
+- The result of a conversion is the `.tex` file, its figure directory, and the layout JSON files of `--ocr-output-dir`. Keep these files. Do not convert a book again to get the same document.
+- The log names the model that made each reply, when the response has that name: `the response names the model ...`. To convert more pages with that model, give its ID with `--backend-option model=...`.
 For a camera raw file, install the decoder with `pip install "scanwich[raw]"`.
 LibRaw then decodes all the sensor data. Scanwich does not use the small preview image of the file.
 Both Nix packages and both image targets include the decoder.
@@ -130,7 +146,9 @@ The paper is A4, and the text area is 420pt by 672pt.
 - The content of a source page is in a box, in the `sourcepage` environment. A source page without content is an empty page.
 - When the content is too high for the text area, the page shows it at a smaller size. Thus a source page never becomes two pages.
   The TeX engine then writes a warning that has the number of the source page and the size, for example `Package scanwich Warning: Source page 12 is at 87 percent of its size`.
+  LuaLaTeX, XeLaTeX, and pdfLaTeX write the warning to the terminal and to the log file. Tectonic writes it only to the log file, and it keeps that file only with `--keep-logs`.
   Scanwich does not start a TeX engine, so the conversion cannot tell you which page this is. Its log tells you to read the warnings of the engine.
+  The size has no lower limit: a page with very much content can be too small to read. `--flow` is the layout for such a book.
 - The running head and the page number are in the head line or the foot line of the page: at the left, at the center, or at the right. The page number is the printed number of the source.
 - A paragraph that continues on the next page stays in two parts. The second part has no indent.
 - When the page boundary divides a word with a hyphen, the complete word is on the first of the two pages, and the next page starts after it.
@@ -159,8 +177,10 @@ Scanwich does not start a TeX engine. Compile the document with LuaLaTeX, XeLaTe
 
 ```console
 latexmk -lualatex book.tex
-tectonic book.tex
+tectonic --keep-logs book.tex
 ```
+
+With `--keep-logs`, Tectonic keeps `book.log`. Search that file for `scanwich Warning` to find each source page that is at a smaller size.
 
 These engines read all Unicode text.
 pdfLaTeX also compiles the document when the text has only characters that pdfLaTeX knows.
@@ -196,6 +216,13 @@ The text in `<sc>` has the small capitals as capital letters, as the page prints
 When a model does not give the tag, the document then prints capital letters of the usual size, and not lowercase letters.
 A text in `<sc>` that has lowercase letters uses them for the small capitals, and its capital letters are large capitals.
 A `page_header`, a `page_footer`, and a `page_number` can have a `position`: `top-left`, `top-center`, `top-right`, `bottom-left`, `bottom-center`, or `bottom-right`.
+The check also accepts a value that has one clear meaning: the two words in each sequence, `upper` and `lower`, and only one of the two words, for example `top` or `right`.
+The document gives the usual place to the part that the layout does not have:
+
+- A running head is at the top center, and a running foot at the bottom center.
+- A page number is at the top when it comes before the content of the page, and else at the bottom.
+- At the bottom, a page number is at the center. At the top, it is at the outer side of the page: at the left for an even number and at the right for an odd number.
+  The reason is that a book prints an even number on a left page. A number that is not in digits is at the right.
 A table can have `"double_rule": true` for a double rule above the table and below it.
 A box is `{"left": 120, "top": 300, "right": 880, "bottom": 560}` on a 0-to-1000 grid of the page image.
 The names of the sides leave no doubt about their sequence. The check also accepts the array `[left, top, right, bottom]`.
@@ -235,17 +262,24 @@ The `openai-compatible` backend has it.
 - The backend returns the box of the illustration in that part, and the sides where the part cuts the illustration.
   The caption and the center of the first box tell the model which illustration to find when the part shows more than one.
 - Scanwich sends a larger part when the backend reports a cut side, and when the new box is nearer than 30 units to a side of the part. A label of the illustration can then be outside the part.
-  One illustration gets a maximum of 3 such requests.
 - The crop has the new box and a margin of 5 units at each side. The layout JSON also has the new box.
 - An `INFO` log record has the new box and the box of the page layout.
 
-A crop that is too large loses nothing, and a crop that cuts the illustration loses a part of it. Thus:
+A crop that is too large loses nothing, and a crop that cuts the illustration loses a part of it. Thus each case of doubt gives the larger crop and a `WARNING` log record. Compare that illustration with the source.
 
-- When the backend still reports a cut side after the last request, the crop goes to the border of the part at that side, with a `WARNING` log record.
-- When a request for the box fails, or the backend finds no illustration in the part, the crop uses the box that the backend gave before, with a `WARNING` log record. Compare that illustration with the source.
+- The backend still reports a cut side after the last request: the crop goes to the border of the part at that side.
+- A request for the box fails with an error of each type, or the backend finds no illustration in the part: the crop uses the box that the backend gave before. The conversion continues.
+- The new box has no part of the box of the page layout: the crop uses the box of the page layout.
+- The new box has more than 4 times the area of the box of the page layout, or less than a quarter: the crop has the two boxes.
 
-Each of these requests has a cost. A page with one illustration needs 2 requests, and a page without an illustration needs 1 request.
-The request is small: it has a part of the page, and its reply has only a box.
+The number of requests has these limits:
+
+- A request for a box has no correction request. One illustration gets a maximum of 3 requests for its box.
+- One page gets a maximum of 12 requests for boxes. The other illustrations of that page use the box of the page layout, with one `WARNING` log record.
+- The request for the layout of a page has a maximum of `max_attempts` requests, which is 3. Without `--rotate`, a page that is not upright gets that request two times.
+- Thus one page has a maximum of 18 requests, and of 15 with `--rotate`. The usual numbers are 1 request for a page with no illustration and 2 requests for a page with one illustration.
+
+Each request has a cost. The request for a box is small: it has a part of the page, and its reply has only a box.
 
 ### Page direction
 
@@ -344,6 +378,7 @@ scanwich input.pdf output.pdf \
 The built-in `openai-compatible` backend sends each rasterized page to an OpenAI-compatible
 chat-completions endpoint. It defaults to OpenRouter and the image-capable
 `deepseek/deepseek-v4-flash-vision-exp` model.
+LaTeX output has a different default model and effort, see "Model for LaTeX output". That model did not get a test for the text regions of a searchable PDF.
 Install the SDK with `pip install "scanwich[openai-compatible]"`.
 Both Nix packages and image targets include the SDK.
 Set the API key in the environment:
@@ -390,6 +425,8 @@ The last record of a session thus has the cost of the document. OpenRouter repor
 A failed request has no `usage.cost`, so the total does not include it.
 When a response has `usage.prompt_tokens` and `usage.completion_tokens`, the backend also writes one `INFO` log record with the two numbers.
 The record also has the reasoning tokens when the response has `usage.completion_tokens_details.reasoning_tokens`. They are a part of the completion tokens.
+When the response names a model, the record ends with `; the response names the model ...`. For a model ID that is an alias, this is the model that made the reply.
+Each record names the model of its request, so the records of LaTeX output name the model for LaTeX output.
 
 ```text
 INFO: OpenAI-compatible session 2f0c6f0e-5d0b-4c53-9d57-3f6a4f1f6f0a, model provider/vision-model: usage.cost=0.001500 for this request, total 0.003000 for 2 request(s)
