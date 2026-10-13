@@ -16,7 +16,9 @@ from scanwich.backends.openai_compatible import (
     PROVIDER_DETAIL_MAX_CHARACTERS,
     OpenAICompatibleBackend,
 )
-from scanwich.models import Point
+from scanwich.models import OcrRegion, Point
+
+LOGGER_NAME = "scanwich.backends.openai_compatible"
 
 
 class FakeCompletions:
@@ -37,7 +39,42 @@ class FakeCompletions:
         )
 
 
+def box(text: str, left: float, top: float, right: float, bottom: float) -> dict[str, Any]:
+    """Return a model region with an axis-aligned polygon."""
+    return {
+        "text": text,
+        "polygon": [
+            {"x": left, "y": top},
+            {"x": right, "y": top},
+            {"x": right, "y": bottom},
+            {"x": left, "y": bottom},
+        ],
+    }
+
+
+def corners(left: float, top: float, right: float, bottom: float) -> tuple[Point, ...]:
+    return (Point(left, top), Point(right, top), Point(right, bottom), Point(left, bottom))
+
+
 class OpenAICompatibleBackendTests(TestCase):
+    def recognize_payload(
+        self, payload: dict[str, Any], image_size: tuple[int, int]
+    ) -> list[OcrRegion]:
+        """Return the regions that the backend makes from one model payload."""
+        completions = FakeCompletions(json.dumps(payload))
+        fake_client = SimpleNamespace(chat=SimpleNamespace(completions=completions))
+        fake_openai = SimpleNamespace(OpenAI=lambda **_: fake_client)
+        with TemporaryDirectory() as temporary_directory:
+            image_path = Path(temporary_directory) / "page.png"
+            Image.new("RGB", image_size, "white").save(image_path)
+            backend = OpenAICompatibleBackend(languages=["en"], options={})
+
+            with (
+                patch.dict(os.environ, {"OPENROUTER_API_KEY": "test-secret"}),
+                patch.dict(sys.modules, {"openai": fake_openai}),
+            ):
+                return backend.recognize(image_path)
+
     def recognition_error(self, reply: SimpleNamespace) -> RuntimeError:
         """Return the error that the backend raises for one provider reply."""
         completions = SimpleNamespace(create=lambda **_: reply)
@@ -239,35 +276,155 @@ class OpenAICompatibleBackendTests(TestCase):
             ):
                 backend.recognize(image_path)
 
-    def test_rejects_out_of_bounds_model_coordinates(self) -> None:
+    def test_clamps_out_of_bounds_coordinates_to_the_declared_bounds(self) -> None:
+        cases = (
+            (
+                "normalized",
+                (10, 10),
+                box("private text", 0, 0, 1051, 1000),
+                corners(0, 0, 10, 10),
+                (
+                    "declared coordinate_system=normalized, used coordinate_system=normalized, "
+                    "image=10x10 pixels, 2 of 4 points outside, largest distance 51.0"
+                ),
+            ),
+            (
+                "pixels",
+                (612, 792),
+                box("private text", 100, 700, 700, 900),
+                corners(100, 700, 612, 792),
+                (
+                    "declared coordinate_system=pixels, used coordinate_system=pixels, "
+                    "image=612x792 pixels, 3 of 4 points outside, largest distance 108.0"
+                ),
+            ),
+        )
+        for coordinate_system, image_size, region, polygon, summary in cases:
+            with self.subTest(coordinate_system=coordinate_system):
+                payload = {"coordinate_system": coordinate_system, "regions": [region]}
+                with self.assertLogs(LOGGER_NAME, level="WARNING") as logs:
+                    regions = self.recognize_payload(payload, image_size)
+                self.assertEqual([region.polygon for region in regions], [polygon])
+                self.assertEqual([region.text for region in regions], ["private text"])
+                clamped = [line for line in logs.output if "were clamped" in line]
+                self.assertEqual(len(clamped), 1)
+                self.assertIn(summary, clamped[0])
+                self.assertNotIn("private", "\n".join(logs.output))
+
+    def test_uses_pixels_when_most_regions_are_far_outside_the_grid(self) -> None:
+        cases = (
+            (
+                "portrait page",
+                (2000, 3000),
+                [(300, 300, 1800, 360), (300, 1700, 1800, 1760), (300, 500, 800, 560)],
+                "2 of 3 regions",
+            ),
+            (
+                "landscape page",
+                (2000, 1000),
+                [(100, 100, 1800, 160), (100, 400, 1800, 460), (100, 700, 1800, 760)],
+                "3 of 3 regions",
+            ),
+        )
+        for name, image_size, boxes, share in cases:
+            with self.subTest(name):
+                payload = {
+                    "coordinate_system": "normalized",
+                    "regions": [box("private text", *edges) for edges in boxes],
+                }
+                with self.assertLogs(LOGGER_NAME, level="WARNING") as logs:
+                    regions = self.recognize_payload(payload, image_size)
+                self.assertEqual(
+                    [region.polygon for region in regions], [corners(*edges) for edges in boxes]
+                )
+                (record,) = logs.output
+                self.assertIn(
+                    f"declared normalized coordinates, but {share} are more than 250 units "
+                    f"outside the 0-to-1000 grid and all points fit the "
+                    f"{image_size[0]}x{image_size[1]} pixel image; using the coordinates as pixels",
+                    record,
+                )
+                self.assertNotIn("private", record)
+
+    def test_keeps_normalized_scaling_without_clear_evidence_of_pixels(self) -> None:
+        # All these points also fit the image, but no point is far outside the grid.
+        rows = range(1, 9)
+        cases = (
+            ("one region partly outside", [box("private text", 100, 100, 1051, 130)], 2),
+            (
+                "all regions partly outside",
+                [box("private text", 100, 100 * row, 1060, 100 * row + 30) for row in rows],
+                16,
+            ),
+        )
+        for name, page, points_outside in cases:
+            with self.subTest(name):
+                payload = {"coordinate_system": "normalized", "regions": page}
+                with self.assertLogs(LOGGER_NAME, level="WARNING") as logs:
+                    regions = self.recognize_payload(payload, (2000, 3000))
+                self.assertEqual(
+                    [region.polygon for region in regions],
+                    [corners(200, 300 * row, 2000, 300 * row + 90) for row in rows][: len(page)],
+                )
+                (record,) = logs.output
+                self.assertIn("used coordinate_system=normalized", record)
+                self.assertIn(f"{points_outside} of {4 * len(page)} points outside", record)
+
+    def test_keeps_normalized_scaling_for_a_page_with_one_region(self) -> None:
+        for bottom in (1200, 1400):
+            with self.subTest(bottom=bottom):
+                payload = {
+                    "coordinate_system": "normalized",
+                    "regions": [box("private text", 100, 950, 900, bottom)],
+                }
+                with self.assertLogs(LOGGER_NAME, level="WARNING") as logs:
+                    regions = self.recognize_payload(payload, (2000, 3000))
+                self.assertEqual(
+                    [region.polygon for region in regions], [corners(200, 2850, 1800, 3000)]
+                )
+                (record,) = logs.output
+                self.assertIn("used coordinate_system=normalized", record)
+                self.assertIn(
+                    f"2 of 4 points outside, largest distance {bottom - 1000:.1f}", record
+                )
+
+    def test_keeps_good_regions_of_a_page_with_out_of_bounds_regions(self) -> None:
         payload = {
             "coordinate_system": "normalized",
             "regions": [
-                {
-                    "text": "text",
-                    "polygon": [
-                        {"x": 0, "y": 0},
-                        {"x": 1051, "y": 0},
-                        {"x": 1000, "y": 1000},
-                        {"x": 0, "y": 1000},
-                    ],
-                }
+                box("private good line one", 100, 100, 900, 130),
+                box("private good line two", 100, 200, 900, 230),
+                box("private good line three", 100, 300, 900, 330),
+                box("private bad bottom line", 100, 960, 900, 1500),
             ],
         }
-        completions = FakeCompletions(json.dumps(payload))
-        fake_client = SimpleNamespace(chat=SimpleNamespace(completions=completions))
-        fake_openai = SimpleNamespace(OpenAI=lambda **_: fake_client)
-        with TemporaryDirectory() as temporary_directory:
-            image_path = Path(temporary_directory) / "page.png"
-            Image.new("RGB", (10, 10), "white").save(image_path)
-            backend = OpenAICompatibleBackend(languages=["en"], options={})
-
-            with (
-                patch.dict(os.environ, {"OPENROUTER_API_KEY": "test-secret"}),
-                patch.dict(sys.modules, {"openai": fake_openai}),
-                self.assertRaisesRegex(RuntimeError, "exceed their declared bounds"),
-            ):
-                backend.recognize(image_path)
+        with self.assertLogs(LOGGER_NAME, level="WARNING") as logs:
+            regions = self.recognize_payload(payload, (2000, 3000))
+        self.assertEqual(
+            [region.polygon for region in regions],
+            [
+                corners(200, 300, 1800, 390),
+                corners(200, 600, 1800, 690),
+                corners(200, 900, 1800, 990),
+                corners(200, 2880, 1800, 3000),
+            ],
+        )
+        self.assertEqual(
+            [region.text for region in regions],
+            [
+                "private good line one",
+                "private good line two",
+                "private good line three",
+                "private bad bottom line",
+            ],
+        )
+        (record,) = logs.output
+        self.assertIn(
+            "declared coordinate_system=normalized, used coordinate_system=normalized, "
+            "image=2000x3000 pixels, 2 of 16 points outside, largest distance 500.0",
+            record,
+        )
+        self.assertNotIn("private", record)
 
     def test_accepts_native_pixel_coordinates_for_a_page(self) -> None:
         payload = {
