@@ -51,8 +51,15 @@ FIGURE_SEARCH_MARGIN_RATIO = 0.5
 # nearer than this to a side of the part, a label of the illustration can be outside the
 # part. The part then becomes larger at that side, and the backend gets it again.
 FIGURE_SEARCH_MIN_GAP = 30.0
-# The maximum number of requests for the box of one illustration.
+# The maximum number of requests for the box of one illustration, and for the boxes of
+# all illustrations of one page. A page layout can have many blocks that are not
+# illustrations of the page, for example each ornament.
 FIGURE_SEARCH_REQUESTS = 3
+FIGURE_SEARCH_PAGE_REQUESTS = 12
+# The box of a second request is not better than the box of the page layout in each case.
+# A second box that has this many times the area of the first box, or less than the
+# inverse, is in doubt.
+FIGURE_BOX_AREA_RATIO = 4.0
 # LaTeX reads the name of the figure directory in a command, so the name has only
 # characters that are safe there.
 UNSAFE_NAME_CHARACTERS = re.compile(r"[^A-Za-z0-9._-]+")
@@ -311,47 +318,73 @@ def _locate_figures(
     work_directory.mkdir(parents=True, exist_ok=True)
     blocks = []
     figure_number = 0
+    requests_left = FIGURE_SEARCH_PAGE_REQUESTS
+    without_request = 0
     with Image.open(page_image) as image:
         for block in layout.blocks:
             if isinstance(block, Figure):
                 figure_number += 1
-                box = _locate_figure(
-                    backend,
-                    image,
-                    block,
-                    work_directory / "region.png",
-                    f"illustration {figure_number} of page {page_number}",
-                )
-                block = replace(block, box=box)
+                if requests_left:
+                    box, requests = _locate_figure(
+                        backend,
+                        image,
+                        block,
+                        work_directory / "region.png",
+                        f"illustration {figure_number} of page {page_number}",
+                        min(FIGURE_SEARCH_REQUESTS, requests_left),
+                    )
+                    requests_left -= requests
+                    block = replace(block, box=box)
+                else:
+                    without_request += 1
             blocks.append(block)
+    if without_request:
+        logger.warning(
+            "Page %d has %d illustration(s) in its layout, and one page has a limit of %d "
+            "requests for the boxes of illustrations; %d illustration(s) use the box of "
+            "the page layout. Compare them with the source",
+            page_number,
+            figure_number,
+            FIGURE_SEARCH_PAGE_REQUESTS,
+            without_request,
+        )
     return replace(layout, blocks=tuple(blocks))
 
 
 def _locate_figure(
-    backend: FigureLocator, image: Image.Image, figure: Figure, region_path: Path, name: str
-) -> Box:
-    """Return the box of one illustration on the grid of the page image.
+    backend: FigureLocator,
+    image: Image.Image,
+    figure: Figure,
+    region_path: Path,
+    name: str,
+    max_requests: int,
+) -> tuple[Box, int]:
+    """Return the box of one illustration on the grid of the page image, and the requests.
 
     The backend gets a part of the page image around the box of the layout. It gets a
     larger part when the first part does not show the full illustration with paper around
-    it. The function keeps the box of the layout when the backend gives no box.
+    it, until `max_requests` requests. The function keeps the box of the layout when the
+    backend gives no box, and it does not use a new box that is in doubt without a warning.
     """
     region = _search_region(figure.box)
     box = figure.box
-    for request in range(1, FIGURE_SEARCH_REQUESTS + 1):
+    for request in range(1, max_requests + 1):
         crop_box(image, region).save(region_path, format="PNG", compress_level=1)
         try:
             location = backend.locate_figure(
                 region_path, estimate=_box_in_region(box, region), caption=figure.caption
             )
-        except (RuntimeError, ValueError) as error:
+        except Exception as error:
+            # The page has a layout, so a failure of this request does not stop the
+            # conversion, for each type of error of a backend.
             logger.warning(
-                "The request for the box of %s failed (%s); the crop uses the box that the "
-                "backend gave before. Compare the illustration with the source",
+                "The request for the box of %s failed (%s: %s); the crop uses the box that "
+                "the backend gave before. Compare the illustration with the source",
                 name,
+                type(error).__name__,
                 error,
             )
-            return box
+            return _checked_box(figure.box, box, name), request
         if location is None:
             logger.warning(
                 "The backend found no illustration in the part of the page image for %s; "
@@ -359,12 +392,12 @@ def _locate_figure(
                 "illustration with the source",
                 name,
             )
-            return box
+            return _checked_box(figure.box, box, name), request
         box = _box_on_page(location.box, region)
         open_sides = _open_sides(box, region, location.cut_sides)
         if not open_sides:
             break
-        if request == FIGURE_SEARCH_REQUESTS:
+        if request == max_requests:
             still_cut = [side for side in BOX_SIDES if side in open_sides & location.cut_sides]
             if still_cut:
                 # A crop that is too large loses nothing. A crop that cuts the
@@ -378,8 +411,11 @@ def _locate_figure(
                     name,
                     ", ".join(still_cut),
                 )
+                # This box is large on purpose, and it has its warning.
+                return box, request
             break
         region = _grown_region(region, open_sides)
+    box = _checked_box(figure.box, box, name)
     logger.info(
         "The box of %s is %s after %d request(s) for it; the page layout gave %s",
         name,
@@ -387,7 +423,47 @@ def _locate_figure(
         request,
         _box_text(figure.box),
     )
-    return box
+    return box, request
+
+
+def _checked_box(first: Box, second: Box, name: str) -> Box:
+    """Return the box for the crop, from the box of the page layout and a second box.
+
+    The second box is the better one in most cases. It is in doubt when it has no part
+    of the first box, and when its area is very different. A crop that is too large loses
+    nothing, and a crop that cuts the illustration loses a part of it. Thus the crop then
+    has the first box also.
+    """
+    if second == first:
+        return first
+    overlap_width = min(first.right, second.right) - max(first.left, second.left)
+    overlap_height = min(first.bottom, second.bottom) - max(first.top, second.top)
+    if overlap_width <= 0 or overlap_height <= 0:
+        logger.warning(
+            "The second box of %s (%s) has no part of the box of the page layout (%s); the "
+            "crop uses the box of the page layout. Compare the illustration with the source",
+            name,
+            _box_text(second),
+            _box_text(first),
+        )
+        return first
+    ratio = (second.width * second.height) / (first.width * first.height)
+    if 1 / FIGURE_BOX_AREA_RATIO <= ratio <= FIGURE_BOX_AREA_RATIO:
+        return second
+    logger.warning(
+        "The second box of %s (%s) is much %s than the box of the page layout (%s); the "
+        "crop has the two boxes. Compare the illustration with the source",
+        name,
+        _box_text(second),
+        "smaller" if ratio < 1 else "larger",
+        _box_text(first),
+    )
+    return Box(
+        left=min(first.left, second.left),
+        top=min(first.top, second.top),
+        right=max(first.right, second.right),
+        bottom=max(first.bottom, second.bottom),
+    )
 
 
 def _search_region(box: Box) -> Box:

@@ -25,6 +25,7 @@ from scanwich.layout import (
 from scanwich.models import OcrRegion, Point
 from scanwich.ocr import FigureLocator, LayoutBackend, OcrBackend, backend_request_options
 from scanwich.pipeline import (
+    FIGURE_SEARCH_PAGE_REQUESTS,
     FIGURE_SEARCH_REQUESTS,
     PageLayoutError,
     convert_pdf,
@@ -821,9 +822,9 @@ class FigureBoxTests(TestCase):
                 FailingFigureBackend(layout),
                 self.page((300, 400, 600, 550)),
                 (
-                    "The request for the box of illustration 1 of page 1 failed (the service is "
-                    "not available); the crop uses the box that the backend gave before. Compare "
-                    "the illustration with the source"
+                    "The request for the box of illustration 1 of page 1 failed (RuntimeError: "
+                    "the service is not available); the crop uses the box that the backend gave "
+                    "before. Compare the illustration with the source"
                 ),
             ),
             (
@@ -846,3 +847,172 @@ class FigureBoxTests(TestCase):
                 self.assertEqual(box, first_box)
                 self.assertEqual(captured_logs.output, [f"WARNING:{LOGGER_NAME}:{warning}"])
                 self.assertEqual(self.crop().size, (310, 320))
+
+    def test_each_error_of_the_second_request_keeps_the_document(self) -> None:
+        # The page has its layout. A failure of the request for a box gives the box of
+        # the layout, for each type of error of a backend.
+        first_box = Box(300, 450, 600, 600)
+        layout = PageLayout(blocks=(Paragraph("Text."), Figure(box=first_box)))
+        errors = [
+            TypeError("a wrong type"),
+            ConnectionError("no network"),
+            TimeoutError("too slow"),
+            KeyError("box"),
+            OSError("no space"),
+        ]
+        for error in errors:
+
+            class RaisingBackend(FakeFigureBackend):
+                def locate_figure(
+                    self, image_path: Path, *, failure: Exception = error, **hints: object
+                ) -> FigureLocation:
+                    raise failure
+
+            with (
+                self.subTest(error=type(error).__name__),
+                self.assertLogs(LOGGER_NAME, level="WARNING") as captured_logs,
+            ):
+                box = self.convert(RaisingBackend(layout), self.page((300, 400, 600, 550)))
+                self.assertEqual(box, first_box)
+                self.assertEqual(len(captured_logs.output), 1)
+                self.assertIn(
+                    f"The request for the box of illustration 1 of page 1 failed "
+                    f"({type(error).__name__}: ",
+                    captured_logs.output[0],
+                )
+                self.assertIn("Text.", (self.directory / "page.tex").read_text(encoding="utf-8"))
+
+    def fixed_box_backend(self, layout: PageLayout, reply: FigureLocation) -> FakeFigureBackend:
+        class FixedBackend(FakeFigureBackend):
+            def locate_figure(self, image_path: Path, **hints: object) -> FigureLocation:
+                super().locate_figure(image_path)
+                return reply
+
+        return FixedBackend(layout)
+
+    def test_second_box_that_is_in_doubt_does_not_replace_the_first_box(self) -> None:
+        # The first box is 300 to 600 across and 400 to 550 down. The part of the page for
+        # the second request is 150 to 750 across and 300 to 650 down.
+        first_box = Box(300, 400, 600, 550)
+        layout = PageLayout(blocks=(Figure(box=first_box),))
+        cases = {
+            "no part of the first box": (
+                # 210 to 270 across, 335 to 363 down: a different place.
+                FigureLocation(Box(100, 100, 200, 180)),
+                (
+                    "The second box of illustration 1 of page 1 (left 210, top 335, right 270, "
+                    "bottom 363) has no part of the box of the page layout (left 300, top 400, "
+                    "right 600, bottom 550); the crop uses the box of the page layout. Compare "
+                    "the illustration with the source"
+                ),
+            ),
+            "a small part of the first box": (
+                # 420 to 480 across, 440 to 510 down: 9 percent of the area.
+                FigureLocation(Box(450, 400, 550, 600)),
+                (
+                    "The second box of illustration 1 of page 1 (left 420, top 440, right 480, "
+                    "bottom 510) is much smaller than the box of the page layout (left 300, top "
+                    "400, right 600, bottom 550); the crop has the two boxes. Compare the "
+                    "illustration with the source"
+                ),
+            ),
+        }
+        for name, (reply, warning) in cases.items():
+            backend = self.fixed_box_backend(layout, reply)
+            with (
+                self.subTest(name=name),
+                self.assertLogs(LOGGER_NAME, level="WARNING") as captured_logs,
+            ):
+                box = self.convert(backend, self.page((300, 400, 600, 550)))
+                self.assertEqual(box, first_box)
+                self.assertEqual(captured_logs.output, [f"WARNING:{LOGGER_NAME}:{warning}"])
+                # The crop has the full red part.
+                self.assertEqual(red_part(self.crop()), (5, 10, 305, 310))
+
+    def test_second_box_that_is_much_larger_gets_a_warning(self) -> None:
+        # The backend returns the full part of the page, each time.
+        first_box = Box(300, 400, 600, 550)
+        layout = PageLayout(blocks=(Figure(box=first_box),))
+        backend = self.fixed_box_backend(layout, FigureLocation(Box(0, 0, 1000, 1000)))
+
+        with self.assertLogs(LOGGER_NAME, level="WARNING") as captured_logs:
+            box = self.convert(backend, self.page((300, 400, 600, 550)))
+
+        # Each request has a larger part, because the box is at the border of the part.
+        self.assertEqual(len(backend.part_sizes), FIGURE_SEARCH_REQUESTS)
+        self.assertEqual(box, Box(0.0, 100.0, 950.0, 850.0))
+        self.assertEqual(
+            captured_logs.output,
+            [
+                (
+                    f"WARNING:{LOGGER_NAME}:The second box of illustration 1 of page 1 (left 0, "
+                    "top 100, right 950, bottom 850) is much larger than the box of the page "
+                    "layout (left 300, top 400, right 600, bottom 550); the crop has the two "
+                    "boxes. Compare the illustration with the source"
+                )
+            ],
+        )
+
+    def test_second_box_of_a_usual_size_replaces_the_first_box(self) -> None:
+        # A first box can be 2 times too large, or have a third of the illustration.
+        first_box = Box(300, 400, 600, 550)
+        layout = PageLayout(blocks=(Figure(box=first_box),))
+        for reply, final_box in (
+            # 3.3 times the area of the first box.
+            (FigureLocation(Box(60, 100, 940, 900)), Box(186.0, 335.0, 714.0, 615.0)),
+            # 0.28 times the area.
+            (FigureLocation(Box(350, 300, 650, 500)), Box(360.0, 405.0, 540.0, 475.0)),
+        ):
+            backend = self.fixed_box_backend(layout, reply)
+            with self.subTest(reply=reply), self.assertNoLogs(LOGGER_NAME, level="WARNING"):
+                self.assertEqual(self.convert(backend, self.page()), final_box)
+
+    def test_one_page_has_a_limit_of_requests_for_boxes(self) -> None:
+        # A model can report each ornament of a page as an illustration.
+        figures = tuple(
+            Figure(box=Box(100, 40 + 60 * number, 300, 80 + 60 * number)) for number in range(15)
+        )
+        layout = PageLayout(blocks=(Paragraph("Text."), *figures))
+        backend = self.fixed_box_backend(layout, FigureLocation(Box(300, 300, 700, 700)))
+
+        with self.assertLogs(LOGGER_NAME, level="WARNING") as captured_logs:
+            convert_to_latex(
+                self.page(),
+                self.directory / "page.tex",
+                backend=backend,
+                ocr_output_directory=self.directory / "layout",
+            )
+
+        self.assertEqual(FIGURE_SEARCH_PAGE_REQUESTS, 12)
+        self.assertEqual(len(backend.part_sizes), 12)
+        self.assertEqual(
+            captured_logs.output,
+            [
+                (
+                    f"WARNING:{LOGGER_NAME}:Page 1 has 15 illustration(s) in its layout, and one "
+                    "page has a limit of 12 requests for the boxes of illustrations; 3 "
+                    "illustration(s) use the box of the page layout. Compare them with the source"
+                )
+            ],
+        )
+        saved = json.loads((self.directory / "layout" / "page-000001.json").read_text())
+        boxes = [Box(**block["box"]) for block in saved["blocks"] if block["type"] == "figure"]
+        # The last 3 illustrations have the boxes of the page layout.
+        self.assertEqual(boxes[12:], [figure.box for figure in figures[12:]])
+        self.assertNotEqual(boxes[0], figures[0].box)
+
+    def test_requests_of_one_illustration_count_for_the_limit_of_the_page(self) -> None:
+        # Each illustration needs 3 requests here, so 4 illustrations use the 12 requests.
+        figures = tuple(
+            Figure(box=Box(300, 100 + 150 * number, 600, 200 + 150 * number)) for number in range(5)
+        )
+        layout = PageLayout(blocks=figures)
+        backend = self.fixed_box_backend(
+            layout, FigureLocation(Box(300, 300, 700, 700), frozenset({"left"}))
+        )
+
+        with self.assertLogs(LOGGER_NAME, level="WARNING") as captured_logs:
+            convert_to_latex(self.page(), self.directory / "page.tex", backend=backend)
+
+        self.assertEqual(len(backend.part_sizes), 12)
+        self.assertIn("1 illustration(s) use the box of the page layout", captured_logs.output[-1])
