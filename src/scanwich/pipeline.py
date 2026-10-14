@@ -125,8 +125,16 @@ PAGE_QUEUE_SIZE = 1
 # the count again. A page with a reply that is not usable, or with an answer of the
 # service about its content, does not count: the service works.
 NO_REPLY_WAVES = 3
+# When the first this many pages of a conversion that need a request fail, for each
+# reason, and no page has a layout, the conversion starts no more pages. A service that
+# gives only replies that Scanwich cannot use, for example after a wrong model option,
+# then has a cost for 10 pages and not for a book. 10 difficult pages in sequence at the
+# start of a book are improbable. A layout directory with a saved layout turns the rule
+# off, so that a book whose first pages are difficult does not stop at each run.
+FIRST_FAILED_PAGES = 10
 # The reasons of a stop of the conversion before its last page.
 STOP_NO_REPLY = "no reply"
+STOP_FIRST_PAGES = "first pages"
 # The waits in seconds after the service answers that it gets too many requests. All
 # requests of the conversion wait. After the last wait, the request fails.
 RATE_LIMIT_WAITS = (30.0, 60.0, 120.0)
@@ -771,6 +779,8 @@ class _Conversion:
         self._saved_pages = 0
         # The reason of a stop of the conversion before its last page.
         self._stop_reason: str | None = None
+        # The pages whose requests failed, for each reason.
+        self._failed_readings = 0
         # The waves in sequence of pages with no reply from the service, and the time of
         # the event loop when the last page that counted failed.
         self._waves_without_reply = 0
@@ -846,7 +856,19 @@ class _Conversion:
         if not_started:
             lines.append(f"  {len(not_started)} page(s) did not start: {_page_ranges(not_started)}")
         saved = f"The layouts of the pages that are complete are in {self._layout_directory}."
-        if self._stop_reason == STOP_NO_REPLY:
+        if self._stop_reason == STOP_FIRST_PAGES:
+            lines.append(
+                ("The conversion started no more pages: the" if not_started else "The")
+                + f" first {FIRST_FAILED_PAGES} pages that needed a request failed, and no page "
+                "has a layout. The cause is probably the model or an option, for example a "
+                "model that does not read images."
+            )
+            lines.append(
+                "Correct the model or the option, and run the same command again. If these "
+                "pages are the cause, convert the other files first, with the same layout "
+                "directory: a layout directory with a saved layout turns this rule off."
+            )
+        elif self._stop_reason == STOP_NO_REPLY:
             # All pages can have started before the stop.
             lines.append(
                 ("The conversion started no more pages: the" if not_started else "The")
@@ -1062,8 +1084,9 @@ class _Conversion:
         cost and a new run sends its request again.
 
         The conversion also starts no more pages when the service gives no reply for
-        some pages in sequence. Without this rule, a service that stops in the middle of
-        a book makes each later page wait for its timeout.
+        some waves of pages in sequence. Without this rule, a service that stops in the
+        middle of a book makes each later page wait for its timeout. It also starts no
+        more pages when its first pages all fail and no page has a layout.
         """
         if self._layout_directory is None:
             if self._layouts:
@@ -1080,7 +1103,19 @@ class _Conversion:
         logger.error(
             "Page %d/%d (%s) has no layout: %s", page.number, len(self._pages), page.label, message
         )
-        if not read or not isinstance(error, NoReplyError):
+        if not read:
+            return
+        self._failed_readings += 1
+        no_layout = not (self._read_pages or self._saved_pages or self._saved_index)
+        if no_layout and self._failed_readings >= FIRST_FAILED_PAGES and not self._stop.is_set():
+            self._stop.set()
+            self._stop_reason = STOP_FIRST_PAGES
+            logger.error(
+                "The first %d pages that needed a request failed, and no page has a layout, so "
+                "the conversion starts no more pages",
+                self._failed_readings,
+            )
+        if not isinstance(error, NoReplyError):
             return
         if started > self._last_counted_no_reply:
             # A page that was in work when the last page counted belongs to that wave.

@@ -1155,6 +1155,65 @@ class FailedPageTests(BookTestCase):
             error,
         )
 
+    def test_conversion_starts_no_more_pages_when_its_first_pages_all_fail(self) -> None:
+        # A service that gives only replies that Scanwich cannot use, for example after
+        # a wrong model option. Without this rule, each page of a book has a cost.
+        self.assertEqual(pipeline.FIRST_FAILED_PAGES, 10)
+        inputs = self.photos(24)
+        for readers in (1, 4):
+            backend = PageBackend(failing=range(1, 25))
+            layouts = self.directory / f"layouts-{readers}"
+            with (
+                self.subTest(readers=readers),
+                self.assertLogs(LOGGER_NAME, level="ERROR") as captured_logs,
+                self.assertRaises(PageLayoutError) as raised,
+            ):
+                self.convert(inputs, backend, parallel_pages=readers, ocr_output_directory=layouts)
+            # The pages in work at the stop end, and no other page starts.
+            self.assertGreaterEqual(len(backend.requests), 10)
+            self.assertLessEqual(len(backend.requests), 10 + readers)
+            error = str(raised.exception)
+            self.assertIn(
+                "The conversion started no more pages: the first 10 pages that needed a request "
+                "failed, and no page has a layout. The cause is probably the model or an option, "
+                "for example a model that does not read images.\n"
+                "Correct the model or the option, and run the same command again. If these pages "
+                "are the cause, convert the other files first, with the same layout directory: a "
+                "layout directory with a saved layout turns this rule off.",
+                error,
+            )
+            self.assertIn(
+                f"ERROR:{LOGGER_NAME}:The first 10 pages that needed a request failed, and no "
+                "page has a layout, so the conversion starts no more pages",
+                captured_logs.output,
+            )
+
+    def test_book_with_difficult_first_pages_continues_with_saved_layouts(self) -> None:
+        # The way around that the message gives. It must not bring back a stop at each run.
+        inputs = self.photos(14)
+        difficult = range(1, 11)
+        with self.assertLogs(LOGGER_NAME, level="ERROR"), self.assertRaises(PageLayoutError):
+            self.convert(inputs, PageBackend(failing=difficult), parallel_pages=1)
+        self.assertEqual(self.layout_files(), [])
+
+        # The other files first, with the same layout directory.
+        self.convert(inputs[10:], PageBackend())
+        backend = PageBackend(failing=difficult)
+        with (
+            self.assertLogs(LOGGER_NAME, level="ERROR"),
+            self.assertRaises(PageLayoutError) as raised,
+        ):
+            self.convert(inputs, backend, parallel_pages=1)
+        self.assertEqual(backend.requests, list(difficult))
+        self.assertIn("10 of 14 page(s) have no layout", str(raised.exception))
+        self.assertNotIn("did not start", str(raised.exception))
+
+        # A page with a layout from this run also turns the rule off.
+        backend = PageBackend(failing=range(2, 13))
+        with self.assertLogs(LOGGER_NAME, level="ERROR"), self.assertRaises(PageLayoutError):
+            self.convert(self.photos(13), backend, parallel_pages=1, ignore_saved_layouts=True)
+        self.assertEqual(len(backend.requests), 13)
+
     def test_failed_page_keeps_nothing_of_its_request(self) -> None:
         # The error of a failed page has its traceback, and the frames of a backend hold
         # the request with the page image: megabytes for each failed page of a book.
