@@ -1936,6 +1936,22 @@ class ParallelPagesTests(BookTestCase):
                     self.assertEqual(len(self.layout_files()), 10)
                 shutil.rmtree(work_directory)
 
+    def test_signal_at_the_end_of_the_event_loop_gives_no_document(self) -> None:
+        # The cancel of the conversion comes after its last step, so it has no effect.
+        # The stop must still come before the document.
+        run = pipeline._Conversion.run
+
+        async def run_with_a_signal_at_its_end(conversion: object) -> None:
+            await run(conversion)  # type: ignore[arg-type]
+            signal.raise_signal(signal.SIGTERM)
+
+        with patch.object(pipeline._Conversion, "run", run_with_a_signal_at_its_end):
+            stop, work_directory, _ = self.stopped_conversion([])
+        self.assertEqual(stop.signal_number, signal.SIGTERM)
+        self.assertFalse(stop.document_complete)
+        self.assert_clean_stop(work_directory)
+        self.assertEqual(len(self.layout_files()), 10)
+
     def test_signal_in_the_install_gives_the_complete_new_result(self) -> None:
         # A stop between two renames of the install left the new document with the
         # earlier illustrations, or lost an earlier illustration. The install continues
