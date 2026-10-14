@@ -25,6 +25,8 @@ from scanwich.pipeline import (
 # The exit code of a command that a signal stops is this number and the signal number:
 # 130 for Ctrl-C, 143 for SIGTERM, and 129 for SIGHUP.
 EXIT_CODE_SIGNAL_BASE = 128
+# The language codes when the command has no -l.
+DEFAULT_LANGUAGES = ("de", "pt", "en")
 # The suffix of a PDF file, for the check of the language codes.
 PDF_SUFFIX = ".pdf"
 # These signals stop LaTeX output as Ctrl-C does. SIGHUP comes when the terminal closes
@@ -97,9 +99,8 @@ def build_parser() -> argparse.ArgumentParser:
         "-l",
         "--languages",
         nargs="+",
-        default=["de", "pt", "en"],
         metavar="LANG",
-        help="OCR language codes (default: de pt en)",
+        help=f"OCR language codes (default: {' '.join(DEFAULT_LANGUAGES)})",
     )
     parser.add_argument(
         "--ocr-backend",
@@ -194,7 +195,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         for name in available_backends():
             print(name)
         return 0
-    for language in args.languages:
+    # Only the values of -l get the check: a file named `en` is no reason to refuse a
+    # command without -l.
+    for language in args.languages or ():
         # `-l` takes each word after it, so `a.pdf b.pdf -l de book.tex` has `b.pdf` as
         # its output. A value for a backend can have a dot or a slash, for example
         # `Latin (med.)` for a backend that puts the value in its prompt.
@@ -203,6 +206,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 f"-l takes language codes, and {language!r} looks like the name of a file. "
                 "Put the names of the files before -l, or put -- after the last language code"
             )
+    if args.languages is None:
+        args.languages = list(DEFAULT_LANGUAGES)
     if len(args.paths) < 2:
         parser.error("input and output are required unless --list-backends is used")
     *inputs, output = args.paths

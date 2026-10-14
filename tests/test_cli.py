@@ -1,3 +1,4 @@
+import contextlib
 import io
 import logging
 import signal
@@ -277,6 +278,40 @@ class CliTests(TestCase):
             self.assertIn("-l takes language codes, and '", usage.getvalue())
             self.assertIn("put -- after the last language code", usage.getvalue())
             convert_pdf.assert_not_called()
+
+    def test_file_with_the_name_of_a_default_language_code(self) -> None:
+        # Only the values of -l get the check. A file named `en` in the current
+        # directory refused each command without -l.
+        for name in ("de", "pt", "en"):
+            (self.directory / name).write_text("a file with no suffix")
+        commands = {
+            "convert_to_latex": [str(self.photo), "page.tex"],
+            "convert_pdf": ["in.pdf", "out.pdf"],
+        }
+        for function, arguments in commands.items():
+            with (
+                self.subTest(command=arguments),
+                contextlib.chdir(self.directory),
+                patch(f"scanwich.cli.{function}") as conversion,
+            ):
+                exit_code, log_output = self.run_main(arguments, LayoutCapableBackend())
+                self.assertEqual(exit_code, 0, log_output)
+                self.assertEqual(
+                    self.load_backend.call_args.kwargs["languages"], ["de", "pt", "en"]
+                )
+                conversion.assert_called_once()
+        # A value that the user gives keeps the check.
+        usage = io.StringIO()
+        with (
+            contextlib.chdir(self.directory),
+            patch("scanwich.cli.convert_to_latex") as convert_to_latex,
+            redirect_stderr(usage),
+            self.assertRaises(SystemExit) as raised,
+        ):
+            main([str(self.photo), "page.tex", "-l", "en"])
+        self.assertEqual(raised.exception.code, 2)
+        self.assertIn("'en' looks like the name of a file", usage.getvalue())
+        convert_to_latex.assert_not_called()
 
     def test_directory_that_the_command_cannot_write_to_is_one_error_line(self) -> None:
         a_file = self.directory / "a-file"
