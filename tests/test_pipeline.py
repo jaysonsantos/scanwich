@@ -579,20 +579,19 @@ class LatexConversionTests(TestCase):
         )
         output_tex = self.directory / "page.tex"
         json_directory = self.directory / "layout"
+        message = (
+            "the backend gave a layout for page 1 that the check of a layout file refuses: "
+            "block 1 .paragraph. text has one half of a character"
+        )
 
-        convert_to_latex(self.photo(), output_tex, backend=FakeLayoutBackend(layout))
-        self.assertIn("a b", output_tex.read_text(encoding="utf-8"))
-
-        # The check of a layout file refuses such text. A layout that Scanwich saves
-        # must be a layout that it can read again, so the page fails and has no file.
-        output_tex.unlink()
+        # The check of a layout file refuses such text. Each layout of a backend gets
+        # that check, so the page fails with and without a layout directory, and it has
+        # no file.
+        with self.assertRaisesRegex(PageLayoutError, message):
+            convert_to_latex(self.photo(), output_tex, backend=FakeLayoutBackend(layout))
         with (
             self.assertLogs(LOGGER_NAME, level="ERROR"),
-            self.assertRaisesRegex(
-                PageLayoutError,
-                "the backend gave a layout for page 1 that Scanwich cannot save and read "
-                "again: block 1 .paragraph. text has one half of a character",
-            ),
+            self.assertRaisesRegex(PageLayoutError, message),
         ):
             convert_to_latex(
                 self.photo(),

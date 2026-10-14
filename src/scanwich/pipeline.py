@@ -1044,6 +1044,7 @@ class _Conversion:
                 self._calls, layout, job.image_path, region_path, page.number
             )
         logger.info("Recognized %d block(s) on page %d", len(layout.blocks), page.number)
+        layout = await asyncio.to_thread(_checked_layout, page, layout)
         if self._layout_directory is not None:
             assert job.digest is not None
             record = _SourceRecord(
@@ -1051,7 +1052,7 @@ class _Conversion:
             )
             # The layout is complete here. The file is there before the crops start, so
             # that a later failure does not lose a layout that has a cost.
-            path, layout = await asyncio.to_thread(
+            path = await asyncio.to_thread(
                 _write_layout_file, self._layout_directory, page, record, layout
             )
             logger.info("Wrote layout JSON for page %d to %s", page.number, path.name)
@@ -1306,17 +1307,30 @@ def _layout_of_file(payload: Mapping[str, Any]) -> PageLayout:
     return layout
 
 
+def _checked_layout(page: _SourcePage, layout: PageLayout) -> PageLayout:
+    """Return the layout of a backend as the check of a layout file reads it.
+
+    A backend can return a layout as an object, without the check of the JSON form. Each
+    conversion gives each such layout this check, with and without a layout directory:
+    a layout that the check refuses gives `PageLayoutError`. The document is from the
+    result, so that a later conversion with the saved layout gives the same document.
+    """
+    try:
+        return _layout_of_file(json.loads(_json_text(layout.to_json())))
+    except LayoutFormatError as error:
+        hint = f" {error.hint}" if error.hint else ""
+        raise PageLayoutError(
+            f"the backend gave a layout for page {page.number} that the check of a layout "
+            f"file refuses: {error}.{hint}"
+        ) from None
+
+
 def _write_layout_file(
     directory: Path, page: _SourcePage, record: _SourceRecord, layout: PageLayout
-) -> tuple[Path, PageLayout]:
-    """Save the layout of a page with the record of its source.
+) -> Path:
+    """Save the layout of a page with the record of its source, and return the file.
 
-    The result is the file, and the layout as a later conversion reads it from the file.
-    The caller makes the document from that layout, so that a later conversion with the
-    saved layout gives the same document.
-
-    A layout that Scanwich cannot read again gives `PageLayoutError`, and no file. A
-    backend can return such a layout as an object, without the check of the JSON form.
+    The layout is the result of `_checked_layout`, so a later conversion can read it.
     """
     directory.mkdir(parents=True, exist_ok=True)
     path = directory / _layout_file_name(page, record.digest)
@@ -1332,14 +1346,6 @@ def _write_layout_file(
         **layout.to_json(),
     }
     text = _json_text(payload)
-    try:
-        layout_of_file = _layout_of_file(json.loads(text))
-    except LayoutFormatError as error:
-        hint = f" {error.hint}" if error.hint else ""
-        raise PageLayoutError(
-            f"the backend gave a layout for page {page.number} that Scanwich cannot save and "
-            f"read again: {error}.{hint}"
-        ) from None
     # A stop in the middle of the write must not leave a part of a file. Two conversions
     # can write the layout of one page at the same time, so each write has a name of
     # its own for its temporary file.
@@ -1349,7 +1355,7 @@ def _write_layout_file(
         temporary.replace(path)
     finally:
         temporary.unlink(missing_ok=True)
-    return path, layout_of_file
+    return path
 
 
 async def _recognize_upright_layout(

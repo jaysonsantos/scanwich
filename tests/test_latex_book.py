@@ -711,8 +711,8 @@ class SavedLayoutTests(BookTestCase):
                 self.convert(inputs, backend, ignore_saved_layouts=True)
             error = str(raised.exception)
             self.assertIn(
-                f"page 2 ({inputs[1]}): the backend gave a layout for page 2 that Scanwich "
-                "cannot save and read again: block ",
+                f"page 2 ({inputs[1]}): the backend gave a layout for page 2 that the check "
+                "of a layout file refuses: block ",
                 error,
             )
             self.assertIn(message, error)
@@ -743,6 +743,11 @@ class SavedLayoutTests(BookTestCase):
         self.assertEqual(backend.requests, [])
         self.assertEqual(self.document(), first_document)
         self.assertIn("Text with spaces at its ends.", first_document)
+
+        # With no layout directory, the layout gets the same check, and the document is
+        # the same. Before, the alignment stopped the document writer with a `KeyError`.
+        self.convert(inputs, PageBackend({1: layout}), ocr_output_directory=None)
+        self.assertEqual(self.document(), first_document)
 
     def test_directory_that_scanwich_cannot_write_to_stops_before_the_first_request(self) -> None:
         # The first file of the layout directory comes after the requests of a page.
@@ -1494,6 +1499,7 @@ class ParallelPagesTests(BookTestCase):
             "_make_page_image": False,
             "_turn_page_image": False,
             "_save_region": False,
+            "_checked_layout": False,
             "_write_layout_file": False,
             "_crop_figures": False,
             "_read_saved_layout": True,
