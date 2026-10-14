@@ -1223,19 +1223,76 @@ class FailedPageTests(BookTestCase):
             self.assertLessEqual(len(backend.requests), 10 + readers)
             error = str(raised.exception)
             self.assertIn(
-                "The conversion started no more pages: the first 10 pages that needed a request "
-                "failed, and no page has a layout. The cause is probably the model or an option, "
-                "for example a model that does not read images.\n"
+                "The conversion started no more pages: the first 10 pages with a reply of the "
+                "service failed, and no page has a layout. The cause is probably the model or an "
+                "option, for example a model that does not read images.\n"
                 "Correct the model or the option, and run the same command again. If these pages "
                 "are the cause, convert the other files first, with the same layout directory: a "
                 "layout directory with a saved layout turns this rule off.",
                 error,
             )
             self.assertIn(
-                f"ERROR:{LOGGER_NAME}:The first 10 pages that needed a request failed, and no "
-                "page has a layout, so the conversion starts no more pages",
+                f"ERROR:{LOGGER_NAME}:The first 10 pages with a reply of the service failed, and "
+                "no page has a layout, so the conversion starts no more pages",
                 captured_logs.output,
             )
+
+    def test_service_that_gives_no_reply_is_the_cause_with_many_pages_in_work(self) -> None:
+        # The rule for the first pages counts only pages with a reply. With 8 or more
+        # pages in work, a service that gave no reply failed 10 pages before its third
+        # wave, and the message named the model as the cause.
+        # The number of waves depends on the time of each start, so with 16 pages in work
+        # the stop can come or not. The cause is the same.
+        inputs = self.photos(24)
+        for readers in (4, 8, 16):
+            backend = AsyncPageBackend(no_reply=range(1, 25), delay=0.01)
+            layouts = self.directory / f"layouts-{readers}"
+            with self.subTest(readers=readers):
+                with (
+                    self.assertLogs(LOGGER_NAME, level="ERROR") as captured_logs,
+                    self.assertRaises(PageLayoutError) as raised,
+                ):
+                    self.convert(
+                        inputs, backend, parallel_pages=readers, ocr_output_directory=layouts
+                    )
+                error = str(raised.exception)
+                self.assertIn(
+                    "The cause is probably the service, the key, the quota, or an option.\n", error
+                )
+                self.assertNotIn("model", error)
+                self.assertNotIn(
+                    "with a reply of the service failed", "\n".join(captured_logs.output)
+                )
+
+    def test_pages_with_no_reply_in_fewer_than_three_waves_name_the_service(self) -> None:
+        class TogetherBackend(AsyncPageBackend):
+            """A backend whose pages get no reply, after all pages started."""
+
+            async def recognize_layout_async(
+                self, image_path: Path, *, upright: bool = False
+            ) -> PageLayout:
+                page = self.start(image_path, upright)
+                while len(self.requests) < 3:
+                    await asyncio.sleep(0.001)
+                return self.end(page)
+
+        backend = TogetherBackend(no_reply=range(1, 4))
+        with (
+            self.assertLogs(LOGGER_NAME, level="ERROR"),
+            self.assertRaises(PageLayoutError) as raised,
+        ):
+            self.convert(self.photos(3), backend, parallel_pages=3)
+        # One wave, so no stop came, and the message of the list names the cause.
+        self.assertEqual(sorted(backend.requests), [1, 2, 3])
+        self.assertIn(
+            "No page of this list got a reply from the service. The cause is probably the "
+            "service, the key, the quota, or an option.\n"
+            f"The layouts of the pages that are complete are in {self.layouts}. When the service "
+            "works again, the same command sends requests only for the pages that have no saved "
+            "layout.",
+            str(raised.exception),
+        )
+        self.assertNotIn("Read the error of each page first", str(raised.exception))
 
     def test_book_with_difficult_first_pages_continues_with_saved_layouts(self) -> None:
         # The way around that the message gives. It must not bring back a stop at each run.
