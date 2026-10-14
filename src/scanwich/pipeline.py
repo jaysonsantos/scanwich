@@ -339,12 +339,12 @@ def _convert_with_stop_signals(
     has work files. The work files go away before the handlers of the caller come back.
     """
     # A directory that Scanwich cannot write to must stop the conversion here, before
-    # the first request. The layout directory gets its first file after requests.
+    # the first request. The conversion checks the layout directory before its first
+    # request: a read-only layout directory with a layout for each page needs no write.
     _check_directory(output_tex.parent, "the directory of the document")
     layout_directory = None
     if ocr_output_directory is not None:
         layout_directory = ocr_output_directory.expanduser().resolve()
-        _check_directory(layout_directory, "the layout directory")
     figure_directory = _figure_directory(output_tex)
     pages = _source_pages(given_paths, input_paths)
     logger.info("The document has %d page(s) from %d input file(s)", len(pages), len(input_paths))
@@ -781,6 +781,8 @@ class _Conversion:
         self._stop_reason: str | None = None
         # The pages whose requests failed, for each reason.
         self._failed_readings = 0
+        # The layout directory is checked before the first request of the conversion.
+        self._layout_directory_is_checked = False
         # The waves in sequence of pages with no reply from the service, and the time of
         # the event loop when the last page that counted failed.
         self._waves_without_reply = 0
@@ -798,6 +800,7 @@ class _Conversion:
             self._stop_signals.attach(conversion_task)
         # The primitives of asyncio belong to the event loop, so they start here.
         self._stop = asyncio.Event()
+        self._layout_directory_check = asyncio.Lock()
         self._calls = _BackendCalls(self._backend)
         if self._layout_directory is not None and not self._ignore_saved_layouts:
             self._saved_index = await asyncio.to_thread(_saved_layout_index, self._layout_directory)
@@ -967,6 +970,9 @@ class _Conversion:
                 started = asyncio.get_running_loop().time()
                 try:
                     layout = await self._convert_page(job)
+                except OutputDirectoryError:
+                    # No page can have a layout file, so this is the error of the conversion.
+                    raise
                 except Exception as error:
                     self._page_failed(job.page, error, read=job.saved is None, started=started)
                 else:
@@ -1021,6 +1027,9 @@ class _Conversion:
         """Return the layout that the backend gives for a page, and save it."""
         page = job.page
         assert job.image_path is not None
+        if self._layout_directory is not None:
+            # A request has a cost, and its layout needs the directory.
+            await self._check_layout_directory()
         logger.info(
             "Recognizing the layout of page %d/%d with %s",
             page.number,
@@ -1047,6 +1056,16 @@ class _Conversion:
             )
             logger.info("Wrote layout JSON for page %d to %s", page.number, path.name)
         return layout
+
+    async def _check_layout_directory(self) -> None:
+        """Raise `OutputDirectoryError` when a layout file cannot go to the directory."""
+        assert self._layout_directory is not None
+        async with self._layout_directory_check:
+            if not self._layout_directory_is_checked:
+                await asyncio.to_thread(
+                    _check_directory, self._layout_directory, "the layout directory"
+                )
+                self._layout_directory_is_checked = True
 
     def _reading(self, page: _SourcePage) -> dict[str, Any]:
         """Return the backend and the settings that give the layout of a page."""

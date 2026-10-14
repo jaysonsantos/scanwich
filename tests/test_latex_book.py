@@ -783,6 +783,32 @@ class SavedLayoutTests(BookTestCase):
         self.assertEqual(list(read_only.iterdir()), [])
         self.assertEqual(a_file.read_text(), "not a directory")
 
+    def test_read_only_layout_directory_with_each_layout_needs_no_write(self) -> None:
+        # A person makes the layout directory read-only, for example to keep the layouts
+        # that they corrected. A new run with a layout for each page sends no request.
+        if os.geteuid() == 0:
+            self.skipTest("the system administrator can write to each directory")
+        inputs = self.photos(3)
+        self.convert(inputs, PageBackend())
+        first_document = self.document()
+        self.layouts.chmod(0o500)
+        self.addCleanup(self.layouts.chmod, 0o700)
+
+        backend = NoRequestBackend()
+        self.convert(inputs, backend)
+        self.assertEqual(backend.requests, [])
+        self.assertEqual(self.document(), first_document)
+
+        # A page that needs a request needs the directory. The check comes before the
+        # first request.
+        backend = PageBackend()
+        with self.assertRaisesRegex(
+            OutputDirectoryError, "Scanwich cannot write to the layout directory"
+        ):
+            self.convert([*inputs, self.photo(4)], backend)
+        self.assertEqual(backend.requests, [])
+        self.assertEqual(self.document(), first_document)
+
     def test_two_writers_of_one_layout_file_do_not_fail(self) -> None:
         # Two conversions can have one layout directory, for example a document with
         # pages and a document with `--flow` from the same files.
