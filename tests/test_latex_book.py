@@ -848,6 +848,24 @@ class SavedLayoutTests(BookTestCase):
             json.loads(layout_file.read_text(encoding="utf-8"))["blocks"][0]["text"], text_of(1)
         )
 
+    def test_write_that_fails_leaves_no_temporary_file(self) -> None:
+        inputs = self.photos(2)
+        replace = Path.replace
+
+        def full_disk(source: Path, target: Path) -> Path:
+            if source.name.endswith(".scanwich-tmp") and target.suffix == ".json":
+                raise OSError(28, "No space left on device", str(target))
+            return replace(source, target)
+
+        with (
+            patch.object(Path, "replace", full_disk),
+            self.assertLogs(LOGGER_NAME, level="ERROR"),
+            self.assertRaisesRegex(PageLayoutError, "No space left on device"),
+        ):
+            self.convert(inputs, PageBackend())
+        # No part of a layout file stays, and the directory has no file at all.
+        self.assertEqual([path.name for path in self.layouts.iterdir()], [])
+
     def test_two_layout_files_with_one_record_give_a_warning(self) -> None:
         inputs = self.photos(2)
         self.convert(inputs, PageBackend())
@@ -1607,9 +1625,14 @@ class ParallelPagesTests(BookTestCase):
             def __init__(self, *arguments: object, **options: object) -> None:
                 super().__init__(*arguments, **options)  # type: ignore[arg-type]
                 self.threads: list[int] = []
+                self.thread_objects: list[threading.Thread] = []
+                self.pages_of_the_log: list[str | None] = []
 
             def recognize_layout(self, image_path: Path, *, upright: bool = False) -> PageLayout:
                 self.threads.append(threading.get_ident())
+                self.thread_objects.append(threading.current_thread())
+                # A log record from this thread names its page.
+                self.pages_of_the_log.append(pipeline.LOG_PAGE.get())
                 return super().recognize_layout(image_path, upright=upright)
 
             def locate_figure(self, image_path: Path, **hints: object) -> FigureLocation:
@@ -1619,13 +1642,58 @@ class ParallelPagesTests(BookTestCase):
         figure = PageLayout(blocks=(Paragraph("Text."), Figure(box=Box(250, 250, 750, 750))))
         threads_before = threading.active_count()
         backend = ThreadBackend(dict.fromkeys(range(1, 9), figure), delay=0.002)
-        self.convert(self.photos(8), backend, parallel_pages=4)
+        conversions: list[object] = []
+
+        class KeptConversion(pipeline._Conversion):
+            """A conversion that stays in memory, so that its thread cannot end with it."""
+
+            def __init__(self, **options: object) -> None:
+                super().__init__(**options)  # type: ignore[arg-type]
+                conversions.append(self)
+
+        with patch.object(pipeline, "_Conversion", KeptConversion):
+            self.convert(self.photos(8), backend, parallel_pages=4)
 
         self.assertEqual(len(backend.threads), 16)
         self.assertEqual(len(set(backend.threads)), 1)
         # The thread is not the thread of the caller, which made the backend.
         self.assertNotIn(threading.get_ident(), backend.threads)
+        # The thread ends with the conversion.
+        self.assertFalse(backend.thread_objects[0].is_alive())
         self.assertEqual(threading.active_count(), threads_before)
+        self.assertEqual(
+            sorted(backend.pages_of_the_log), [f"page {number}/8" for number in range(1, 9)]
+        )
+
+    def test_stop_waits_for_the_call_of_a_synchronous_provider(self) -> None:
+        # The call of such a provider cannot get a cancel. The work files must stay until
+        # it ends, and no thread of the conversion stays after the stop.
+        calls: list[str] = []
+
+        class SlowCallBackend(PageBackend):
+            def recognize_layout(self, image_path: Path, *, upright: bool = False) -> PageLayout:
+                layout = super().recognize_layout(image_path, upright=upright)
+                if len(self.requests) == 2:
+                    calls.append("start")
+                    signal.raise_signal(signal.SIGTERM)
+                    time.sleep(0.3)
+                    calls.append("end")
+                return layout
+
+        def handler_of_the_caller(*arguments: object) -> None:
+            raise AssertionError("the conversion did not take the signal")
+
+        self.addCleanup(
+            signal.signal, signal.SIGTERM, signal.signal(signal.SIGTERM, handler_of_the_caller)
+        )
+        threads_before = threading.active_count()
+        with self.assertRaises(ConversionStopped):
+            self.convert(
+                self.photos(4), SlowCallBackend(), parallel_pages=2, stop_signals=(signal.SIGTERM,)
+            )
+        self.assertEqual(calls, ["start", "end"])
+        self.assertEqual(threading.active_count(), threads_before)
+        self.assertFalse(self.output.parent.exists() and any(self.output.parent.iterdir()))
 
     def test_error_of_aclose_is_a_warning(self) -> None:
         class NotClosingBackend(AsyncPageBackend):
@@ -1780,7 +1848,13 @@ class ParallelPagesTests(BookTestCase):
         work_directory = self.directory / "work"
         work_directory.mkdir(exist_ok=True)
 
-        def handler_of_the_caller(*arguments: object) -> None:
+        # The signals that the handler of the caller got during the conversion, and the
+        # signals that had no handler. The conversion must take each signal.
+        self.signals_of_the_caller: list[int] = []
+        self.signals_with_no_handler: list[int] = []
+
+        def handler_of_the_caller(number: int, frame: object) -> None:
+            self.signals_of_the_caller.append(number)
             raise AssertionError("the conversion did not take the signal")
 
         self.handler_of_the_caller = handler_of_the_caller
@@ -1790,6 +1864,10 @@ class ParallelPagesTests(BookTestCase):
         def send(page: int) -> None:
             if page == at_page:
                 for number in signals:
+                    if signal.getsignal(number) in (signal.SIG_DFL, None):
+                        # The signal would end the process of the tests.
+                        self.signals_with_no_handler.append(number)
+                        continue
                     signal.raise_signal(number)
 
         backend = AsyncPageBackend(delay=0.03, on_request=send)
@@ -1805,6 +1883,8 @@ class ParallelPagesTests(BookTestCase):
         return raised.exception, work_directory, backend
 
     def assert_clean_stop(self, work_directory: Path) -> None:
+        self.assertEqual(self.signals_of_the_caller, [])
+        self.assertEqual(self.signals_with_no_handler, [])
         # No hidden directory and no temporary document next to the earlier document.
         self.assertEqual(self.output.read_text(), "the earlier document")
         self.assertEqual([path.name for path in self.output.parent.iterdir()], ["book.tex"])
@@ -1866,7 +1946,11 @@ class ParallelPagesTests(BookTestCase):
                 signal.raise_signal(signal.SIGHUP)
 
         backend = AsyncPageBackend(delay=0.01, on_request=send)
-        self.convert(inputs, backend, stop_signals=(signal.SIGTERM, signal.SIGHUP))
+        try:
+            self.convert(inputs, backend, stop_signals=(signal.SIGTERM, signal.SIGHUP))
+        except ConversionStopped:
+            # The test framework stops all tests for a `KeyboardInterrupt`.
+            self.fail("the conversion stopped for a signal that the caller ignores")
 
         self.assertEqual(sorted(backend.requests), [1, 2, 3, 4, 5, 6])
         self.assertEqual(self.document().count("\\begin{sourcepage}"), 6)
