@@ -158,9 +158,16 @@ scanwich pages/*.ARW book.tex --ocr-backend openai-compatible -l de --rotate 90 
   Scanwich then writes a `WARNING` log record. It does not change the sequence. Give such names leading zeros.
 - `--rotate` is for all the files. For files with different directions, do not use it. The backend then finds the direction of each page, see "Page direction".
 - An option can be between the names. `-l` takes each word after it, so put the names of the files before `-l`, or put `--` after the last language code.
-  A value of `-l` that is a file, or that has the suffix of a file of the command, is a usage error. These suffixes are `.tex`, `.pdf`, the image formats, and the camera raw formats.
+  A value of `-l` that is a file, or that ends in the suffix of a file of the command, is a usage error. The case of the letters does not matter.
+  Only the values that you give get this check. The default `de pt en` does not, so a file named `en` in the current directory does not stop a command without `-l`.
   A value such as `Latin (med.)` or `de/at` is correct: the `openai-compatible` backend puts each value as text in its prompt.
+  The suffixes are these:
+  - The output: `.tex` and `.pdf`.
+  - The camera raw formats: `.3fr`, `.arw`, `.cr2`, `.cr3`, `.crw`, `.dcr`, `.dng`, `.erf`, `.iiq`, `.kdc`, `.mef`, `.mos`, `.mrw`, `.nef`, `.nrw`, `.orf`, `.pef`, `.raf`, `.raw`, `.rw2`, `.rwl`, `.sr2`, `.srf`, `.srw`, `.x3f`.
+  - The image formats that Pillow registers. With Pillow 12.3.0, the version of `uv.lock`, these are `.apng`, `.avif`, `.avifs`, `.blp`, `.bmp`, `.bufr`, `.bw`, `.cur`, `.dcx`, `.dds`, `.dib`, `.emf`, `.eps`, `.fit`, `.fits`, `.flc`, `.fli`, `.ftc`, `.ftu`, `.gbr`, `.gif`, `.grib`, `.h5`, `.hdf`, `.icb`, `.icns`, `.ico`, `.iim`, `.im`, `.j2c`, `.j2k`, `.jfif`, `.jp2`, `.jpc`, `.jpe`, `.jpeg`, `.jpf`, `.jpg`, `.jpx`, `.mpeg`, `.mpg`, `.mpo`, `.msp`, `.palm`, `.pbm`, `.pcd`, `.pcx`, `.pfm`, `.pgm`, `.png`, `.pnm`, `.ppm`, `.ps`, `.psd`, `.pxr`, `.qoi`, `.ras`, `.rgb`, `.rgba`, `.sgi`, `.tga`, `.tif`, `.tiff`, `.vda`, `.vst`, `.webp`, `.wmf`, `.xbm`, `.xpm`. A different version of Pillow can have different suffixes. Thus `-l fr.ps` and `-l x.im` are usage errors.
 - A name that starts with `-` must come after `--`, for example `scanwich -l de -- -scan.pdf out.pdf`. Another way is `./-scan.pdf`.
+- **Python 3.11:** in a command with `--`, all names must come after `--`, for example `scanwich -l de -- a.png b.png book.tex`.
+  `scanwich a.png -l de -- b.png book.tex` is a usage error on Python 3.11. Python 3.12 and later accept it.
 
 #### Saved layouts
 
@@ -223,16 +230,24 @@ Scanwich ignores the other files of the directory.
   The HTTP statuses 400, 403, 413, and 422 are an answer about the page, for example an image that is too large or a moderation flag. They do not count.
   The cause of a stop is probably the service, the key, the quota, or an option. When the service works again, run the same command.
   If the same pages fail again, they are the cause: convert the other files first, with the same layout directory.
+  When each failed page got no reply but fewer than 3 waves came, for example with 16 pages in work and 24 pages in all, all pages start and fail. The message then also names the service as the probable cause.
 - **A difficult page:** a page with a reply that Scanwich cannot use does not count for that rule, and a page that gets a layout starts the count again.
   Thus difficult pages at the start of a book do not stop the other pages.
-- **The first pages of a run:** when the first 10 pages that need a request all fail, for each reason, and no page has a layout, the conversion starts no more pages.
-  The cause is then probably the model or an option, and each more page has a cost. A layout directory with a saved layout turns this rule off.
+- **The first pages of a run:** when the first 10 pages with a reply of the service all fail, and no page has a layout, the conversion starts no more pages.
+  The cause is then probably the model or an option, and each more page has a cost.
+  A page with no reply does not count for this rule. It counts for the rule of a service that gives no reply, above.
   If these 10 pages are the cause, convert the other files first, with the same layout directory.
+- **A saved layout turns the rule for the first pages off:** a layout file with a `source` record in the layout directory turns it off, also the layout of a different document.
+  Thus with one layout directory for all your books, the rule is off after the first book. Use one layout directory for each book to keep the rule.
+  With `--ignore-saved-layouts`, Scanwich does not read the saved layouts, so the rule is on.
 - **A stop:** Ctrl-C, SIGTERM, and SIGHUP stop the conversion in a clean way, in each part of the conversion. SIGHUP is the signal of a terminal that closes or a connection that is lost.
   The exit codes are 130, 143, and 129. The layouts that are saved stay, and no work file stays. A page that is in work at that moment is not saved.
   Run the same command again to continue.
+- **A stop in the install of the result:** the install gives the new document and its illustrations their names. A stop there waits for the end of the install and of the removal of the work files. For 100 illustrations, this needs about 0.1 seconds.
+  The new document and its illustrations are then complete. The command tells this in a `WARNING` log record, and it gives the exit code of the stop, so that a script stops also.
+  In this step, a second Ctrl-C also has no effect.
 - **A second signal:** while the conversion stops, a second SIGTERM or SIGHUP has no effect. A terminal that closes sends SIGHUP two times.
-  A second Ctrl-C ends the process at once, and the work files can then stay. SIGKILL always ends the process.
+  A second Ctrl-C before the install ends the process at once, and the work files can then stay. SIGKILL always ends the process.
 - **`nohup` and an ignored signal:** a signal that has no effect when the command starts, for example SIGHUP with `nohup scanwich ...`, keeps no effect. The conversion continues.
 - **A provider with only synchronous methods:** a stop waits for its call that is in work, because Python cannot cancel such a call. The stop ends when that call ends.
   The `openai-compatible` backend has async methods, so a stop cancels its requests at once.
@@ -262,6 +277,8 @@ A request for a photo of a book page needs 30 to 40 seconds, so Scanwich reads s
 - **The event loop:** the function starts an event loop of its own. A thread with a running event loop cannot call it, and gets a `RuntimeError` that tells this.
   Call it from a different thread there, for example with `await asyncio.to_thread(convert_to_latex, ...)`.
 - **A stop:** `stop_signals` has the signals that stop the conversion as Ctrl-C does, for example `(signal.SIGTERM,)`. The function then raises `ConversionStopped`, which has the `signal_number`.
+  `document_complete` is True for a stop in the install of the result: the new document and its illustrations are then complete. When it is False, the earlier result did not change.
+  In the install, Ctrl-C gets the same handler when it has the usual handler of Python. A different handler of the caller for Ctrl-C stays in place.
   The handlers are in place from the first work file to the last one. Then the handlers of the caller come back. A signal that the caller ignores gets no handler.
   This needs the main thread. In a different thread, a signal keeps its usual effect. The default is no signal.
 
