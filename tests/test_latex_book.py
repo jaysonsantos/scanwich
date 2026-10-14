@@ -814,6 +814,35 @@ class SavedLayoutTests(BookTestCase):
         self.assertEqual(backend.requests, [])
         self.assertEqual(self.document(), first_document)
 
+    def test_layout_directory_with_no_permission_is_one_error_before_the_first_request(
+        self,
+    ) -> None:
+        # For a file in such a directory, `Path.is_file()` raises `PermissionError` on
+        # Python 3.11 to 3.13, and each page failed with it. Python 3.14 returns False.
+        if os.geteuid() == 0:
+            self.skipTest("the system administrator can read each directory")
+        self.layouts.mkdir()
+        self.layouts.chmod(0o000)
+        self.addCleanup(self.layouts.chmod, 0o700)
+        is_file = Path.is_file
+
+        def is_file_of_python_3_13(path: Path, **options: object) -> bool:
+            if path.parent == self.layouts:
+                raise PermissionError(13, "Permission denied", str(path))
+            return is_file(path, **options)  # type: ignore[arg-type]
+
+        for name, check in (
+            ("this Python", is_file),
+            ("Python 3.11 to 3.13", is_file_of_python_3_13),
+        ):
+            with self.subTest(check=name), patch.object(Path, "is_file", check):
+                backend = PageBackend()
+                with self.assertRaisesRegex(
+                    OutputDirectoryError, "Scanwich cannot write to the layout directory"
+                ):
+                    self.convert(self.photos(3), backend)
+                self.assertEqual(backend.requests, [])
+
     def test_two_writers_of_one_layout_file_do_not_fail(self) -> None:
         # Two conversions can have one layout directory, for example a document with
         # pages and a document with `--flow` from the same files.

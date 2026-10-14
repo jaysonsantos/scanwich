@@ -984,7 +984,7 @@ class _Conversion:
         """
         assert self._layout_directory is not None
         path = self._layout_directory / _layout_file_name(page, digest)
-        if not path.is_file():
+        if not _is_a_file(path):
             other_paths = self._saved_index.get((digest, page.page_of_input))
             if not other_paths:
                 return None
@@ -1272,6 +1272,19 @@ def _source_record_from_json(value: Any) -> _SourceRecord | None:
     return _SourceRecord(
         digest=digest, page=page, turn=turn, reading=reading if isinstance(reading, dict) else {}
     )
+
+
+def _is_a_file(path: Path) -> bool:
+    """Return True for a file, and False also when the system refuses the check.
+
+    For a directory that Scanwich cannot read, Python 3.11 to 3.13 raise
+    `PermissionError` in `Path.is_file()`, and Python 3.14 returns False. With False,
+    the check of the layout directory before the first request gives one error.
+    """
+    try:
+        return path.is_file()
+    except OSError:
+        return False
 
 
 def _saved_layout_index(directory: Path) -> dict[tuple[str, int], list[Path]]:
