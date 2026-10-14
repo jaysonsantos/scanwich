@@ -1905,10 +1905,10 @@ class ParallelPagesTests(BookTestCase):
         self.assertIn(len(self.layout_files()), (4, 5))
 
     def test_signal_in_the_parts_before_and_after_the_event_loop(self) -> None:
-        # The index of the saved layouts and the install of the document have work files
-        # also. A signal there must give the same clean stop.
+        # The index of the saved layouts and the document before its install have work
+        # files also. A signal there must give the same clean stop.
         index = pipeline._saved_layout_index
-        install = pipeline._install_result
+        render = pipeline.render_latex
 
         def index_with_a_signal(*arguments: object) -> object:
             signal.raise_signal(signal.SIGTERM)
@@ -1916,17 +1916,18 @@ class ParallelPagesTests(BookTestCase):
             time.sleep(0.05)
             return index(*arguments)
 
-        def install_with_a_signal(*arguments: object) -> object:
+        def render_with_a_signal(*arguments: object, **options: object) -> object:
             signal.raise_signal(signal.SIGTERM)
-            return install(*arguments)
+            return render(*arguments, **options)
 
         for name, value in (
             ("_saved_layout_index", index_with_a_signal),
-            ("_install_result", install_with_a_signal),
+            ("render_latex", render_with_a_signal),
         ):
             with self.subTest(part=name):
                 stop, work_directory, backend = self.stopped_conversion([], **{name: value})
                 self.assertEqual(stop.signal_number, signal.SIGTERM)
+                self.assertFalse(stop.document_complete)
                 self.assert_clean_stop(work_directory)
                 if name == "_saved_layout_index":
                     self.assertEqual(backend.requests, [])
@@ -1934,6 +1935,100 @@ class ParallelPagesTests(BookTestCase):
                     # All pages are complete and saved, and the next run needs no request.
                     self.assertEqual(len(self.layout_files()), 10)
                 shutil.rmtree(work_directory)
+
+    def test_signal_in_the_install_gives_the_complete_new_result(self) -> None:
+        # A stop between two renames of the install left the new document with the
+        # earlier illustrations, or lost an earlier illustration. The install continues
+        # to its end, and the stop comes after it.
+        inputs = self.photos(4)
+        earlier = PageLayout(blocks=(Paragraph("Earlier text."), Figure(box=RED_BOX)))
+        new = PageLayout(blocks=(Paragraph("New text."), Figure(box=Box(0, 0, 1000, 1000))))
+        self.convert(inputs, PageBackend(dict.fromkeys(range(1, 5), earlier)))
+        earlier_result = self.directory / "earlier"
+        shutil.copytree(self.output.parent, earlier_result)
+        earlier_figures = self.figure_files()
+        self.convert(
+            inputs,
+            PageBackend(dict.fromkeys(range(1, 5), new)),
+            ocr_output_directory=self.directory / "new-layouts",
+        )
+        new_document, new_figures = self.document(), self.figure_files()
+        self.assertNotEqual(new_figures, earlier_figures)
+        work_directory = self.directory / "work"
+        work_directory.mkdir()
+
+        def handler_of_the_caller(number: int, frame: object) -> None:
+            raise AssertionError("the conversion did not take the signal")
+
+        for number in (signal.SIGTERM, signal.SIGHUP):
+            self.addCleanup(signal.signal, number, signal.signal(number, handler_of_the_caller))
+        # Ctrl-C has the usual handler of Python.
+        self.addCleanup(
+            signal.signal, signal.SIGINT, signal.signal(signal.SIGINT, signal.default_int_handler)
+        )
+        real_replace = Path.replace
+        points: dict[str, Callable[[Path, Path], bool]] = {
+            "the document": lambda source, target: Path(target).name == "book.tex",
+            "an earlier illustration": (
+                lambda source, target: str(target).endswith(pipeline.OLD_FIGURE_SUFFIX)
+            ),
+            "a new illustration": (
+                lambda source, target: str(source).endswith(pipeline.NEW_FIGURE_SUFFIX)
+            ),
+        }
+        for number in (signal.SIGTERM, signal.SIGINT):
+            for point, is_the_point in points.items():
+                with self.subTest(signal=signal.Signals(number).name, after=point):
+                    shutil.rmtree(self.output.parent)
+                    shutil.copytree(earlier_result, self.output.parent)
+                    sent: list[int] = []
+
+                    def replace(
+                        source: Path,
+                        target: Path,
+                        is_the_point: Callable[[Path, Path], bool] = is_the_point,
+                        number: int = number,
+                        sent: list[int] = sent,
+                    ) -> Path:
+                        result = real_replace(source, target)
+                        if not sent and is_the_point(source, target):
+                            sent.append(number)
+                            signal.raise_signal(number)
+                        return result
+
+                    try:
+                        with (
+                            patch.object(Path, "replace", replace),
+                            patch("tempfile.tempdir", str(work_directory)),
+                        ):
+                            self.convert(
+                                inputs,
+                                NoRequestBackend(),
+                                ocr_output_directory=self.directory / "new-layouts",
+                                stop_signals=(signal.SIGTERM, signal.SIGHUP),
+                            )
+                    except KeyboardInterrupt as error:
+                        # The test framework stops all tests for a `KeyboardInterrupt`.
+                        stop = error
+                    else:
+                        self.fail("the conversion did not raise the stop")
+
+                    self.assertEqual(sent, [number])
+                    self.assertIsInstance(stop, ConversionStopped)
+                    self.assertEqual(getattr(stop, "signal_number", None), number)
+                    self.assertTrue(getattr(stop, "document_complete", False))
+                    # The new document and all its illustrations, and no temporary file.
+                    self.assertEqual(self.document(), new_document)
+                    self.assertEqual(self.figure_files(), new_figures)
+                    self.assertEqual(
+                        sorted(path.name for path in self.output.parent.iterdir()),
+                        ["book-figures", "book.tex"],
+                    )
+                    self.assertEqual(list(work_directory.iterdir()), [])
+                    # The handlers of the caller are in place again.
+                    for each in (signal.SIGTERM, signal.SIGHUP):
+                        self.assertIs(signal.getsignal(each), handler_of_the_caller)
+                    self.assertIs(signal.getsignal(signal.SIGINT), signal.default_int_handler)
 
     def test_signal_that_the_caller_ignores_keeps_no_effect(self) -> None:
         # `nohup` gives SIG_IGN to SIGHUP, so that a long run continues after the

@@ -266,11 +266,24 @@ def main(argv: Sequence[str] | None = None) -> int:
             except KeyboardInterrupt as stop:
                 # Ctrl-C, or one of the stop signals.
                 signal_number = getattr(stop, "signal_number", signal.SIGINT)
-                logger.error(
-                    "The conversion stopped before its end%s, so there is no new document.%s",
+                signal_name = (
                     ""
                     if signal_number == signal.SIGINT
-                    else f" (signal {signal.Signals(signal_number).name})",
+                    else f" (signal {signal.Signals(signal_number).name})"
+                )
+                if getattr(stop, "document_complete", False):
+                    # The stop came in the install of the result, which continued to its
+                    # end. The exit code tells a script that a stop came.
+                    logger.warning(
+                        "The stop%s came after the new document was complete: %s and its "
+                        "illustrations are the new result",
+                        signal_name,
+                        output,
+                    )
+                    return EXIT_CODE_SIGNAL_BASE + signal_number
+                logger.error(
+                    "The conversion stopped before its end%s, so there is no new document.%s",
+                    signal_name,
                     ""
                     if args.ocr_output_dir is None
                     else (

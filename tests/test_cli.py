@@ -386,6 +386,30 @@ class CliTests(TestCase):
                 )
                 self.assertNotIn("Traceback", log_output)
 
+    def test_stop_in_the_install_tells_that_the_new_document_is_complete(self) -> None:
+        output = self.directory / "page.tex"
+        for number, exit_code, name in (
+            (signal.SIGTERM, 143, " (signal SIGTERM)"),
+            (signal.SIGINT, 130, ""),
+        ):
+            stop = ConversionStopped(number, document_complete=True)
+            with (
+                self.subTest(signal=signal.Signals(number).name),
+                patch("scanwich.cli.convert_to_latex", side_effect=stop),
+            ):
+                code, log_output = self.run_main(
+                    [str(self.photo), str(output), "--ocr-output-dir", "layout"],
+                    LayoutCapableBackend(),
+                )
+                # The exit code tells a script that a stop came.
+                self.assertEqual(code, exit_code)
+                self.assertIn(
+                    f"WARNING: The stop{name} came after the new document was complete: "
+                    f"{output} and its illustrations are the new result\n",
+                    log_output,
+                )
+                self.assertNotIn("no new document", log_output)
+
     def test_real_stop_signal_during_a_conversion(self) -> None:
         class StoppedBackend(LayoutCapableBackend):
             """A backend whose second page gets the signal while its request is in work."""

@@ -175,11 +175,16 @@ class ConversionStopped(KeyboardInterrupt):
 
     The conversion ended in a clean way: no task, no thread, and no work file stays, and
     each layout that was saved stays.
+
+    `document_complete` is True for a signal in the install of the result. The install
+    then continued to its end, so the new document and its illustrations are complete.
+    When it is False, the earlier document and its illustrations did not change.
     """
 
-    def __init__(self, signal_number: int) -> None:
+    def __init__(self, signal_number: int, *, document_complete: bool = False) -> None:
         super().__init__(signal_number)
         self.signal_number = signal_number
+        self.document_complete = document_complete
 
 
 def convert_pdf(
@@ -262,8 +267,9 @@ def convert_to_latex(
 
     `stop_signals` are signal numbers, for example `signal.SIGTERM`. Such a signal stops
     the conversion as Ctrl-C does, and the function raises `ConversionStopped`. This
-    needs the main thread, and a platform that has signal handlers for an event loop.
-    Without them, a signal keeps its usual effect.
+    needs the main thread. In a different thread, a signal keeps its usual effect. A
+    stop signal or Ctrl-C in the install of the result does not stop the install: the
+    function raises `ConversionStopped` after it, with `document_complete` True.
 
     The function starts an event loop of its own. A thread with a running event loop
     cannot call it: use a different thread, for example with `asyncio.to_thread`.
@@ -317,6 +323,9 @@ def convert_to_latex(
             parallel_pages=parallel_pages,
             stop=stop,
         )
+    if stop.signal_number is not None:
+        # Each other signal raised the stop before the install. The result is complete.
+        raise ConversionStopped(stop.signal_number, document_complete=True)
 
 
 def _convert_with_stop_signals(
@@ -337,6 +346,7 @@ def _convert_with_stop_signals(
 
     The stop signals have their handlers for the full time of this function: each part
     has work files. The work files go away before the handlers of the caller come back.
+    From the start of the install of the result, a signal only records the stop.
     """
     # A directory that Scanwich cannot write to must stop the conversion here, before
     # the first request. The conversion checks the layout directory before its first
@@ -406,6 +416,10 @@ def _convert_with_stop_signals(
         temporary_tex = output_tex.with_name(f".{output_tex.name}{TEMPORARY_SUFFIX}")
         try:
             temporary_tex.write_text(render_latex(layouts, flow=flow), encoding="utf-8")
+            # A stop between two renames of the install can leave the new document with the
+            # earlier illustrations, or lose an earlier illustration. The install and the
+            # removal of the work files need a short time, so a stop waits for them.
+            stop.defer()
             figure_count = _install_result(
                 temporary_tex, output_tex, Path(new_figures_directory), figure_directory
             )
@@ -431,6 +445,7 @@ class _StopSignals:
     The handlers stay until the work files are gone, and the handlers of the caller then
     come back.
 
+    - From `defer()` to the end, a stop signal and Ctrl-C only record the stop.
     - A second signal has no effect while the conversion stops. A terminal that closes
       sends SIGHUP two times, in less than 10 ms.
     - A signal that the caller ignores at the start gets no handler, so that it keeps no
@@ -444,6 +459,7 @@ class _StopSignals:
         self._handlers_of_the_caller: dict[int, Any] = {}
         self._loop: asyncio.AbstractEventLoop | None = None
         self._task: asyncio.Task[Any] | None = None
+        self._deferred = False
         # The signal that stopped the conversion.
         self.signal_number: int | None = None
 
@@ -477,10 +493,25 @@ class _StopSignals:
         if self.signal_number is not None:
             raise ConversionStopped(self.signal_number)
 
+    def defer(self) -> None:
+        """From now on, a stop signal and Ctrl-C only record the stop."""
+        self._deferred = True
+        # Ctrl-C gets the same handler when it has the usual handler of Python, which
+        # raises `KeyboardInterrupt`. A different handler of the caller stays.
+        if signal.getsignal(signal.SIGINT) is not signal.default_int_handler:
+            return
+        try:
+            signal.signal(signal.SIGINT, self._handle)
+        except ValueError:
+            return
+        self._handlers_of_the_caller[signal.SIGINT] = signal.default_int_handler
+
     def _handle(self, number: int, frame: object) -> None:
         if self.signal_number is not None:
             return
         self.signal_number = number
+        if self._deferred:
+            return
         if self._loop is None or self._task is None:
             raise ConversionStopped(number)
         # The handler runs in the thread of the event loop, between two steps of a task.
