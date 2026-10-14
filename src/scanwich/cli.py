@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import argparse
 import logging
-import os
 import signal
 import sys
 from collections.abc import Sequence
 from pathlib import Path
 
+from PIL import Image
+
+from scanwich.images import RAW_SUFFIXES
 from scanwich.ocr import LayoutBackend, available_backends, load_backend
 from scanwich.pdf import PdfPipelineError
 from scanwich.pipeline import (
@@ -23,6 +25,8 @@ from scanwich.pipeline import (
 # The exit code of a command that a signal stops is this number and the signal number:
 # 130 for Ctrl-C, 143 for SIGTERM, and 129 for SIGHUP.
 EXIT_CODE_SIGNAL_BASE = 128
+# The suffix of a PDF file, for the check of the language codes.
+PDF_SUFFIX = ".pdf"
 # These signals stop LaTeX output as Ctrl-C does. SIGHUP comes when the terminal closes
 # or a connection is lost, which is probable in the hours that a book needs.
 STOP_SIGNAL_NAMES = ("SIGTERM", "SIGHUP")
@@ -40,6 +44,20 @@ class _PageFilter(logging.Filter):
         page = LOG_PAGE.get()
         record.page = f"[{page}] " if page else ""
         return True
+
+
+def _is_a_file_name(value: str) -> bool:
+    """Return True for a value that is a file, or that has the suffix of a file of the command.
+
+    The suffixes are those of an output and of each input: `.tex`, `.pdf`, the image
+    formats of Pillow, and the camera raw formats.
+    """
+    Image.init()
+    suffixes = {LATEX_SUFFIX, PDF_SUFFIX, *RAW_SUFFIXES, *Image.registered_extensions()}
+    return (
+        Path(value).suffix.lower() in {suffix.lower() for suffix in suffixes}
+        or Path(value).is_file()
+    )
 
 
 def _stop_signals() -> tuple[int, ...]:
@@ -155,9 +173,15 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
-    # An option can be between the names: `in.pdf --dpi 72 out.pdf`. The usual parse
-    # function takes the names only when they are together, because they are one argument.
-    args = parser.parse_intermixed_args(argv)
+    arguments = sys.argv[1:] if argv is None else list(argv)
+    if sys.version_info < (3, 12) and "--" in arguments:
+        # With Python 3.11, `parse_intermixed_args` refuses a name after `--` that starts
+        # with `-`. The names after `--` are together, so the usual function is correct.
+        args = parser.parse_args(arguments)
+    else:
+        # An option can be between the names: `in.pdf --dpi 72 out.pdf`. The usual parse
+        # function takes the names only when they are together: they are one argument.
+        args = parser.parse_intermixed_args(arguments)
     logging.basicConfig(
         level=logging.INFO,
         format="%(levelname)s: %(page)s%(message)s",
@@ -172,11 +196,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 0
     for language in args.languages:
         # `-l` takes each word after it, so `a.pdf b.pdf -l de book.tex` has `b.pdf` as
-        # its output.
-        if "." in language or "/" in language or os.sep in language:
+        # its output. A value for a backend can have a dot or a slash, for example
+        # `Latin (med.)` for a backend that puts the value in its prompt.
+        if _is_a_file_name(language):
             parser.error(
-                f"-l takes language codes, and {language!r} is the name of a file. Put the "
-                "names of the files before -l, or put -- after the last language code"
+                f"-l takes language codes, and {language!r} looks like the name of a file. "
+                "Put the names of the files before -l, or put -- after the last language code"
             )
     if len(args.paths) < 2:
         parser.error("input and output are required unless --list-backends is used")

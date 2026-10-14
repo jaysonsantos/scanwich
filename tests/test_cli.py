@@ -255,10 +255,14 @@ class CliTests(TestCase):
     def test_name_of_a_file_is_not_a_language_code(self) -> None:
         # `-l` takes each word after it. Without this check, `a.pdf b.pdf -l de book.tex`
         # writes the searchable PDF of `a.pdf` to `b.pdf`.
+        a_file = self.directory / "notes"
+        a_file.write_text("a file with no suffix")
         commands = [
             [str(self.photo), "other.pdf", "-l", "de", "book.tex"],
             [str(self.photo), "-l", "fr", "pages/page.png", "book.tex"],
             [str(self.photo), "-l", "fr", "book.pdf"],
+            [str(self.photo), "-l", "fr", "pages/IMG_0001.ARW", "book.tex"],
+            [str(self.photo), "book.tex", "-l", "fr", str(a_file)],
         ]
         for arguments in commands:
             usage = io.StringIO()
@@ -295,6 +299,46 @@ class CliTests(TestCase):
                 self.assertNotIn("Traceback", log_output)
         # The command stops before the backend gets a page.
         self.assertEqual(backend.image_sizes, [])
+
+    def test_language_value_with_a_dot_or_a_slash_for_a_backend(self) -> None:
+        # The `openai-compatible` backend puts each value as text in its prompt.
+        output = self.directory / "page.tex"
+        values = ["Latin (med.)", "de/at", "zh.Hans", "models/de.traineddata"]
+        with patch("scanwich.cli.convert_to_latex") as convert_to_latex:
+            exit_code, log_output = self.run_main(
+                [str(self.photo), str(output), "-l", *values], LayoutCapableBackend()
+            )
+        self.assertEqual(exit_code, 0, log_output)
+        self.assertEqual(self.load_backend.call_args.kwargs["languages"], values)
+        convert_to_latex.assert_called_once()
+
+    def test_double_dash_before_a_name_that_starts_with_a_dash(self) -> None:
+        # Python 3.11 refused this form with the parser of names between options.
+        cases = {
+            "searchable PDF": (["--", "-scan.pdf", "out.pdf"], "convert_pdf"),
+            "LaTeX output": (
+                ["-l", "fr", "--", "-a.png", "-b.png", "book.tex"],
+                "convert_to_latex",
+            ),
+        }
+        for name, (arguments, function) in cases.items():
+            with (
+                self.subTest(case=name),
+                patch("scanwich.cli.convert_pdf") as convert_pdf,
+                patch("scanwich.cli.convert_to_latex") as convert_to_latex,
+            ):
+                exit_code, log_output = self.run_main(arguments, LayoutCapableBackend())
+                self.assertEqual(exit_code, 0, log_output)
+                called = convert_pdf if function == "convert_pdf" else convert_to_latex
+                called.assert_called_once()
+                names = [str(path) for path in called.call_args.args[0:2]]
+                if function == "convert_pdf":
+                    self.assertEqual(names, ["-scan.pdf", "out.pdf"])
+                else:
+                    self.assertEqual(
+                        [[str(path) for path in called.call_args.args[0]], names[1]],
+                        [["-a.png", "-b.png"], "book.tex"],
+                    )
 
     def test_stop_of_the_user_is_not_a_traceback(self) -> None:
         output = self.directory / "page.tex"
