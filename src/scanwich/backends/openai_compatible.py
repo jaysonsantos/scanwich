@@ -123,6 +123,12 @@ SESSION_ID_HEADER = "X-Session-Id"
 # wait in seconds that the service asks for.
 RATE_LIMIT_STATUS = 429
 RETRY_AFTER_HEADER = "retry-after"
+# The HTTP statuses of an answer of the service about one request: a request that it
+# cannot read (for example an image that is too large), input that its moderation
+# refuses, and a request that is too large. Another page can get a reply, so such an
+# answer is not `NoReplyError`. Each other status, a connection error, and a timeout are
+# no reply. 401, 402, and 404 (the key, the credit, the model) are so for each page.
+PAGE_ANSWER_STATUSES = frozenset({400, 403, 413, 422})
 
 logger = logging.getLogger(__name__)
 
@@ -324,7 +330,8 @@ class OpenAICompatibleBackend:
         The errors tell the caller if the service gave a reply:
 
         - A request that fails gives `NoReplyError`. The cause is then the service or
-          the key, and not the page.
+          the key, and not the page. An HTTP status of `PAGE_ANSWER_STATUSES` is an
+          answer about the page, so it gives a different error.
         - A service that answers that it gets too many requests gives `RateLimitError`,
           so that the caller can make all its requests wait. Its `resume` sends the
           refused request again, with `attempt` as its number. Thus the replies before
@@ -344,7 +351,15 @@ class OpenAICompatibleBackend:
             try:
                 completion = await client.chat.completions.create(**request)
             except Exception as error:
-                if getattr(error, "status_code", None) == RATE_LIMIT_STATUS:
+                status_code = getattr(error, "status_code", None)
+                if status_code in PAGE_ANSWER_STATUSES:
+                    # The service works, and it answered about this page.
+                    if attempt > 1:
+                        raise self._correction_request_error(error, attempt, model, limit) from None
+                    raise RuntimeError(
+                        f"OpenAI-compatible request failed for model {model}: {error}"
+                    ) from error
+                if status_code == RATE_LIMIT_STATUS:
                     raise RateLimitError(
                         f"OpenAI-compatible request failed for model {model}: the service "
                         f"gets too many requests (HTTP status {RATE_LIMIT_STATUS})",

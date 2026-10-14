@@ -8,6 +8,7 @@ import hashlib
 import inspect
 import json
 import logging
+import math
 import os
 import re
 import shutil
@@ -116,12 +117,16 @@ DEFAULT_PARALLEL_PAGES = 4
 # time are not more than: one for each reader, the pages in the queue, and the one page
 # that waits for a place in the queue.
 PAGE_QUEUE_SIZE = 1
-# When this many pages in sequence fail with no reply from the service, the cause is
-# probably not a page: it can be the service, the key, the quota, or an option. The
-# conversion then starts no more pages. A page that gets a layout from its requests
-# starts the count again. A page with a reply that is not usable does not count: the
-# service works, and the page is the cause.
-NO_REPLY_PAGES = 3
+# When the pages in work get no reply from the service this many times in sequence, the
+# cause is probably not a page: it can be the service, the key, the quota, or an option.
+# The conversion then starts no more pages. One time is one wave of failed pages: the
+# pages in work at one moment fail together. Thus a page counts only when it started
+# after the last page that counted. A page that gets a layout from its requests starts
+# the count again. A page with a reply that is not usable, or with an answer of the
+# service about its content, does not count: the service works.
+NO_REPLY_WAVES = 3
+# The reasons of a stop of the conversion before its last page.
+STOP_NO_REPLY = "no reply"
 # The waits in seconds after the service answers that it gets too many requests. All
 # requests of the conversion wait. After the last wait, the request fails.
 RATE_LIMIT_WAITS = (30.0, 60.0, 120.0)
@@ -764,8 +769,12 @@ class _Conversion:
         # saved layout.
         self._read_pages = 0
         self._saved_pages = 0
-        # The pages in sequence that failed with no reply from the service.
-        self._pages_without_reply = 0
+        # The reason of a stop of the conversion before its last page.
+        self._stop_reason: str | None = None
+        # The waves in sequence of pages with no reply from the service, and the time of
+        # the event loop when the last page that counted failed.
+        self._waves_without_reply = 0
+        self._last_counted_no_reply = -math.inf
         # The settings of saved layouts that are not the settings of this conversion.
         self._other_settings: dict[str, int] = {}
         self._other_settings_pages = 0
@@ -837,15 +846,17 @@ class _Conversion:
         if not_started:
             lines.append(f"  {len(not_started)} page(s) did not start: {_page_ranges(not_started)}")
         saved = f"The layouts of the pages that are complete are in {self._layout_directory}."
-        if self._stop.is_set():
+        if self._stop_reason == STOP_NO_REPLY:
+            # All pages can have started before the stop.
             lines.append(
-                f"The conversion started no more pages, because {NO_REPLY_PAGES} pages in "
-                "sequence got no reply from the service. The cause is probably the service, "
-                "the key, the quota, or an option, and not a page."
+                ("The conversion started no more pages: the" if not_started else "The")
+                + f" pages in work got no reply from the service {NO_REPLY_WAVES} times in "
+                "sequence. The cause is probably the service, the key, the quota, or an option."
             )
             lines.append(
-                f"{saved} When the service gives replies again, the same command sends "
-                "requests only for the pages that have no saved layout."
+                f"{saved} When the service works again, the same command sends requests only "
+                "for the pages that have no saved layout. If the same pages fail again, they "
+                "are the cause: convert the other files first, with the same layout directory."
             )
         else:
             lines.append(
@@ -931,16 +942,17 @@ class _Conversion:
                     job.image_path.unlink(missing_ok=True)
                 continue
             with _log_page(job.page, len(self._pages)):
+                started = asyncio.get_running_loop().time()
                 try:
                     layout = await self._convert_page(job)
                 except Exception as error:
-                    self._page_failed(job.page, error, read=job.saved is None)
+                    self._page_failed(job.page, error, read=job.saved is None, started=started)
                 else:
                     self._layouts[job.page.number] = layout
                     if job.saved is None:
                         self._read_pages += 1
                         # The service gives replies.
-                        self._pages_without_reply = 0
+                        self._waves_without_reply = 0
                     else:
                         self._saved_pages += 1
 
@@ -1037,8 +1049,12 @@ class _Conversion:
             ", ".join(names),
         )
 
-    def _page_failed(self, page: _SourcePage, error: Exception, *, read: bool) -> None:
+    def _page_failed(
+        self, page: _SourcePage, error: Exception, *, read: bool, started: float = -math.inf
+    ) -> None:
         """Record a page that has no layout. `read` is True when its requests failed.
+
+        `started` is the time of the event loop when the work for the page started.
 
         A conversion that saves its layouts continues with the other pages: one new run
         then completes the document, and it sends requests only for the pages that
@@ -1066,13 +1082,17 @@ class _Conversion:
         )
         if not read or not isinstance(error, NoReplyError):
             return
-        self._pages_without_reply += 1
-        if self._pages_without_reply >= NO_REPLY_PAGES and not self._stop.is_set():
+        if started > self._last_counted_no_reply:
+            # A page that was in work when the last page counted belongs to that wave.
+            self._waves_without_reply += 1
+            self._last_counted_no_reply = asyncio.get_running_loop().time()
+        if self._waves_without_reply >= NO_REPLY_WAVES and not self._stop.is_set():
             self._stop.set()
+            self._stop_reason = STOP_NO_REPLY
             logger.error(
-                "%d pages in sequence got no reply from the service. The cause is probably "
-                "not a page, so the conversion starts no more pages",
-                self._pages_without_reply,
+                "The pages in work got no reply from the service %d times in sequence, so the "
+                "conversion starts no more pages",
+                self._waves_without_reply,
             )
 
 

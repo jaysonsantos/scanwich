@@ -46,7 +46,7 @@ from scanwich.ocr import (
 )
 from scanwich.pipeline import (
     DEFAULT_PARALLEL_PAGES,
-    NO_REPLY_PAGES,
+    NO_REPLY_WAVES,
     PAGE_QUEUE_SIZE,
     ConversionStopped,
     OutputDirectoryError,
@@ -996,7 +996,7 @@ class FailedPageTests(BookTestCase):
     def test_conversion_starts_no_more_pages_when_the_service_gives_no_reply(self) -> None:
         # A service that stops in the middle of a book. Without this rule, each later
         # page waits for its timeout.
-        self.assertEqual(NO_REPLY_PAGES, 3)
+        self.assertEqual(NO_REPLY_WAVES, 3)
         inputs = self.photos(12)
         made: list[int] = []
         make_page_image = pipeline._make_page_image
@@ -1022,17 +1022,18 @@ class FailedPageTests(BookTestCase):
             f"  page 6 ({inputs[5]}): the service gave no reply for page 6\n"
             f"  page 7 ({inputs[6]}): the service gave no reply for page 7\n"
             "  5 page(s) did not start: 8-12\n"
-            "The conversion started no more pages, because 3 pages in sequence got no reply "
-            "from the service. The cause is probably the service, the key, the quota, or an "
-            "option, and not a page.\n"
+            "The conversion started no more pages: the pages in work got no reply from the "
+            "service 3 times in sequence. The cause is probably the service, the key, the "
+            "quota, or an option.\n"
             f"The layouts of the pages that are complete are in {self.layouts}. When the "
-            "service gives replies again, the same command sends requests only for the pages "
-            "that have no saved layout.",
+            "service works again, the same command sends requests only for the pages that "
+            "have no saved layout. If the same pages fail again, they are the cause: convert "
+            "the other files first, with the same layout directory.",
         )
         self.assertEqual(
             captured_logs.output[-1],
-            f"ERROR:{LOGGER_NAME}:3 pages in sequence got no reply from the service. The cause "
-            "is probably not a page, so the conversion starts no more pages",
+            f"ERROR:{LOGGER_NAME}:The pages in work got no reply from the service 3 times in "
+            "sequence, so the conversion starts no more pages",
         )
         # After the stop, the conversion makes no more page images: not more than the
         # pages that were in the queue.
@@ -1075,8 +1076,84 @@ class FailedPageTests(BookTestCase):
         with self.assertLogs(LOGGER_NAME, level="ERROR"), self.assertRaises(PageLayoutError):
             self.convert(self.photos(40), backend, parallel_pages=readers)
         self.assertEqual(len(self.layout_files()), 8)
-        # The pages in work when the third page fails have their requests, and no more.
-        self.assertLessEqual(len(backend.requests), 8 + NO_REPLY_PAGES + readers)
+        # Each wave is not more than the pages in work. After the third wave, the pages
+        # in work have their requests, and no more.
+        self.assertLessEqual(len(backend.requests), 8 + (NO_REPLY_WAVES + 1) * readers)
+
+    def test_one_outage_of_the_service_counts_one_time(self) -> None:
+        # The pages in work at one moment fail together. A short outage must not stop a
+        # run: 3 or 4 pages with no reply are one wave.
+        outage = (0.25, 0.4)
+        started = time.monotonic()
+
+        class OutageBackend(AsyncPageBackend):
+            async def recognize_layout_async(
+                self, image_path: Path, *, upright: bool = False
+            ) -> PageLayout:
+                if outage[0] <= time.monotonic() - started < outage[1]:
+                    page = self.start(image_path, upright)
+                    # A client that tries a request again needs some time to fail.
+                    await asyncio.sleep(0.2)
+                    self.in_flight -= 1
+                    raise NoReplyError(f"the service gave no reply for page {page}")
+                return await super().recognize_layout_async(image_path, upright=upright)
+
+        backend = OutageBackend(delay=0.1)
+        with (
+            self.assertLogs(LOGGER_NAME, level="ERROR"),
+            self.assertRaises(PageLayoutError) as raised,
+        ):
+            self.convert(self.photos(24), backend, parallel_pages=4)
+
+        error = str(raised.exception)
+        failed = error.count("the service gave no reply")
+        self.assertGreater(failed, 1)
+        # Each page started and each other page has its layout.
+        self.assertNotIn("did not start", error)
+        self.assertNotIn("got no reply from the service 3 times", error)
+        self.assertEqual(len(self.layout_files()), 24 - failed)
+
+    def test_slow_pages_at_the_same_time_count_one_time(self) -> None:
+        # A page that needs more time than the timeout of the service. Three such pages
+        # in work at one moment are one wave.
+        class SlowBackend(AsyncPageBackend):
+            async def recognize_layout_async(
+                self, image_path: Path, *, upright: bool = False
+            ) -> PageLayout:
+                page = self.start(image_path, upright)
+                await asyncio.sleep(0.3 if page in (5, 6, 7) else 0.02)
+                self.in_flight -= 1
+                if page in (5, 6, 7):
+                    raise NoReplyError(f"the request for page {page} timed out")
+                return PageLayout(blocks=(Paragraph(text_of(page)),))
+
+        for run in (1, 2):
+            backend = SlowBackend()
+            with (
+                self.subTest(run=run),
+                self.assertLogs(LOGGER_NAME, level="ERROR"),
+                self.assertRaises(PageLayoutError) as raised,
+            ):
+                self.convert(self.photos(12), backend, parallel_pages=4)
+            self.assertIn("3 of 12 page(s) have no layout", str(raised.exception))
+            self.assertNotIn("did not start", str(raised.exception))
+            self.assertEqual(len(self.layout_files()), 9)
+
+    def test_stop_after_the_last_page_tells_no_pages_that_did_not_start(self) -> None:
+        backend = PageBackend(no_reply={1, 2, 3})
+        with (
+            self.assertLogs(LOGGER_NAME, level="ERROR"),
+            self.assertRaises(PageLayoutError) as raised,
+        ):
+            self.convert(self.photos(3), backend, parallel_pages=1)
+        error = str(raised.exception)
+        self.assertNotIn("did not start", error)
+        self.assertNotIn("started no more pages", error)
+        self.assertIn(
+            "The pages in work got no reply from the service 3 times in sequence. The cause is "
+            "probably the service, the key, the quota, or an option.\n",
+            error,
+        )
 
     def test_failed_page_keeps_nothing_of_its_request(self) -> None:
         # The error of a failed page has its traceback, and the frames of a backend hold
@@ -1846,6 +1923,19 @@ class RateLimitTests(BookTestCase):
             self.convert(inputs, backend, parallel_pages=1)
         # One request and one more after each wait.
         self.assertEqual(backend.requests, [1, 2, 2, 2, 2])
+
+    def test_rate_refusal_after_its_waits_counts_as_no_reply(self) -> None:
+        # A quota that ends in the middle of a book. Without this, each later page waits
+        # 3 times before it fails.
+        backend = self.limited_backend(dict.fromkeys(range(3, 13), 100))
+        with (
+            patch("scanwich.pipeline.RATE_LIMIT_WAITS", (0.01, 0.01)),
+            self.assertLogs(LOGGER_NAME, level="WARNING"),
+            self.assertRaisesRegex(PageLayoutError, "4 page.s. did not start: 9-12") as raised,
+        ):
+            self.convert(self.photos(12), backend, parallel_pages=2)
+        self.assertIn("got no reply from the service 3 times in sequence", str(raised.exception))
+        self.assertEqual(len(self.layout_files()), 2)
 
     def test_refused_request_for_a_box_is_a_failed_page(self) -> None:
         # A layout with the first box of an illustration must not be the saved layout:

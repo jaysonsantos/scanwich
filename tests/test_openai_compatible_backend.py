@@ -1830,6 +1830,34 @@ class AsyncRequestTests(TestCase):
             self.run_async(FakeAsyncCompletions("not JSON"), "recognize_layout_async")
         self.assertNotIsInstance(raised.exception, NoReplyError)
 
+    def test_status_of_an_answer_about_a_page_is_not_no_reply(self) -> None:
+        # An answer about one page: the service works, and another page can get a reply.
+        # The other statuses are the same for each page, or the service does not work.
+        statuses = {
+            **dict.fromkeys((400, 403, 413, 422), False),
+            **dict.fromkeys((401, 402, 404, 408, 409, 500, 502, 503, 504, 529), True),
+        }
+        for status_code, no_reply in statuses.items():
+            for first_reply in (None, "not JSON"):
+                # The status at the first request, and at a correction request.
+                replies = [self.service_error(status_code, {})]
+                if first_reply is not None:
+                    replies.insert(0, first_reply)
+                with (
+                    self.subTest(status=status_code, correction=first_reply is not None),
+                    self.assertLogs(LOGGER_NAME, level="INFO"),
+                    self.assertRaises(RuntimeError) as raised,
+                ):
+                    self.run_async(FakeAsyncCompletions(*replies), "recognize_layout_async")
+                self.assertEqual(isinstance(raised.exception, NoReplyError), no_reply)
+                if first_reply is not None:
+                    # A correction request has text from a reply, so its error has no
+                    # text of the provider.
+                    self.assertIn(
+                        f"in attempt 2 of 3: RuntimeError, HTTP status {status_code}",
+                        str(raised.exception),
+                    )
+
     def test_request_with_no_key_gives_no_reply(self) -> None:
         backend = OpenAICompatibleBackend(languages=["en"], options={})
         with (
