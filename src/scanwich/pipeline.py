@@ -290,6 +290,41 @@ def convert_to_latex(
             "LaTeX output needs an OCR backend that recognizes the layout of a page"
         )
 
+    with _StopSignals(stop_signals) as stop:
+        _convert_with_stop_signals(
+            given_paths,
+            input_paths,
+            output_tex,
+            backend=backend,
+            dpi=dpi,
+            rotate=rotate,
+            flow=flow,
+            ocr_output_directory=ocr_output_directory,
+            ignore_saved_layouts=ignore_saved_layouts,
+            parallel_pages=parallel_pages,
+            stop=stop,
+        )
+
+
+def _convert_with_stop_signals(
+    given_paths: Sequence[Path],
+    input_paths: Sequence[Path],
+    output_tex: Path,
+    *,
+    backend: LayoutBackend,
+    dpi: int | None,
+    rotate: int | None,
+    flow: bool,
+    ocr_output_directory: Path | None,
+    ignore_saved_layouts: bool,
+    parallel_pages: int,
+    stop: _StopSignals,
+) -> None:
+    """Do the work of `convert_to_latex`, which has checked the arguments.
+
+    The stop signals have their handlers for the full time of this function: each part
+    has work files. The work files go away before the handlers of the caller come back.
+    """
     # A directory that Scanwich cannot write to must stop the conversion here, before
     # the first request. The layout directory gets its first file after requests.
     _check_directory(output_tex.parent, "the directory of the document")
@@ -330,22 +365,18 @@ def convert_to_latex(
             layout_directory=layout_directory,
             ignore_saved_layouts=ignore_saved_layouts,
             parallel_pages=parallel_pages,
-            stop_signals=stop_signals,
+            stop=stop,
         )
-        # The event loop replaces the handlers of the stop signals, and it does not put
-        # the handlers of the caller back.
-        handlers = {number: signal.getsignal(number) for number in stop_signals}
         try:
             asyncio.run(conversion.run())
         except asyncio.CancelledError:
-            if conversion.stop_signal is None:
+            if stop.signal_number is None:
                 raise
-            raise ConversionStopped(conversion.stop_signal) from None
+            raise ConversionStopped(stop.signal_number) from None
         finally:
-            for number, handler in handlers.items():
-                # A thread that is not the main thread has no signal handlers.
-                with contextlib.suppress(ValueError, TypeError, OSError):
-                    signal.signal(number, handler)
+            stop.detach()
+        # A signal can come after the last page and before the end of the event loop.
+        stop.raise_if_stopped()
         layouts = conversion.layouts_in_sequence()
 
         if not any(layout.blocks for layout in layouts):
@@ -377,6 +408,72 @@ def convert_to_latex(
         )
     if figure_count:
         logger.info("Wrote %d illustration(s) to %s", figure_count, figure_directory)
+
+
+class _StopSignals:
+    """The handlers of the stop signals, for the time that a conversion has work files.
+
+    In the event loop, a stop signal cancels the conversion, as Ctrl-C does in
+    `asyncio.run`. Before and after the event loop, it raises `ConversionStopped` at once.
+    The handlers stay until the work files are gone, and the handlers of the caller then
+    come back.
+
+    - A second signal has no effect while the conversion stops. A terminal that closes
+      sends SIGHUP two times, in less than 10 ms.
+    - A signal that the caller ignores at the start gets no handler, so that it keeps no
+      effect. `nohup` and a parent of the process give `SIG_IGN` to SIGHUP in this way.
+    - A thread that is not the main thread cannot set signal handlers. Each signal then
+      keeps its usual effect.
+    """
+
+    def __init__(self, signal_numbers: Collection[int]) -> None:
+        self._signal_numbers = tuple(signal_numbers)
+        self._handlers_of_the_caller: dict[int, Any] = {}
+        self._loop: asyncio.AbstractEventLoop | None = None
+        self._task: asyncio.Task[Any] | None = None
+        # The signal that stopped the conversion.
+        self.signal_number: int | None = None
+
+    def __enter__(self) -> _StopSignals:
+        for number in self._signal_numbers:
+            handler = signal.getsignal(number)
+            if handler == signal.SIG_IGN:
+                continue
+            try:
+                signal.signal(number, self._handle)
+            except ValueError:
+                continue
+            self._handlers_of_the_caller[number] = handler
+        return self
+
+    def __exit__(self, *details: object) -> None:
+        for number, handler in self._handlers_of_the_caller.items():
+            # A handler that the caller did not set in Python is not known.
+            with contextlib.suppress(ValueError, TypeError, OSError):
+                signal.signal(number, signal.SIG_DFL if handler is None else handler)
+
+    def attach(self, task: asyncio.Task[Any]) -> None:
+        """Make a stop signal cancel this task of the running event loop."""
+        self._loop = asyncio.get_running_loop()
+        self._task = task
+
+    def detach(self) -> None:
+        self._loop = self._task = None
+
+    def raise_if_stopped(self) -> None:
+        if self.signal_number is not None:
+            raise ConversionStopped(self.signal_number)
+
+    def _handle(self, number: int, frame: object) -> None:
+        if self.signal_number is not None:
+            return
+        self.signal_number = number
+        if self._loop is None or self._task is None:
+            raise ConversionStopped(number)
+        # The handler runs in the thread of the event loop, between two steps of a task.
+        # The cancel waits for the next step of the loop.
+        with contextlib.suppress(RuntimeError):
+            self._loop.call_soon_threadsafe(self._task.cancel)
 
 
 def _check_directory(directory: Path, name: str) -> None:
@@ -641,12 +738,10 @@ class _Conversion:
         layout_directory: Path | None,
         ignore_saved_layouts: bool,
         parallel_pages: int,
-        stop_signals: Collection[int] = (),
+        stop: _StopSignals | None = None,
     ) -> None:
         self._backend = backend
-        self._stop_signals = tuple(stop_signals)
-        # The signal that stopped the conversion.
-        self.stop_signal: int | None = None
+        self._stop_signals = stop
         self._pages = pages
         self._work_directory = work_directory
         self._new_figures_directory = new_figures_directory
@@ -677,6 +772,11 @@ class _Conversion:
 
     async def run(self) -> None:
         """Get the layout of each page. A page that fails is then without a layout."""
+        # From here, a stop signal cancels this task. The index below has work files.
+        if self._stop_signals is not None:
+            conversion_task = asyncio.current_task()
+            assert conversion_task is not None
+            self._stop_signals.attach(conversion_task)
         # The primitives of asyncio belong to the event loop, so they start here.
         self._stop = asyncio.Event()
         self._calls = _BackendCalls(self._backend)
@@ -694,8 +794,6 @@ class _Conversion:
             asyncio.create_task(self._read(queue), name=f"scanwich-page-reader-{number}")
             for number in range(1, readers + 1)
         ]
-        loop = asyncio.get_running_loop()
-        handled_signals = self._handle_stop_signals(loop)
         try:
             await asyncio.gather(*tasks)
         finally:
@@ -704,8 +802,6 @@ class _Conversion:
                 task.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
             await self._calls.close()
-            for number in handled_signals:
-                loop.remove_signal_handler(number)
         if self._layout_directory is not None:
             logger.info(
                 "%d page(s) got a layout from requests, and %d page(s) have a saved layout",
@@ -723,30 +819,6 @@ class _Conversion:
                     for name, count in sorted(self._other_settings.items())
                 ),
             )
-
-    def _handle_stop_signals(self, loop: asyncio.AbstractEventLoop) -> list[int]:
-        """Make each stop signal cancel the conversion, and return the signals that do."""
-        conversion_task = asyncio.current_task()
-        assert conversion_task is not None
-
-        def stop(number: int) -> None:
-            if self.stop_signal is None:
-                self.stop_signal = number
-                conversion_task.cancel()
-            # The same signal again has its usual effect, for a conversion that does
-            # not end.
-            loop.remove_signal_handler(number)
-
-        handled = []
-        for number in self._stop_signals:
-            try:
-                loop.add_signal_handler(number, stop, number)
-            except (NotImplementedError, RuntimeError, ValueError):
-                # No handler on this platform or in this thread. The signal then keeps
-                # its usual effect.
-                continue
-            handled.append(number)
-        return handled
 
     def layouts_in_sequence(self) -> list[PageLayout]:
         """Return the layouts of all pages, or raise `PageLayoutError` when one has none."""

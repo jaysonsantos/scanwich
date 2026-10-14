@@ -1,6 +1,7 @@
 """LaTeX output for a book: many input files, saved layouts, and parallel pages."""
 
 import asyncio
+import contextlib
 import gc
 import hashlib
 import json
@@ -1596,6 +1597,112 @@ class ParallelPagesTests(BookTestCase):
                 backend = AsyncPageBackend()
                 self.convert(inputs, backend, ocr_output_directory=layouts)
                 self.assertEqual(len(backend.requests), 10 - saved)
+
+    def stopped_conversion(
+        self, signals: list[int], *, at_page: int = 6, **patches: Callable[..., object]
+    ) -> tuple[ConversionStopped, Path, AsyncPageBackend]:
+        """Convert 10 photos, send the signals at a page, and return the stop.
+
+        Each stop signal has a handler of the caller that fails the test, so that a
+        signal that the conversion does not take ends no test process.
+        """
+        inputs = self.photos(10)
+        self.output.parent.mkdir(exist_ok=True)
+        self.output.write_text("the earlier document")
+        work_directory = self.directory / "work"
+        work_directory.mkdir(exist_ok=True)
+
+        def handler_of_the_caller(*arguments: object) -> None:
+            raise AssertionError("the conversion did not take the signal")
+
+        self.handler_of_the_caller = handler_of_the_caller
+        for number in (signal.SIGTERM, signal.SIGHUP):
+            self.addCleanup(signal.signal, number, signal.signal(number, handler_of_the_caller))
+
+        def send(page: int) -> None:
+            if page == at_page:
+                for number in signals:
+                    signal.raise_signal(number)
+
+        backend = AsyncPageBackend(delay=0.03, on_request=send)
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(patch("tempfile.tempdir", str(work_directory)))
+            for name, value in patches.items():
+                stack.enter_context(patch.object(pipeline, name, value))
+            stack.enter_context(self.assertNoLogs("asyncio", level="WARNING"))
+            raised = stack.enter_context(self.assertRaises(ConversionStopped))
+            self.convert(
+                inputs, backend, parallel_pages=2, stop_signals=(signal.SIGTERM, signal.SIGHUP)
+            )
+        return raised.exception, work_directory, backend
+
+    def assert_clean_stop(self, work_directory: Path) -> None:
+        # No hidden directory and no temporary document next to the earlier document.
+        self.assertEqual(self.output.read_text(), "the earlier document")
+        self.assertEqual([path.name for path in self.output.parent.iterdir()], ["book.tex"])
+        self.assertEqual(list(work_directory.iterdir()), [])
+        # The handlers of the caller are in place again.
+        for number in (signal.SIGTERM, signal.SIGHUP):
+            self.assertIs(signal.getsignal(number), self.handler_of_the_caller)
+
+    def test_two_signals_give_one_clean_stop(self) -> None:
+        # A terminal that closes sends SIGHUP two times, in less than 10 ms. The second
+        # signal must have no effect while the conversion stops.
+        stop, work_directory, backend = self.stopped_conversion(
+            [signal.SIGHUP, signal.SIGHUP, signal.SIGTERM]
+        )
+        self.assertEqual(stop.signal_number, signal.SIGHUP)
+        self.assertEqual(backend.in_flight, 0)
+        self.assert_clean_stop(work_directory)
+        self.assertIn(len(self.layout_files()), (4, 5))
+
+    def test_signal_in_the_parts_before_and_after_the_event_loop(self) -> None:
+        # The index of the saved layouts and the install of the document have work files
+        # also. A signal there must give the same clean stop.
+        index = pipeline._saved_layout_index
+        install = pipeline._install_result
+
+        def index_with_a_signal(*arguments: object) -> object:
+            signal.raise_signal(signal.SIGTERM)
+            # The index is in a thread. The signal cancels the conversion meanwhile.
+            time.sleep(0.05)
+            return index(*arguments)
+
+        def install_with_a_signal(*arguments: object) -> object:
+            signal.raise_signal(signal.SIGTERM)
+            return install(*arguments)
+
+        for name, value in (
+            ("_saved_layout_index", index_with_a_signal),
+            ("_install_result", install_with_a_signal),
+        ):
+            with self.subTest(part=name):
+                stop, work_directory, backend = self.stopped_conversion([], **{name: value})
+                self.assertEqual(stop.signal_number, signal.SIGTERM)
+                self.assert_clean_stop(work_directory)
+                if name == "_saved_layout_index":
+                    self.assertEqual(backend.requests, [])
+                else:
+                    # All pages are complete and saved, and the next run needs no request.
+                    self.assertEqual(len(self.layout_files()), 10)
+                shutil.rmtree(work_directory)
+
+    def test_signal_that_the_caller_ignores_keeps_no_effect(self) -> None:
+        # `nohup` gives SIG_IGN to SIGHUP, so that a long run continues after the
+        # terminal closes.
+        inputs = self.photos(6)
+        self.addCleanup(signal.signal, signal.SIGHUP, signal.signal(signal.SIGHUP, signal.SIG_IGN))
+
+        def send(page: int) -> None:
+            if page == 3:
+                signal.raise_signal(signal.SIGHUP)
+
+        backend = AsyncPageBackend(delay=0.01, on_request=send)
+        self.convert(inputs, backend, stop_signals=(signal.SIGTERM, signal.SIGHUP))
+
+        self.assertEqual(sorted(backend.requests), [1, 2, 3, 4, 5, 6])
+        self.assertEqual(self.document().count("\\begin{sourcepage}"), 6)
+        self.assertIs(signal.getsignal(signal.SIGHUP), signal.SIG_IGN)
 
     def test_stop_signals_in_a_thread_that_has_no_signal_handlers(self) -> None:
         # Only the main thread has signal handlers. The conversion must still work.

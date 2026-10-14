@@ -390,6 +390,31 @@ class CliTests(TestCase):
         # The handler of the caller is in place again.
         self.assertIs(signal.getsignal(signal.SIGTERM), handler)
 
+    def test_parent_that_ignores_the_signals_keeps_the_conversion(self) -> None:
+        # `nohup scanwich ...` and a parent that ignores SIGTERM.
+        class SignalBackend(LayoutCapableBackend):
+            def recognize_layout(self, image_path: Path, *, upright: bool = False) -> PageLayout:
+                if len(self.image_sizes) == 1:
+                    signal.raise_signal(signal.SIGHUP)
+                    signal.raise_signal(signal.SIGTERM)
+                return super().recognize_layout(image_path, upright=upright)
+
+        second = self.directory / "photo-2.png"
+        Image.new("RGB", (60, 20), "white").save(second)
+        output = self.directory / "book.tex"
+        for number in (signal.SIGHUP, signal.SIGTERM):
+            self.addCleanup(signal.signal, number, signal.signal(number, signal.SIG_IGN))
+
+        exit_code, log_output = self.run_main(
+            [str(self.photo), str(second), str(output), "--parallel-pages", "1"],
+            SignalBackend(),
+        )
+
+        self.assertEqual(exit_code, 0, log_output)
+        self.assertEqual(output.read_text(encoding="utf-8").count("\\begin{sourcepage}"), 2)
+        for number in (signal.SIGHUP, signal.SIGTERM):
+            self.assertIs(signal.getsignal(number), signal.SIG_IGN)
+
     def test_platform_with_no_sighup_has_the_other_stop_signal(self) -> None:
         output = self.directory / "page.tex"
         sighup = signal.SIGHUP
