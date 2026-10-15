@@ -7,7 +7,14 @@ from pypdf import PdfReader, PdfWriter
 from reportlab.pdfgen import canvas
 
 from scanwich.models import OcrRegion, Point
-from scanwich.pdf import DEFAULT_DPI, RasterizedPage, assemble_searchable_pdf, rasterize_pdf
+from scanwich.pdf import (
+    DEFAULT_DPI,
+    PdfPipelineError,
+    RasterizedPage,
+    assemble_searchable_pdf,
+    rasterize_pdf,
+    rasterize_pdf_page,
+)
 
 
 class RasterizePdfTests(TestCase):
@@ -27,6 +34,32 @@ class RasterizePdfTests(TestCase):
             self.assertEqual(pages[0].dpi, 100.0)
             with Image.open(pages[0].image_path) as rendered:
                 self.assertEqual(rendered.size, (200, 100))
+
+    def test_rasterizes_one_page_as_the_full_document_does(self) -> None:
+        with TemporaryDirectory() as temporary_directory:
+            directory = Path(temporary_directory)
+            input_path = directory / "input.pdf"
+            source = canvas.Canvas(str(input_path))
+            for width in (144, 72, 216):
+                source.setPageSize((width, 72))
+                source.drawString(10, 50, f"a page {width} points wide")
+                source.showPage()
+            source.save()
+            pages = rasterize_pdf(input_path, directory / "pages", dpi=100)
+
+            one_page = rasterize_pdf_page(input_path, 2, directory / "one.png", dpi=100)
+
+            self.assertEqual(one_page.image_path, directory / "one.png")
+            self.assertEqual(
+                (one_page.width_points, one_page.height_points, one_page.dpi),
+                (pages[2].width_points, pages[2].height_points, pages[2].dpi),
+            )
+            self.assertEqual((directory / "one.png").read_bytes(), pages[2].image_path.read_bytes())
+            # The function makes the image of one page only.
+            self.assertEqual(sorted(path.name for path in directory.glob("*.png")), ["one.png"])
+            with self.assertRaisesRegex(PdfPipelineError, "has 3 page.s., and no page 4"):
+                rasterize_pdf_page(input_path, 3, directory / "none.png")
+            self.assertFalse((directory / "none.png").exists())
 
     def test_uses_default_dpi_without_a_full_page_image(self) -> None:
         with TemporaryDirectory() as temporary_directory:

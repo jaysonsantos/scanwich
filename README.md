@@ -96,7 +96,7 @@ For direct CLI use, pass `--ocr-backend openai-compatible`.
 
 ## LaTeX documents
 
-Scanwich can write a PDF or a photo of a page as a LaTeX document.
+Scanwich can write PDFs and photos of pages as one LaTeX document.
 The purpose is an archive copy of an old book.
 The document has the text and the structure of the pages. It is not an image of the pages.
 Give the output file a name that ends in `.tex`:
@@ -105,10 +105,13 @@ Give the output file a name that ends in `.tex`:
 export OPENROUTER_API_KEY=...
 scanwich book.pdf book.tex --ocr-backend openai-compatible -l de
 scanwich page.ARW page.tex --ocr-backend openai-compatible -l de --rotate 90
+scanwich pages/*.ARW book.tex --ocr-backend openai-compatible -l de --rotate 90 \
+  --ocr-output-dir book-layouts
 ```
 
-The input is a PDF, an image that Pillow can read, or a camera raw file.
-A PDF with many pages becomes one document. An image is one page.
+An input is a PDF, an image that Pillow can read, or a camera raw file.
+All the inputs of a command become one document. A PDF gives all its pages, and an image is one page.
+For a book of many files, see "A book from many files".
 
 ### Model for LaTeX output
 
@@ -123,7 +126,8 @@ You do not give these two values. The searchable PDF and the HTTP API keep their
 `~openai/gpt-luna-latest` is an alias. The provider moves it to a newer model. That has these effects:
 
 - A later conversion of the same book can give different text, different formatting, a different cost, and a different time. Scanwich cannot make it the same.
-- The result of a conversion is the `.tex` file, its figure directory, and the layout JSON files of `--ocr-output-dir`. Keep these files. Do not convert a book again to get the same document.
+- The result of a conversion is the `.tex` file, its figure directory, and the layout JSON files of `--ocr-output-dir`. Keep these files.
+  With the layout files, a new conversion makes the same document and sends no request. Without them, a new conversion does not give the same document.
 - The log names the model that made each reply, when the response has that name: `the response names the model ...`. To convert more pages with that model, give its ID with `--backend-option model=...`.
 For a camera raw file, install the decoder with `pip install "scanwich[raw]"`.
 LibRaw then decodes all the sensor data. Scanwich does not use the small preview image of the file.
@@ -137,6 +141,146 @@ The document has these parts of the source, in reading order:
 - illustrations as image files, which the document includes with `\includegraphics`;
 - footnotes, with the reference marks of the source;
 - the running head, the running foot, and the printed page number of each page, at their places.
+
+### A book from many files
+
+Give the files of a book in the sequence of its pages, and the document as the last name:
+
+```console
+scanwich pages/*.ARW book.tex --ocr-backend openai-compatible -l de --rotate 90 \
+  --ocr-output-dir book-layouts
+```
+
+- The pages of the document have the sequence of the command. A PDF in the list gives its pages at its place.
+- The rules for the pages of one PDF are also the rules across the files.
+  These are: a paragraph that continues, a word that the end of a page divides, the names of the illustrations, and one source page for one page of the document.
+- A shell sorts the names of a pattern by their characters, so `page10.jpg` is before `page2.jpg`.
+  Scanwich then writes a `WARNING` log record. It does not change the sequence. Give such names leading zeros.
+- `--rotate` is for all the files. For files with different directions, do not use it. The backend then finds the direction of each page, see "Page direction".
+- An option can be between the names. `-l` takes each word after it, so put the names of the files before `-l`, or put `--` after the last language code.
+  A value of `-l` that is a file, or that ends in the suffix of a file of the command, is a usage error. The case of the letters does not matter.
+  Only the values that you give get this check. The default `de pt en` does not, so a file named `en` in the current directory does not stop a command without `-l`.
+  A value such as `Latin (med.)` or `de/at` is correct: the `openai-compatible` backend puts each value as text in its prompt.
+  The suffixes are these:
+  - The output: `.tex` and `.pdf`.
+  - The camera raw formats: `.3fr`, `.arw`, `.cr2`, `.cr3`, `.crw`, `.dcr`, `.dng`, `.erf`, `.iiq`, `.kdc`, `.mef`, `.mos`, `.mrw`, `.nef`, `.nrw`, `.orf`, `.pef`, `.raf`, `.raw`, `.rw2`, `.rwl`, `.sr2`, `.srf`, `.srw`, `.x3f`.
+  - The image formats that Pillow registers. With Pillow 12.3.0, the version of `uv.lock`, these are `.apng`, `.avif`, `.avifs`, `.blp`, `.bmp`, `.bufr`, `.bw`, `.cur`, `.dcx`, `.dds`, `.dib`, `.emf`, `.eps`, `.fit`, `.fits`, `.flc`, `.fli`, `.ftc`, `.ftu`, `.gbr`, `.gif`, `.grib`, `.h5`, `.hdf`, `.icb`, `.icns`, `.ico`, `.iim`, `.im`, `.j2c`, `.j2k`, `.jfif`, `.jp2`, `.jpc`, `.jpe`, `.jpeg`, `.jpf`, `.jpg`, `.jpx`, `.mpeg`, `.mpg`, `.mpo`, `.msp`, `.palm`, `.pbm`, `.pcd`, `.pcx`, `.pfm`, `.pgm`, `.png`, `.pnm`, `.ppm`, `.ps`, `.psd`, `.pxr`, `.qoi`, `.ras`, `.rgb`, `.rgba`, `.sgi`, `.tga`, `.tif`, `.tiff`, `.vda`, `.vst`, `.webp`, `.wmf`, `.xbm`, `.xpm`. A different version of Pillow can have different suffixes. Thus `-l fr.ps` and `-l x.im` are usage errors.
+- A name that starts with `-` must come after `--`, for example `scanwich -l de -- -scan.pdf out.pdf`. Another way is `./-scan.pdf`.
+- **Python 3.11:** in a command with `--`, all names must come after `--`, for example `scanwich -l de -- a.png b.png book.tex`.
+  `scanwich a.png -l de -- b.png book.tex` is a usage error on Python 3.11. Python 3.12 and later accept it.
+
+#### Saved layouts
+
+Use `--ocr-output-dir DIRECTORY` for a book.
+Scanwich then saves the layout of each page in that directory when the page is complete.
+A later conversion sends no request for a page that has a saved layout there.
+
+- **After a failure or a stop:** run the same command again. It sends requests only for the pages that have no saved layout.
+- **After a correction by hand:** change the layout file of a page, and run the same command again.
+  Scanwich makes the document from the saved layouts and sends no request. It makes each illustration again from the `box` of the layout.
+- **After you add, remove, or move a page:** the other pages keep their layouts.
+- **For a different model on some pages:** remove the layout files of those pages, and run the command with `--backend-option model=...`. The other pages keep their layouts.
+
+Each layout file has a `source` record. The record tells Scanwich which page the layout is for:
+
+| Field | Content |
+| --- | --- |
+| `sha256` | The SHA-256 of the bytes of the input file |
+| `page` | The number of the page in the input file. An image has the page 1 |
+| `turn` | The clockwise angle in degrees that the page image turned by before the backend read it |
+| `reading` | The backend, its settings such as the model and the languages, and the DPI of a PDF page |
+| `file` | The name of the input file. It is only for you |
+
+- **The input file:** a saved layout is for a page when `sha256` and `page` are those of the input. The name and the place of the input file do not matter.
+- **A changed input file:** different bytes give a different hash. The page gets a new request and a new layout file, and the earlier file stays.
+- **The direction:** with `--rotate`, the `turn` of the record must be the angle of the option. When it is not, the page fails, and the message tells you what to do.
+  Without `--rotate`, Scanwich turns the page image by the `turn` of the record. The boxes of the layout are on that image.
+- **The model:** a saved layout from a different model, effort, language list, or DPI stays in use.
+  Scanwich then writes a `WARNING` log record with the number of such layouts. Thus you can read the difficult pages with a different model, and the other pages get no new request.
+
+The name of a layout file is `NAME-HASH.json`. `NAME` is the name of the input file, and `HASH` is the first 8 characters of its `sha256`.
+A page of a PDF has the name `NAME-page-0001-HASH.json`.
+The log names the input file and the layout file of each page.
+
+Scanwich does not change and does not replace a layout file that it uses. To get a new layout:
+
+- For one page, remove its layout file.
+- For all pages, use `--ignore-saved-layouts`. Each page then gets its requests, and the new layout replaces the saved one.
+
+A layout file that Scanwich cannot use is a failed page. An example is a file that is not valid JSON after a change by hand.
+Scanwich sends no request for such a page: a new layout replaces the file, and the file can have your work. The message has the name of the file and the defect.
+Scanwich ignores the other files of the directory.
+
+- **A directory that Scanwich cannot write to:** Scanwich checks the directory of the document at the start, and the layout directory before the first request. Such a directory stops the conversion with one error message.
+  A conversion in which each page has a saved layout writes nothing to the layout directory, so that directory can be read-only.
+- **Two layout files with the same `sha256` and `page`:** the file with the usual name is in use. When no file has that name, Scanwich uses the first name in the sort sequence and writes a `WARNING` log record.
+- **Two conversions with one layout directory:** they can run at the same time, for example a document with pages and a document with `--flow`. Do not convert to the same document two times at the same time.
+
+#### Failed pages
+
+- **With `--ocr-output-dir`:** a page that fails does not stop the other pages.
+  At the end, the conversion writes no document. It has the exit code 1, and its message lists each failed page with its input file and its error.
+  The same command again sends requests only for the pages of that list. Read the error of each page first: a page that fails again needs a correction of its cause.
+- **Without `--ocr-output-dir`:** the conversion stops at the first failed page.
+  Each more page has a cost, and a new run sends the request of each page again.
+  A conversion of more than one page writes a `WARNING` log record about this before the first request.
+- **A service that gives no reply:** when the pages in work get no reply from the service 3 times in sequence, the conversion starts no more pages.
+  The pages in work at one moment fail together, so they count one time: a page counts only when it started after the last page that counted. Thus a short outage does not stop a run, and a slow page alone does not stop it.
+  No reply is a connection that fails, a timeout, an HTTP error status of the service, a rate refusal after its waits, or a key that is not there.
+  The HTTP statuses 400, 403, 413, and 422 are an answer about the page, for example an image that is too large or a moderation flag. They do not count.
+  The cause of a stop is probably the service, the key, the quota, or an option. When the service works again, run the same command.
+  If the same pages fail again, they are the cause: convert the other files first, with the same layout directory.
+  When each failed page got no reply but fewer than 3 waves came, for example with 16 pages in work and 24 pages in all, all pages start and fail. The message then also names the service as the probable cause.
+- **A difficult page:** a page with a reply that Scanwich cannot use does not count for that rule, and a page that gets a layout starts the count again.
+  Thus difficult pages at the start of a book do not stop the other pages.
+- **The first pages of a run:** when the first 10 pages with a reply of the service all fail, and no page has a layout, the conversion starts no more pages.
+  The cause is then probably the model or an option, and each more page has a cost.
+  A page with no reply does not count for this rule. It counts for the rule of a service that gives no reply, above.
+  If these 10 pages are the cause, convert the other files first, with the same layout directory.
+- **A saved layout turns the rule for the first pages off:** a layout file with a `source` record in the layout directory turns it off, also the layout of a different document.
+  Thus with one layout directory for all your books, the rule is off after the first book. Use one layout directory for each book to keep the rule.
+  With `--ignore-saved-layouts`, Scanwich does not read the saved layouts, so the rule is on.
+- **A stop:** Ctrl-C, SIGTERM, and SIGHUP stop the conversion in a clean way, in each part of the conversion. SIGHUP is the signal of a terminal that closes or a connection that is lost.
+  The exit codes are 130, 143, and 129. The layouts that are saved stay, and no work file stays. A page that is in work at that moment is not saved.
+  Run the same command again to continue.
+- **A stop in the install of the result:** the install gives the new document and its illustrations their names. A stop there waits for the end of the install and of the removal of the work files. For 100 illustrations, this needs about 0.1 seconds.
+  The new document and its illustrations are then complete. The command tells this in a `WARNING` log record, and it gives the exit code of the stop, so that a script stops also.
+  In this step, a second Ctrl-C also has no effect.
+- **A second signal:** while the conversion stops, a second SIGTERM or SIGHUP has no effect. A terminal that closes sends SIGHUP two times.
+  A second Ctrl-C before the install ends the process at once, and the work files can then stay. SIGKILL always ends the process.
+- **`nohup` and an ignored signal:** a signal that has no effect when the command starts, for example SIGHUP with `nohup scanwich ...`, keeps no effect. The conversion continues.
+- **A provider with only synchronous methods:** a stop waits for its call that is in work, because Python cannot cancel such a call. The stop ends when that call ends.
+  The `openai-compatible` backend has async methods, so a stop cancels its requests at once.
+
+A document with a page that is not there is not a correct archive copy. Thus a conversion with a failed page writes no document.
+
+#### Parallel pages
+
+A request for a photo of a book page needs 30 to 40 seconds, so Scanwich reads some pages at the same time.
+
+- **The number:** the default is 4 pages. `--parallel-pages NUMBER` sets it, and `--parallel-pages 1` reads one page after the other.
+- **The document:** it does not depend on the number, or on the sequence of the replies. The cost is the same also.
+- **The memory:** Scanwich makes the image of a page a short time before it reads the page, and removes the image when the illustrations of the page are complete.
+  Not more than `NUMBER` + 2 page images exist at one time, in memory and in the temporary directory of the system. This is so for a book of each size.
+  A failed page keeps only its error message.
+- **The log:** each record of the work for a page starts with the page, for example `INFO: [page 12/200] ...`.
+- **A service that limits the rate:** when the service answers with the HTTP status 429, all pages wait before their next request. Then the request goes again.
+  The waits are 30, 60, and 120 seconds, or the time that the service asks for, to a maximum of 300 seconds. After the third wait, the page fails.
+  A refused request has no reply and no cost. The replies that a page got before the refusal count for its limit of requests.
+  When you see such waits, use a smaller number.
+- **A backend with only synchronous methods:** it gets one request at a time, from one thread, see "OCR plugins".
+
+#### From a Python program
+
+`scanwich.pipeline.convert_to_latex(inputs, output_tex, backend=backend)` is the function of the command. Its options have the names of the options of the command.
+
+- **The event loop:** the function starts an event loop of its own. A thread with a running event loop cannot call it, and gets a `RuntimeError` that tells this.
+  Call it from a different thread there, for example with `await asyncio.to_thread(convert_to_latex, ...)`.
+- **A stop:** `stop_signals` has the signals that stop the conversion as Ctrl-C does, for example `(signal.SIGTERM,)`. The function then raises `ConversionStopped`, which has the `signal_number`.
+  `document_complete` is True for a stop in the install of the result: the new document and its illustrations are then complete. When it is False, the earlier result did not change.
+  In the install, Ctrl-C gets the same handler when it has the usual handler of Python. A different handler of the caller for Ctrl-C stays in place.
+  The handlers are in place from the first work file to the last one. Then the handlers of the caller come back. A signal that the caller ignores gets no handler.
+  This needs the main thread. In a different thread, a signal keeps its usual effect. The default is no signal.
 
 ### Pages of the document
 
@@ -172,8 +316,11 @@ A new conversion replaces the files of the earlier conversion that have a name o
 Scanwich writes the document after all pages are complete. A conversion that fails does not change an earlier document or its illustrations.
 The new illustrations first go to the figure directory under temporary names. Only when all of them are there do the new illustrations and the new document get their names, and then Scanwich removes the earlier illustrations.
 A temporary name starts with a dot and ends with `.scanwich-new` or `.scanwich-old`. A conversion removes these files.
+During a conversion, the new illustrations wait in a directory next to the document. Its name starts with a dot and ends with `.scanwich-tmp`, and the conversion removes it at its end.
+The illustrations of a book are large in sum, and the temporary directory of a system can be in memory.
 If the system stops a conversion in its last step, such files can stay. A file that ends with `.scanwich-old` is then an illustration of the earlier document: remove the dot and the suffix from its name to use it again.
 A conversion fails when a page has no usable layout, and when no page has content. The error message has the number of the page.
+For the other pages of such a conversion, see "Failed pages".
 A page with no content in a document that has content gives a `WARNING` log record.
 
 Scanwich does not start a TeX engine. Compile the document with LuaLaTeX, XeLaTeX, or Tectonic:
@@ -211,7 +358,7 @@ The backend does not write LaTeX. This has three effects:
 - Scanwich can check a reply before it uses it. The `openai-compatible` backend asks the model to correct a reply that it cannot use.
 - An illustration has a box on the page image. Scanwich needs that box to crop the illustration.
 
-`--ocr-output-dir` saves the JSON of each page as `page-000001.json`.
+`--ocr-output-dir` saves the JSON of each page in one file, with a `source` record. See "Saved layouts" for the record and for the name of the file.
 The module `scanwich.layout` defines the JSON.
 One page has `blocks` in reading order. The block types are `heading`, `paragraph`, `quote`, `list`, `table`, `figure`, `footnote`, `page_header`, `page_footer`, and `page_number`.
 Text can have the tags `<b>`, `<i>`, `<u>`, `<sc>`, `<sup>`, `<sub>`, `<br>`, and `<fn>mark</fn>`.
@@ -236,6 +383,7 @@ Text of a reply does not disappear without an error. The check keeps the text, o
 - It rejects a reply that has text in a field that the layout does not read. Examples are a list in a list item, and a table with a caption and no rows.
 - It rejects text that it cannot keep in a field that the layout reads. Examples are the heads of the columns in the `columns` field of a table, and a value of `align` or `rules` that is not one of the names.
   A figure of a reply has no `image` field, because Scanwich makes the image file from the box.
+  A saved layout has no such field also. In a layout file that you change, Scanwich ignores the field.
 - It rejects a box that is not on the grid: a box on a scale of 0 to 1, and a box with a value above 1020.
 - It rejects text that has a control character. In JSON, a backslash without an escape makes such a character, for example in `\frac`.
 - It ignores a field that has no text and that the layout does not read, for example a number or a flag.
@@ -280,6 +428,7 @@ The number of requests has these limits:
 - One page gets a maximum of 12 requests for boxes. The other illustrations of that page use the box of the page layout, with one `WARNING` log record.
 - The request for the layout of a page has a maximum of `max_attempts` requests, which is 3. Without `--rotate`, a page that is not upright gets that request two times.
 - Thus one page has a maximum of 18 requests, and of 15 with `--rotate`. The usual numbers are 1 request for a page with no illustration and 2 requests for a page with one illustration.
+- These limits are for the requests that get a reply. A request that the service refuses for the rate has no reply and no cost. It goes again after a wait, see "Parallel pages".
 
 Each request has a cost. The request for a box is small: it has a part of the page, and its reply has only a box.
 
@@ -365,6 +514,33 @@ def locate_figure(
 The image shows a part of a page. `estimate` is a first box of the illustration on the 0-to-1000 grid of that image, and `caption` is its caption.
 The result has the box on the same grid and the sides where the image cuts the illustration. It is `None` when the image shows no illustration.
 `scanwich.layout.figure_location_from_json` makes a `FigureLocation` from JSON and checks it.
+
+For a book, a provider can also have these methods:
+
+```python
+async def recognize_layout_async(self, image_path: Path, *, upright: bool = False) -> PageLayout: ...
+async def locate_figure_async(
+    self, image_path: Path, *, estimate: Box | None = None, caption: str | None = None
+) -> FigureLocation | None: ...
+def layout_settings(self) -> Mapping[str, Any]: ...
+```
+
+- **The async methods:** LaTeX output awaits them for `--parallel-pages` pages at the same time, in one event loop. They are additions to the synchronous methods.
+  When the provider has a coroutine method `aclose()`, Scanwich awaits it before the event loop ends.
+- **A provider with only the synchronous methods:** it gets one call at a time, and all its calls come from one thread, the same thread for the whole conversion.
+  Scanwich does not know that such a provider permits calls from more than one thread. Ctrl-C then has an effect only after the call that is in work.
+  That thread is not the thread of the constructor: the command makes the provider in the main thread. Thus do not make an object in the constructor that only its thread can use, for example a `sqlite3` connection. Make it at the first call.
+- **`layout_settings()`:** it returns the settings that change a layout, for example the model, as JSON values with no secret. They go to the `source` record of each saved layout.
+- **`scanwich.ocr.NoReplyError`:** raise it from these methods when a request fails and the page is not the cause. Examples are a connection that fails, a timeout, and an HTTP error status.
+  LaTeX output starts no more pages after 3 waves of pages with this error. For a reply that the provider cannot use, raise an error of a different type.
+  For an answer of the service about the content of one page, raise an error of a different type also: the `openai-compatible` backend does so for the HTTP statuses 400, 403, 413, and 422.
+- **`scanwich.ocr.RateLimitError`:** it is a type of `NoReplyError`. Raise it when the service answers that it gets too many requests. `retry_after` is the wait in seconds that the service asks for.
+  Scanwich then makes all its requests wait, and sends the request again: it calls the method again.
+  `resume` is for a provider with the async methods. When the call had replies with a cost before the refusal, give `resume`: a function with no argument that sends the refused request again and returns an awaitable for the result of the call.
+  Scanwich then awaits `resume()` and does not call the method again. A provider with only the synchronous methods gives no `resume`.
+- **A layout that the provider returns as an object:** Scanwich writes each such layout as JSON and reads it back with the check of `scanwich.layout.page_layout_from_json`, with and without `--ocr-output-dir`.
+  A layout that the check refuses is a failed page, and it gets no file. The document is from the result of the check, so that a later conversion with the saved layout gives the same document.
+  Such a failed page had its requests, and they have a cost. Each new run pays for them again and fails again, until the provider gives a layout that the check accepts.
 
 Backend options use `KEY=VALUE`; JSON values are decoded automatically. EasyOCR passes
 top-level options to `easyocr.Reader`. A `readtext` JSON object is passed to

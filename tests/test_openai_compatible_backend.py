@@ -1,9 +1,12 @@
+import asyncio
 import base64
 import io
 import json
 import os
 import random
 import sys
+import threading
+import time
 import uuid
 from collections.abc import Sequence
 from pathlib import Path
@@ -15,6 +18,7 @@ from unittest.mock import ANY, patch
 
 from PIL import Image
 
+from scanwich.backends import openai_compatible
 from scanwich.backends.openai_compatible import (
     DEFAULT_LAYOUT_MODEL,
     DEFAULT_MAX_ATTEMPTS,
@@ -42,7 +46,16 @@ from scanwich.layout import (
     TableCell,
 )
 from scanwich.models import OcrRegion, Point
-from scanwich.ocr import FigureLocator, LayoutBackend, OcrBackend
+from scanwich.ocr import (
+    AsyncFigureLocator,
+    AsyncLayoutBackend,
+    FigureLocator,
+    LayoutBackend,
+    LayoutSettings,
+    NoReplyError,
+    OcrBackend,
+    RateLimitError,
+)
 
 LOGGER_NAME = "scanwich.backends.openai_compatible"
 
@@ -1623,3 +1636,403 @@ class RequestDefaultsTests(TestCase):
                     ),
                 ],
             )
+
+
+class FakeAsyncCompletions(FakeCompletions):
+    """Answer the requests of the async client. An error in the replies is raised."""
+
+    def __init__(self, *contents: str | Exception) -> None:
+        super().__init__(*(content for content in contents if isinstance(content, str)))
+        self._replies = contents
+
+    async def create(self, **request: Any) -> SimpleNamespace:  # type: ignore[override]
+        reply = self._replies[min(len(self.calls), len(self._replies) - 1)]
+        if isinstance(reply, Exception):
+            self.calls.append(request)
+            raise reply
+        return FakeCompletions.create(self, **request)
+
+
+class AsyncRequestTests(TestCase):
+    """The async methods for LaTeX output, which a caller awaits for some pages at one time."""
+
+    LAYOUT_REPLY = '{"page_top":"top","blocks":[{"type":"paragraph","text":"Text of the page."}]}'
+    FIGURE_REPLY = '{"box":{"left":250,"top":150,"right":750,"bottom":640},"cut":["top"]}'
+
+    def setUp(self) -> None:
+        temporary_directory = TemporaryDirectory()
+        self.addCleanup(temporary_directory.cleanup)
+        self.image_path = Path(temporary_directory.name) / "page.png"
+        Image.new("RGB", (400, 300), "white").save(self.image_path)
+
+    def run_async(
+        self, completions: FakeAsyncCompletions, method: str, **hints: Any
+    ) -> tuple[Any, OpenAICompatibleBackend]:
+        """Return the result of one async method, and the backend."""
+        clients = []
+
+        def make_client(**options: Any) -> SimpleNamespace:
+            clients.append(options)
+            return SimpleNamespace(chat=SimpleNamespace(completions=completions))
+
+        fake_openai = SimpleNamespace(AsyncOpenAI=make_client)
+        backend = OpenAICompatibleBackend(languages=["en"], options={})
+        self.backend = backend
+        with (
+            patch.dict(os.environ, {"OPENROUTER_API_KEY": "test-secret"}),
+            patch.dict(sys.modules, {"openai": fake_openai}),
+        ):
+            result = asyncio.run(getattr(backend, method)(self.image_path, **hints))
+        self.assertEqual(len(clients), 1)
+        return result, backend
+
+    def run_sync(self, reply: str, method: str, **hints: Any) -> tuple[Any, dict[str, Any]]:
+        completions = FakeCompletions(reply)
+        fake_client = SimpleNamespace(chat=SimpleNamespace(completions=completions))
+        fake_openai = SimpleNamespace(OpenAI=lambda **_: fake_client)
+        backend = OpenAICompatibleBackend(languages=["en"], options={})
+        with (
+            patch.dict(os.environ, {"OPENROUTER_API_KEY": "test-secret"}),
+            patch.dict(sys.modules, {"openai": fake_openai}),
+        ):
+            result = getattr(backend, method)(self.image_path, **hints)
+        (request,) = completions.calls
+        return result, request
+
+    def test_backend_has_the_contracts_for_parallel_pages(self) -> None:
+        backend = OpenAICompatibleBackend(languages=["en"], options={})
+        self.assertIsInstance(backend, AsyncLayoutBackend)
+        self.assertIsInstance(backend, AsyncFigureLocator)
+        self.assertIsInstance(backend, LayoutSettings)
+
+    def test_async_request_is_the_request_of_the_synchronous_method(self) -> None:
+        cases = {
+            "recognize_layout": (self.LAYOUT_REPLY, {"upright": True}),
+            "locate_figure": (
+                self.FIGURE_REPLY,
+                {"estimate": Box(100, 200, 800, 900), "caption": "Fig. 2"},
+            ),
+        }
+        for method, (reply, hints) in cases.items():
+            with self.subTest(method=method):
+                expected, request = self.run_sync(reply, method, **hints)
+                completions = FakeAsyncCompletions(reply)
+
+                result, _ = self.run_async(completions, f"{method}_async", **hints)
+
+                self.assertEqual(result, expected)
+                self.assertEqual(completions.calls, [request])
+                self.assertEqual(request["model"], DEFAULT_LAYOUT_MODEL)
+
+    def test_async_layout_request_gets_a_correction_request(self) -> None:
+        completions = FakeAsyncCompletions("not JSON", self.LAYOUT_REPLY)
+        with self.assertLogs(LOGGER_NAME, level="WARNING") as captured_logs:
+            layout, _ = self.run_async(completions, "recognize_layout_async")
+        self.assertEqual(layout, PageLayout(blocks=(Paragraph("Text of the page."),)))
+        self.assertEqual(len(completions.calls), 2)
+        self.assertIn("returned an unusable reply in attempt 1 of 3", captured_logs.output[0])
+
+    def test_one_async_call_for_a_box_is_one_request(self) -> None:
+        completions = FakeAsyncCompletions("not JSON", self.FIGURE_REPLY)
+        with (
+            self.assertLogs(LOGGER_NAME, level="WARNING"),
+            self.assertRaisesRegex(RuntimeError, "returned invalid JSON"),
+        ):
+            self.run_async(completions, "locate_figure_async")
+        self.assertEqual(len(completions.calls), 1)
+
+    def service_error(self, status_code: int, headers: object) -> Exception:
+        error = RuntimeError("the text of the provider")
+        error.status_code = status_code  # type: ignore[attr-defined]
+        error.response = SimpleNamespace(headers=headers)  # type: ignore[attr-defined]
+        return error
+
+    def test_service_with_too_many_requests_gives_its_own_error(self) -> None:
+        # The caller makes all its requests wait, so it must know this cause.
+        cases = [
+            ({"retry-after": "7"}, 7.0),
+            ({"retry-after": "1.5"}, 1.5),
+            ({"retry-after": "Wed, 21 Oct 2026 07:28:00 GMT"}, None),
+            ({"retry-after": "-1"}, None),
+            ({"retry-after": "nan"}, None),
+            ({}, None),
+            (None, None),
+        ]
+        for headers, retry_after in cases:
+            for method in ("recognize_layout_async", "locate_figure_async"):
+                error = self.service_error(429, headers)
+                with (
+                    self.subTest(headers=headers, method=method),
+                    self.assertRaises(RateLimitError) as raised,
+                ):
+                    self.run_async(FakeAsyncCompletions(error, self.LAYOUT_REPLY), method)
+                self.assertEqual(raised.exception.retry_after, retry_after)
+                self.assertEqual(
+                    str(raised.exception),
+                    f"OpenAI-compatible request failed for model {DEFAULT_LAYOUT_MODEL}: the "
+                    "service gets too many requests (HTTP status 429)",
+                )
+                self.assertIs(raised.exception.__cause__, error)
+
+    def test_other_error_of_the_service_is_the_error_of_the_synchronous_method(self) -> None:
+        completions = FakeAsyncCompletions(self.service_error(503, {"retry-after": "7"}))
+        with self.assertRaises(RuntimeError) as raised:
+            self.run_async(completions, "recognize_layout_async")
+        self.assertNotIsInstance(raised.exception, RateLimitError)
+        # The service gave no reply. The caller counts such pages.
+        self.assertIsInstance(raised.exception, NoReplyError)
+        self.assertEqual(
+            str(raised.exception),
+            f"OpenAI-compatible request failed for model {DEFAULT_LAYOUT_MODEL}: the text of "
+            "the provider",
+        )
+        self.assertEqual(len(completions.calls), 1)
+
+    def test_error_tells_if_the_service_gave_a_reply(self) -> None:
+        # A page that got a reply does not count for the rule that stops a conversion
+        # when the service gives no reply.
+        no_choices = SimpleNamespace(choices=None, error={"message": "the provider is down"})
+        too_long = SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    finish_reason="length",
+                    native_finish_reason=None,
+                    message=SimpleNamespace(content="{"),
+                )
+            ]
+        )
+
+        class Replies(FakeAsyncCompletions):
+            def __init__(self, reply: object) -> None:
+                super().__init__("")
+                self.reply = reply
+
+            async def create(self, **request: Any) -> Any:
+                self.calls.append(request)
+                if isinstance(self.reply, Exception):
+                    raise self.reply
+                return self.reply
+
+        cases = {
+            "no connection": (ConnectionError("no route"), True),
+            "an HTTP error": (self.service_error(500, {}), True),
+            "no choices in the completion": (no_choices, True),
+            "a completion that stops at the token limit": (too_long, False),
+        }
+        for name, (reply, no_reply) in cases.items():
+            with self.subTest(case=name), self.assertRaises(RuntimeError) as raised:
+                self.run_async(Replies(reply), "recognize_layout_async")
+            self.assertEqual(isinstance(raised.exception, NoReplyError), no_reply)
+        with (
+            self.assertLogs(LOGGER_NAME, level="WARNING"),
+            self.assertRaises(RuntimeError) as raised,
+        ):
+            self.run_async(FakeAsyncCompletions("not JSON"), "recognize_layout_async")
+        self.assertNotIsInstance(raised.exception, NoReplyError)
+
+    def test_status_of_an_answer_about_a_page_is_not_no_reply(self) -> None:
+        # An answer about one page: the service works, and another page can get a reply.
+        # The other statuses are the same for each page, or the service does not work.
+        statuses = {
+            **dict.fromkeys((400, 403, 413, 422), False),
+            **dict.fromkeys((401, 402, 404, 408, 409, 500, 502, 503, 504, 529), True),
+        }
+        for status_code, no_reply in statuses.items():
+            for first_reply in (None, "not JSON"):
+                # The status at the first request, and at a correction request.
+                replies = [self.service_error(status_code, {})]
+                if first_reply is not None:
+                    replies.insert(0, first_reply)
+                with (
+                    self.subTest(status=status_code, correction=first_reply is not None),
+                    self.assertLogs(LOGGER_NAME, level="INFO"),
+                    self.assertRaises(RuntimeError) as raised,
+                ):
+                    self.run_async(FakeAsyncCompletions(*replies), "recognize_layout_async")
+                self.assertEqual(isinstance(raised.exception, NoReplyError), no_reply)
+                if first_reply is not None:
+                    # A correction request has text from a reply, so its error has no
+                    # text of the provider.
+                    self.assertIn(
+                        f"in attempt 2 of 3: RuntimeError, HTTP status {status_code}",
+                        str(raised.exception),
+                    )
+
+    def test_request_with_no_key_gives_no_reply(self) -> None:
+        backend = OpenAICompatibleBackend(languages=["en"], options={})
+        with (
+            patch.dict(os.environ, clear=True),
+            self.assertRaisesRegex(NoReplyError, "requires OPENROUTER_API_KEY to be set"),
+        ):
+            asyncio.run(backend.recognize_layout_async(self.image_path))
+
+    def test_refused_request_goes_again_with_the_replies_before_it(self) -> None:
+        # The replies before a refusal have a cost. They count for the limit of 3
+        # requests, so the request after the refusal is the same correction request.
+        refusal = self.service_error(429, {})
+        completions = FakeAsyncCompletions("not JSON", "not JSON", refusal, "not JSON")
+        backend = OpenAICompatibleBackend(languages=["en"], options={})
+        client = SimpleNamespace(chat=SimpleNamespace(completions=completions))
+
+        async def read() -> None:
+            with self.assertRaises(RateLimitError) as raised:
+                await backend.recognize_layout_async(self.image_path, upright=True)
+            self.assertEqual(len(completions.calls), 3)
+            assert raised.exception.resume is not None
+            # The third request fails again, with a reply that has a cost.
+            await raised.exception.resume()
+
+        with (
+            patch.dict(os.environ, {"OPENROUTER_API_KEY": "test-secret"}),
+            patch.dict(sys.modules, {"openai": SimpleNamespace(AsyncOpenAI=lambda **_: client)}),
+            self.assertLogs(LOGGER_NAME, level="WARNING") as captured_logs,
+            self.assertRaisesRegex(RuntimeError, "returned invalid JSON"),
+        ):
+            asyncio.run(read())
+
+        # 4 requests: 3 replies with a cost, and the refusal.
+        self.assertEqual(len(completions.calls), 4)
+        self.assertEqual(completions.calls[3], completions.calls[2])
+        # A correction request has the reply before it and the defect.
+        self.assertEqual([len(call["messages"]) for call in completions.calls], [2, 4, 6, 6])
+        self.assertIn("returned an unusable reply in attempt 3 of 3", captured_logs.output[-1])
+
+    def test_refused_request_with_a_good_reply_after_it(self) -> None:
+        completions = FakeAsyncCompletions(
+            "not JSON", self.service_error(429, {}), self.LAYOUT_REPLY
+        )
+        backend = OpenAICompatibleBackend(languages=["en"], options={})
+        client = SimpleNamespace(chat=SimpleNamespace(completions=completions))
+
+        async def read() -> PageLayout:
+            try:
+                return await backend.recognize_layout_async(self.image_path)
+            except RateLimitError as error:
+                assert error.resume is not None
+                return await error.resume()
+
+        with (
+            patch.dict(os.environ, {"OPENROUTER_API_KEY": "test-secret"}),
+            patch.dict(sys.modules, {"openai": SimpleNamespace(AsyncOpenAI=lambda **_: client)}),
+            self.assertLogs(LOGGER_NAME, level="WARNING"),
+        ):
+            layout = asyncio.run(read())
+        self.assertEqual(layout, PageLayout(blocks=(Paragraph("Text of the page."),)))
+        self.assertEqual(len(completions.calls), 3)
+
+    def test_error_of_a_correction_request_has_no_text_of_the_provider(self) -> None:
+        completions = FakeAsyncCompletions("not JSON", self.service_error(503, {}))
+        with (
+            self.assertLogs(LOGGER_NAME, level="WARNING"),
+            self.assertRaises(RuntimeError) as raised,
+        ):
+            self.run_async(completions, "recognize_layout_async")
+        self.assertEqual(
+            str(raised.exception),
+            f"OpenAI-compatible request failed for model {DEFAULT_LAYOUT_MODEL} in attempt 2 "
+            "of 3: RuntimeError, HTTP status 503",
+        )
+
+    def test_caller_can_close_the_async_client(self) -> None:
+        closed = []
+
+        class Completions(FakeAsyncCompletions):
+            pass
+
+        completions = Completions(self.LAYOUT_REPLY)
+
+        async def close() -> None:
+            closed.append(True)
+
+        async def read_and_close() -> None:
+            backend = OpenAICompatibleBackend(languages=["en"], options={})
+            client = SimpleNamespace(chat=SimpleNamespace(completions=completions), close=close)
+            with (
+                patch.dict(os.environ, {"OPENROUTER_API_KEY": "test-secret"}),
+                patch.dict(
+                    sys.modules, {"openai": SimpleNamespace(AsyncOpenAI=lambda **_: client)}
+                ),
+            ):
+                await backend.recognize_layout_async(self.image_path)
+                await backend.aclose()
+                # The next request makes a new client, for the event loop of that request.
+                self.assertIsNone(backend._async_client)
+
+        asyncio.run(read_and_close())
+        self.assertEqual(closed, [True])
+
+    def test_image_encode_does_not_stop_the_event_loop(self) -> None:
+        # The encode of a page image uses the processor, so it is in a thread. A task
+        # that needs the event loop at short intervals gets it during the encode.
+        work_seconds = 0.3
+        encode_image = openai_compatible._encode_image
+        threads: list[str] = []
+
+        def slow_encode(image_path: Path) -> object:
+            threads.append(threading.current_thread().name)
+            time.sleep(work_seconds)
+            return encode_image(image_path)
+
+        for method, reply in (
+            ("recognize_layout_async", self.LAYOUT_REPLY),
+            ("locate_figure_async", self.FIGURE_REPLY),
+        ):
+            gaps: list[float] = []
+            backend = OpenAICompatibleBackend(languages=["en"], options={})
+            completions = FakeAsyncCompletions(reply)
+            client = SimpleNamespace(chat=SimpleNamespace(completions=completions))
+
+            async def beat(gaps: list[float] = gaps) -> None:
+                last = time.monotonic()
+                while True:
+                    await asyncio.sleep(0.005)
+                    gaps.append(time.monotonic() - last)
+                    last = time.monotonic()
+
+            async def read(backend: Any = backend, method: str = method) -> None:
+                heartbeat = asyncio.create_task(beat())
+                try:
+                    await getattr(backend, method)(self.image_path)
+                finally:
+                    heartbeat.cancel()
+
+            with (
+                self.subTest(method=method),
+                patch.object(openai_compatible, "_encode_image", slow_encode),
+                patch.dict(os.environ, {"OPENROUTER_API_KEY": "test-secret"}),
+                patch.dict(
+                    sys.modules, {"openai": SimpleNamespace(AsyncOpenAI=lambda _c=client, **_: _c)}
+                ),
+            ):
+                asyncio.run(read())
+                self.assertEqual(len(completions.calls), 1)
+                self.assertGreater(len(gaps), 20)
+                self.assertLess(max(gaps), work_seconds / 2)
+        self.assertEqual(len(threads), 2)
+        self.assertNotIn(threading.main_thread().name, threads)
+
+    def test_settings_that_change_a_layout(self) -> None:
+        backend = OpenAICompatibleBackend(languages=["fr", "la"], options={})
+        self.assertEqual(
+            backend.layout_settings(),
+            {
+                "model": "~openai/gpt-luna-latest",
+                "reasoning_effort": "medium",
+                "languages": ["fr", "la"],
+            },
+        )
+        backend = OpenAICompatibleBackend(
+            languages=[],
+            options={
+                "model": "provider/vision-model",
+                "reasoning_effort": None,
+                "base_url": "https://user:password@example.test/v1",
+                "api_key_env": "A_SECRET_NAME",
+            },
+        )
+        settings = backend.layout_settings()
+        self.assertEqual(
+            settings, {"model": "provider/vision-model", "reasoning_effort": None, "languages": []}
+        )
+        # The settings go to a file, so they have no address and no name of a key.
+        self.assertEqual(json.loads(json.dumps(settings)), settings)
