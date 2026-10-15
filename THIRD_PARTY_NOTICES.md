@@ -17,6 +17,8 @@ The standard Nix package and container include these direct dependencies:
 | Pillow | MIT-CMU |
 | pypdfium2 | Apache-2.0 OR BSD-3-Clause |
 | PDFium | Apache-2.0 AND BSD-3-Clause AND MIT |
+| rawpy | MIT |
+| LibRaw | LGPL-2.1-only OR CDDL-1.0 |
 | ReportLab | BSD-3-Clause |
 
 The `scanwich-openai-compatible` Nix package and `openai-compatible` container target

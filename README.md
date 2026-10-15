@@ -11,6 +11,9 @@ For pip installations, use `pip install "scanwich[easyocr]"`.
 The PDF pipeline itself does not import or depend on
 EasyOCR-specific result types.
 
+Scanwich can also write a PDF or a photo of a page as a LaTeX document.
+See [LaTeX documents](#latex-documents).
+
 ## Run with Nix
 
 The flake provides Python, EasyOCR, pypdfium2/PDFium, Pillow, and ReportLab:
@@ -91,6 +94,233 @@ The workflow adds commit tags: `sha-<short-sha>` for the standard image and `ope
 Use `nix build .#scanwich-openai-compatible` to build the package without a container.
 For direct CLI use, pass `--ocr-backend openai-compatible`.
 
+## LaTeX documents
+
+Scanwich can write a PDF or a photo of a page as a LaTeX document.
+The purpose is an archive copy of an old book.
+The document has the text and the structure of the pages. It is not an image of the pages.
+Give the output file a name that ends in `.tex`:
+
+```console
+export OPENROUTER_API_KEY=...
+scanwich book.pdf book.tex --ocr-backend openai-compatible -l de
+scanwich page.ARW page.tex --ocr-backend openai-compatible -l de --rotate 90
+```
+
+The input is a PDF, an image that Pillow can read, or a camera raw file.
+A PDF with many pages becomes one document. An image is one page.
+
+### Model for LaTeX output
+
+For LaTeX output, the `openai-compatible` backend uses the model `~openai/gpt-luna-latest` with the reasoning effort `medium`, on OpenRouter.
+You do not give these two values. The searchable PDF and the HTTP API keep their own defaults, see "OpenAI-compatible vision backend".
+
+- **Why this effort:** with `low`, the model writes a line in small capitals as lowercase letters. With `medium`, it keeps the capital forms and marks the small capitals.
+- **Cost and time:** on one test page, a photo of 24 megapixels with one drawing, a conversion needed 2 requests, about 0.005 USD, and about 50 seconds. A page with no illustration needs 1 request.
+- **Your own values:** `--backend-option model=...` and `--backend-option reasoning_effort=...` replace the defaults for all requests. A different `base_url` needs a `model` of that service.
+- **The alias `luna` is a different model ID.** It is `gpt-5.6-luna`, for a Hermes endpoint. See "Hermes and Luna".
+
+`~openai/gpt-luna-latest` is an alias. The provider moves it to a newer model. That has these effects:
+
+- A later conversion of the same book can give different text, different formatting, a different cost, and a different time. Scanwich cannot make it the same.
+- The result of a conversion is the `.tex` file, its figure directory, and the layout JSON files of `--ocr-output-dir`. Keep these files. Do not convert a book again to get the same document.
+- The log names the model that made each reply, when the response has that name: `the response names the model ...`. To convert more pages with that model, give its ID with `--backend-option model=...`.
+For a camera raw file, install the decoder with `pip install "scanwich[raw]"`.
+LibRaw then decodes all the sensor data. Scanwich does not use the small preview image of the file.
+Both Nix packages and both image targets include the decoder.
+
+The document has these parts of the source, in reading order:
+
+- headings, paragraphs, block quotations, and lists;
+- bold, italic, underlined, small-capital, superscript, and subscript text;
+- tables, with cells that span columns or rows;
+- illustrations as image files, which the document includes with `\includegraphics`;
+- footnotes, with the reference marks of the source;
+- the running head, the running foot, and the printed page number of each page, at their places.
+
+### Pages of the document
+
+Each page of the source is one page of the document, in the same sequence. Thus you can compare the document with the source page by page.
+The paper is A4, and the text area is 420pt by 672pt.
+
+- The content of a source page is in a box, in the `sourcepage` environment. A source page without content is an empty page.
+- When the content is too high for the text area, the page shows it at a smaller size. Thus a source page never becomes two pages.
+  The TeX engine then writes a warning that has the number of the source page and the size, for example `Package scanwich Warning: Source page 12 is at 87 percent of its size`.
+  LuaLaTeX, XeLaTeX, and pdfLaTeX write the warning to the terminal and to the log file. Tectonic writes it only to the log file, and it keeps that file only with `--keep-logs`.
+  Scanwich does not start a TeX engine, so the conversion cannot tell you which page this is. Its log tells you to read the warnings of the engine.
+  The size has no lower limit: a page with very much content can be too small to read. `--flow` is the layout for such a book.
+- The running head and the page number are in the head line or the foot line of the page: at the left, at the center, or at the right. The page number is the printed number of the source.
+- A paragraph that continues on the next page stays in two parts. The second part has no indent.
+- When the page boundary divides a word with a hyphen, the complete word is on the first of the two pages, and the next page starts after it.
+  A search then finds the word, and a copy of the text has it in one piece. A comment line in the document shows the place. Compare that word with the source.
+- A footnote is below the content of its page, with its reference mark of the source.
+- An illustration is at its place in the sequence of the page, at the center of the line.
+
+`--flow` gives a document with flowing text. Its pages are not the pages of the source:
+a paragraph that continues on the next page becomes one paragraph, a table is a `longtable` environment that can continue on a new page, and LaTeX gives new numbers to the footnotes.
+The running head and the page number are then only in a comment line.
+
+Scanwich crops each illustration from the page image.
+The illustrations of `book.tex` are JPEG files of quality 95 in the directory `book-figures` next to the document.
+Their names are `page-0001-figure-01.jpg`, `page-0001-figure-02.jpg`, and so on.
+Keep that directory with the document.
+LaTeX reads the name of the directory, so the name has only ASCII letters, digits, and the characters `.`, `_`, and `-`.
+For a document name with other characters, a hyphen replaces them, and the name gets a part of a hash of the document name.
+For example, `my book.tex` has the directory `my-book-2c7e412c-figures`. Thus two documents in one directory do not share their illustrations.
+A new conversion replaces the files of the earlier conversion that have a name of the form `page-NNNN-figure-NN.jpg`. It does not remove a file with a different name.
+
+Scanwich writes the document after all pages are complete. A conversion that fails does not change an earlier document or its illustrations.
+The new illustrations first go to the figure directory under temporary names. Only when all of them are there do the new illustrations and the new document get their names, and then Scanwich removes the earlier illustrations.
+A temporary name starts with a dot and ends with `.scanwich-new` or `.scanwich-old`. A conversion removes these files.
+If the system stops a conversion in its last step, such files can stay. A file that ends with `.scanwich-old` is then an illustration of the earlier document: remove the dot and the suffix from its name to use it again.
+A conversion fails when a page has no usable layout, and when no page has content. The error message has the number of the page.
+A page with no content in a document that has content gives a `WARNING` log record.
+
+Scanwich does not start a TeX engine. Compile the document with LuaLaTeX, XeLaTeX, or Tectonic:
+
+```console
+latexmk -lualatex book.tex
+tectonic --keep-logs book.tex
+```
+
+With `--keep-logs`, Tectonic keeps `book.log`. Search that file for `scanwich Warning` to find each source page that is at a smaller size.
+
+These engines read all Unicode text.
+pdfLaTeX also compiles the document when the text has only characters that pdfLaTeX knows.
+The document uses the packages `iftex`, `fontspec`, `graphicx`, and `array`. With `--flow`, it also uses `longtable`.
+It uses `multirow` only when that package is installed.
+
+Small capitals are capital letters at a smaller size, from the command `\sourcesmallcaps` of the document.
+The document thus does not print a lowercase letter where the source has a capital form: not in bold or italic text, and not with a font that has no small capitals.
+The text of the PDF has the capital letters. The preamble of the document shows how to use the small capitals of the font.
+
+The text font of the document does not have some characters, for example a prime mark, a not-equal sign, and Greek letters.
+With LuaLaTeX, XeLaTeX, and Tectonic, such a character comes from the font Latin Modern Math when that font is installed. TeX Live has it in the package `lm-math`.
+The text of the PDF then has the character of the source, so a search finds it and a copy is correct.
+Without that font, and with pdfLaTeX, a math command prints the character. The page then looks the same, but the text of the PDF can have a different character.
+With pdfLaTeX, the text of the PDF has `R`, `P`, and `Q` for the integral, sum, and product signs.
+
+### Page layout JSON
+
+A layout backend returns the structure of each page as JSON. The LaTeX writer makes all the LaTeX from that JSON.
+The backend does not write LaTeX. This has three effects:
+
+- The writer escapes each character of the text. Thus the text of a page cannot add a LaTeX command.
+  The writer also leaves out what stops LuaLaTeX, XeLaTeX, and Tectonic, for example a line break that has no line to end.
+  The compile tests give text that is hard for LaTeX to each engine that is installed.
+- Scanwich can check a reply before it uses it. The `openai-compatible` backend asks the model to correct a reply that it cannot use.
+- An illustration has a box on the page image. Scanwich needs that box to crop the illustration.
+
+`--ocr-output-dir` saves the JSON of each page as `page-000001.json`.
+The module `scanwich.layout` defines the JSON.
+One page has `blocks` in reading order. The block types are `heading`, `paragraph`, `quote`, `list`, `table`, `figure`, `footnote`, `page_header`, `page_footer`, and `page_number`.
+Text can have the tags `<b>`, `<i>`, `<u>`, `<sc>`, `<sup>`, `<sub>`, `<br>`, and `<fn>mark</fn>`.
+The text in `<sc>` has the small capitals as capital letters, as the page prints them, and a large capital letter is before the tag: `C<sc>HAPTER</sc> II`.
+When a model does not give the tag, the document then prints capital letters of the usual size, and not lowercase letters.
+A text in `<sc>` that has lowercase letters uses them for the small capitals, and its capital letters are large capitals.
+A `page_header`, a `page_footer`, and a `page_number` can have a `position`: `top-left`, `top-center`, `top-right`, `bottom-left`, `bottom-center`, or `bottom-right`.
+The check also accepts a value that has one clear meaning: the two words in each sequence, `upper` and `lower`, and only one of the two words, for example `top` or `right`.
+The document gives the usual place to the part that the layout does not have:
+
+- A running head is at the top center, and a running foot at the bottom center.
+- A page number is at the top when it comes before the content of the page, and else at the bottom.
+- At the bottom, a page number is at the center. At the top, it is at the outer side of the page: at the left for an even number and at the right for an odd number.
+  The reason is that a book prints an even number on a left page. A number that is not in digits is at the right.
+A table can have `"double_rule": true` for a double rule above the table and below it.
+A box is `{"left": 120, "top": 300, "right": 880, "bottom": 560}` on a 0-to-1000 grid of the page image.
+The names of the sides leave no doubt about their sequence. The check also accepts the array `[left, top, right, bottom]`.
+
+Text of a reply does not disappear without an error. The check keeps the text, or it rejects the reply:
+
+- It accepts a value that has one clear meaning. Examples are an integer where the page prints digits, `"continued": "true"`, header rows in a `header` field, and `"align": "middle"`.
+- It rejects a reply that has text in a field that the layout does not read. Examples are a list in a list item, and a table with a caption and no rows.
+- It rejects text that it cannot keep in a field that the layout reads. Examples are the heads of the columns in the `columns` field of a table, and a value of `align` or `rules` that is not one of the names.
+  A figure of a reply has no `image` field, because Scanwich makes the image file from the box.
+- It rejects a box that is not on the grid: a box on a scale of 0 to 1, and a box with a value above 1020.
+- It rejects text that has a control character. In JSON, a backslash without an escape makes such a character, for example in `\frac`.
+- It ignores a field that has no text and that the layout does not read, for example a number or a flag.
+
+The check cannot find each wrong reply:
+
+- It ignores a number in a field that the layout does not read, also when the number is content of the page. Examples are a table cell that has its value as a number in a different field, and the first number of a numbered list.
+  An integer is text only in a field that the layout reads as text.
+- It accepts a box that has its sides in a different sequence, and a box in pixels that has no value above 1020.
+- It cannot tell the JSON escapes `\n`, `\r`, and `\t` of a backslash without an escape from whitespace.
+- A JSON object that has one key two times keeps only the last value.
+
+An error message of the check has no text from the reply, so a log record can have it.
+The correction request to the model has more: it names each field that the layout does not read, and the number of objects that have the field.
+
+LaTeX output needs a backend that has the method `recognize_layout(image_path)`.
+The `openai-compatible` backend has it. EasyOCR returns text lines without structure, so it does not have it.
+
+### Box of an illustration
+
+A model that reads a full page gives a box for an illustration that is frequently not exact.
+On a photo of a page, the box can be too low by a third of the illustration, and the crop then cuts the illustration.
+Thus Scanwich sends one more request for each illustration, when the backend has the method `locate_figure(image_path, estimate=..., caption=...)`.
+The `openai-compatible` backend has it.
+
+- The request has only the part of the page image around the first box. The margin at each side is 100 units of the grid, or half of the size of the box when that is more.
+- The backend returns the box of the illustration in that part, and the sides where the part cuts the illustration.
+  The caption and the center of the first box tell the model which illustration to find when the part shows more than one.
+- Scanwich sends a larger part when the backend reports a cut side, and when the new box is nearer than 30 units to a side of the part. A label of the illustration can then be outside the part.
+- The crop has the new box and a margin of 5 units at each side. The layout JSON also has the new box.
+- An `INFO` log record has the new box and the box of the page layout.
+
+A crop that is too large loses nothing, and a crop that cuts the illustration loses a part of it. Thus each case of doubt gives a `WARNING` log record, and the larger crop when there are two boxes. Compare that illustration with the source.
+
+- The backend still reports a cut side after the last request: the crop goes to the border of the part at that side.
+- The new box has no part of the box of the page layout, or it has more than 4 times its area, or less than a quarter: the crop has the two boxes.
+- A request for the box fails with an error of each type, or the backend finds no illustration in the part: there is only the box that the backend gave before, and the crop uses it. The conversion continues.
+
+The number of requests has these limits:
+
+- A request for a box has no correction request. One illustration gets a maximum of 3 requests for its box.
+- One page gets a maximum of 12 requests for boxes. The other illustrations of that page use the box of the page layout, with one `WARNING` log record.
+- The request for the layout of a page has a maximum of `max_attempts` requests, which is 3. Without `--rotate`, a page that is not upright gets that request two times.
+- Thus one page has a maximum of 18 requests, and of 15 with `--rotate`. The usual numbers are 1 request for a page with no illustration and 2 requests for a page with one illustration.
+
+Each request has a cost. The request for a box is small: it has a part of the page, and its reply has only a box.
+
+### Page direction
+
+A photo can show a page that is not upright. A model reads such a page badly.
+Without `--rotate`, the backend first finds the side of the image where the top of the page is.
+The model does not read a page that is not upright. Scanwich turns the page image and sends a second request for that page.
+When the backend reports that the page is not upright after that turn, the conversion fails.
+
+`--rotate DEGREES` gives the direction of all pages: Scanwich turns each page image clockwise by 0, 90, 180, or 270 degrees before recognition.
+The backend then gets no request to find the direction, and each page needs one request for its layout.
+Use it when all pages have the same direction. `--rotate 0` is for pages that are upright.
+Scanwich uses the blocks of the backend also when the backend reports a different direction, and writes a `WARNING` log record.
+
+### Differences from the source
+
+Compare the document with the source. A model can read a character incorrectly.
+These differences are intended:
+
+- The lines of a paragraph are not the lines of the source. LaTeX makes new lines for the width of the text area.
+- A word that the page boundary divides is complete on the first of the two pages. See "Pages of the document".
+- A running head and a page number are at the left, at the center, or at the right of the head line or the foot line. Their distance from the text is that of the document.
+  The start of each page also has a comment line, for example `% Source page 3 (printed page number: 47)`.
+- A table has the rules of one of four styles: no rules, horizontal rules, also rules between the columns, or a rule around each cell.
+  The rule above the table and the rule below it can be double rules. A different double rule becomes one rule.
+- All text has the size of the document. A caption or a note that the source prints in a smaller size is not smaller.
+- A paragraph has the width of the text area, also when the source prints it on a narrow measure.
+- Scanwich estimates the widths of the table columns from the number of characters in the cells.
+- The document has one column. Text that is at the side of an illustration comes after the illustration.
+- A formula is plain text. Scanwich does not write LaTeX math for it.
+- An illustration is a part of the page image. Scanwich does not correct its colors or its perspective.
+
+The default font of LaTeX has Latin text only.
+LaTeX prints nothing for a character that the font does not have. It then writes a `Missing character` message to the terminal and to the log.
+Scanwich writes common mathematical symbols, and a Greek letter that is alone, with a math font, so the document has them.
+For text in other scripts, set a font that has them with `\setmainfont` in the document.
+A document without content has one empty page, because LaTeX makes no PDF for a document that has no page.
+
+The HTTP API has no LaTeX output.
+
 ## OCR plugins
 
 Select a provider with `--ocr-backend NAME`; inspect installed providers with
@@ -113,6 +343,29 @@ Every `OcrRegion` contains text, optional confidence, and four clockwise pixel p
 starting at the top-left. This normalized boundary keeps rasterization and PDF assembly
 unchanged when another OCR engine is installed.
 
+A provider that can recognize the structure of a page also has this method:
+
+```python
+def recognize_layout(self, image_path: Path, *, upright: bool = False) -> PageLayout: ...
+```
+
+LaTeX output uses that method. `scanwich.layout.page_layout_from_json` makes a `PageLayout` from JSON and checks it.
+The page image has no EXIF orientation.
+For a page that is not upright, a provider can return `PageLayout(page_top="right")` without blocks. Scanwich then turns the page image and calls the method again.
+With `upright=True`, the caller knows that the page is upright. The provider then does not look for the direction: it reads the page and returns its blocks.
+
+A provider can also have this method, for the exact box of one illustration:
+
+```python
+def locate_figure(
+    self, image_path: Path, *, estimate: Box | None = None, caption: str | None = None
+) -> FigureLocation | None: ...
+```
+
+The image shows a part of a page. `estimate` is a first box of the illustration on the 0-to-1000 grid of that image, and `caption` is its caption.
+The result has the box on the same grid and the sides where the image cuts the illustration. It is `None` when the image shows no illustration.
+`scanwich.layout.figure_location_from_json` makes a `FigureLocation` from JSON and checks it.
+
 Backend options use `KEY=VALUE`; JSON values are decoded automatically. EasyOCR passes
 top-level options to `easyocr.Reader`. A `readtext` JSON object is passed to
 `Reader.readtext`, for example:
@@ -127,6 +380,7 @@ scanwich input.pdf output.pdf \
 The built-in `openai-compatible` backend sends each rasterized page to an OpenAI-compatible
 chat-completions endpoint. It defaults to OpenRouter and the image-capable
 `deepseek/deepseek-v4-flash-vision-exp` model.
+LaTeX output has a different default model and effort, see "Model for LaTeX output". That model did not get a test for the text regions of a searchable PDF.
 Install the SDK with `pip install "scanwich[openai-compatible]"`.
 Both Nix packages and image targets include the SDK.
 Set the API key in the environment:
@@ -171,6 +425,10 @@ When a response has `usage.cost`, the backend writes one `INFO` log record for t
 The record has the session ID, the model, the cost of the request, and the total of the session.
 The last record of a session thus has the cost of the document. OpenRouter reports the cost in credits.
 A failed request has no `usage.cost`, so the total does not include it.
+When a response has `usage.prompt_tokens` and `usage.completion_tokens`, the backend also writes one `INFO` log record with the two numbers.
+The record also has the reasoning tokens when the response has `usage.completion_tokens_details.reasoning_tokens`. They are a part of the completion tokens.
+When the response names a model, the record ends with `; the response names the model ...`. For a model ID that is an alias, this is the model that made the reply.
+Each record names the model of its request, so the records of LaTeX output name the model for LaTeX output.
 
 ```text
 INFO: OpenAI-compatible session 2f0c6f0e-5d0b-4c53-9d57-3f6a4f1f6f0a, model provider/vision-model: usage.cost=0.001500 for this request, total 0.003000 for 2 request(s)
@@ -181,6 +439,7 @@ An example is a text that has a double quote without an escape.
 The backend then sends a second request. That request adds the unusable reply and a description of the defect, and it asks the model for a correct reply.
 The backend does not send the first request again. With a temperature of 0, the model mostly repeats the defect.
 `max_attempts` is the maximum number of requests for the regions of one page. The default is 3. Set it to 1 to send no correction request.
+The request for the layout of a page, which LaTeX output uses, has the same correction requests.
 Each correction request has a cost. The session total includes it.
 The backend writes one `WARNING` log record for each unusable reply. The record has the error and no text from the reply.
 If the last reply is also unusable, the page fails with the error of that reply.

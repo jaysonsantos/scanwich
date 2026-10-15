@@ -16,6 +16,7 @@ from unittest.mock import ANY, patch
 from PIL import Image
 
 from scanwich.backends.openai_compatible import (
+    DEFAULT_LAYOUT_MODEL,
     DEFAULT_MAX_ATTEMPTS,
     DEFAULT_MODEL,
     PROVIDER_DETAIL_MAX_CHARACTERS,
@@ -24,7 +25,24 @@ from scanwich.backends.openai_compatible import (
     _jpeg_mode_image,
     _working_bytes,
 )
+from scanwich.layout import (
+    BLOCK_TYPES,
+    Box,
+    Figure,
+    FigureLocation,
+    Footnote,
+    Heading,
+    LayoutFormatError,
+    ListBlock,
+    ListItem,
+    PageFurniture,
+    PageLayout,
+    Paragraph,
+    Table,
+    TableCell,
+)
 from scanwich.models import OcrRegion, Point
+from scanwich.ocr import FigureLocator, LayoutBackend, OcrBackend
 
 LOGGER_NAME = "scanwich.backends.openai_compatible"
 
@@ -160,7 +178,7 @@ class OpenAICompatibleBackendTests(TestCase):
                 for _ in usages:
                     backend.recognize(image_path)
         session_id = client_options["default_headers"]["X-Session-Id"]
-        return session_id, [record for record in logs.output if "usage.cost" in record]
+        return session_id, [record for record in logs.output if "usage." in record]
 
     def test_sends_image_and_converts_normalized_polygons_to_pixels(self) -> None:
         payload = {
@@ -395,6 +413,46 @@ class OpenAICompatibleBackendTests(TestCase):
         self.assertEqual(str(uuid.UUID(session_id)), session_id)
         self.assertNotEqual(second["X-Session-Id"], session_id)
         self.assertIsNone(other_service)
+
+    def test_logs_the_tokens_of_each_request(self) -> None:
+        session_id, records = self.cost_records(
+            [
+                SimpleNamespace(prompt_tokens=1800, completion_tokens=950, cost=0.002),
+                SimpleNamespace(
+                    prompt_tokens=1500,
+                    completion_tokens=6200,
+                    completion_tokens_details=SimpleNamespace(reasoning_tokens=5400),
+                ),
+                SimpleNamespace(
+                    prompt_tokens=1500,
+                    completion_tokens=800,
+                    completion_tokens_details={"reasoning_tokens": 0},
+                ),
+                # A usage without the two counts as integers gives no record of tokens.
+                SimpleNamespace(prompt_tokens=1800, cost=0.001),
+                SimpleNamespace(prompt_tokens="1800", completion_tokens=True),
+                SimpleNamespace(prompt_tokens=0, completion_tokens=0),
+            ]
+        )
+
+        prefix = (
+            f"INFO:{LOGGER_NAME}:OpenAI-compatible session {session_id}, model {DEFAULT_MODEL}: "
+        )
+        self.assertEqual(
+            records,
+            [
+                prefix + "usage.prompt_tokens=1800, usage.completion_tokens=950 for this request",
+                prefix + "usage.cost=0.002000 for this request, total 0.002000 for 1 request(s)",
+                prefix
+                + "usage.prompt_tokens=1500, usage.completion_tokens=6200, reasoning_tokens=5400 "
+                "for this request",
+                prefix
+                + "usage.prompt_tokens=1500, usage.completion_tokens=800, reasoning_tokens=0 "
+                "for this request",
+                prefix + "usage.cost=0.001000 for this request, total 0.003000 for 2 request(s)",
+                prefix + "usage.prompt_tokens=0, usage.completion_tokens=0 for this request",
+            ],
+        )
 
     def test_logs_the_cost_of_each_request_and_the_session_total(self) -> None:
         session_id, records = self.cost_records(
@@ -966,3 +1024,602 @@ class OpenAICompatibleBackendTests(TestCase):
             OpenAICompatibleBackend(languages=["en"], options={"timeout": 0})
         with self.assertRaisesRegex(ValueError, "max_attempts"):
             OpenAICompatibleBackend(languages=["en"], options={"max_attempts": 0})
+
+
+class LayoutRecognitionTests(TestCase):
+    def recognize_layout(
+        self,
+        completions: FakeCompletions,
+        *,
+        image_size: tuple[int, int] = (1200, 800),
+        languages: Sequence[str] = ("fr", "de"),
+        options: dict[str, Any] | None = None,
+        upright: bool = False,
+    ) -> PageLayout:
+        """Return the layout that the backend makes from the replies for one page."""
+        fake_client = SimpleNamespace(chat=SimpleNamespace(completions=completions))
+        fake_openai = SimpleNamespace(OpenAI=lambda **_: fake_client)
+        with TemporaryDirectory() as temporary_directory:
+            image_path = Path(temporary_directory) / "page.png"
+            Image.new("RGB", image_size, "white").save(image_path)
+            backend = OpenAICompatibleBackend(languages=languages, options=options or {})
+
+            with (
+                patch.dict(os.environ, {"OPENROUTER_API_KEY": "test-secret"}),
+                patch.dict(sys.modules, {"openai": fake_openai}),
+            ):
+                return backend.recognize_layout(image_path, upright=upright)
+
+    def test_backend_recognizes_layouts(self) -> None:
+        backend = OpenAICompatibleBackend(languages=["en"], options={})
+        self.assertIsInstance(backend, LayoutBackend)
+        self.assertIsInstance(backend, OcrBackend)
+
+    def test_returns_the_layout_of_the_reply(self) -> None:
+        payload = {
+            "page_top": "top",
+            "content_box": [100, 50, 900, 950],
+            "blocks": [
+                {"type": "page_number", "text": "406"},
+                {"type": "heading", "level": 1, "text": "A <sc>heading</sc>"},
+                {"type": "paragraph", "text": "A paragraph.<fn>1</fn>"},
+                {
+                    "type": "table",
+                    "header_rows": 1,
+                    "rules": "columns",
+                    "rows": [["a", "b"], ["1", {"text": "2", "colspan": 1}]],
+                },
+                {"type": "figure", "box": [200, 300, 700, 600], "caption": "Fig. 1"},
+                {"type": "footnote", "mark": "1", "text": "A footnote."},
+            ],
+        }
+
+        layout = self.recognize_layout(FakeCompletions(json.dumps(payload)))
+
+        self.assertEqual(
+            layout,
+            PageLayout(
+                content_box=Box(100, 50, 900, 950),
+                blocks=(
+                    PageFurniture("page_number", "406"),
+                    Heading("A <sc>heading</sc>"),
+                    Paragraph("A paragraph.<fn>1</fn>"),
+                    Table(
+                        rows=(
+                            (TableCell("a"), TableCell("b")),
+                            (TableCell("1"), TableCell("2")),
+                        ),
+                        header_rows=1,
+                        rules="columns",
+                    ),
+                    Figure(box=Box(200, 300, 700, 600), caption="Fig. 1"),
+                    Footnote("A footnote.", mark="1"),
+                ),
+            ),
+        )
+
+    def test_asks_for_the_layout_as_json(self) -> None:
+        completions = FakeCompletions('{"page_top":"top","blocks":[]}')
+
+        self.assertEqual(self.recognize_layout(completions), PageLayout())
+
+        (request,) = completions.calls
+        self.assertEqual(request["response_format"], {"type": "json_object"})
+        self.assertEqual(request["temperature"], 0)
+        self.assertEqual(sent_image(request).size, (1200, 800))
+        system_message, user_message = request["messages"]
+        self.assertIn(
+            "never translate, summarize, or infer missing text", system_message["content"]
+        )
+        prompt = user_message["content"][0]["text"]
+        self.assertIn("This 1200x800 pixel image shows one page of a printed document.", prompt)
+        self.assertIn("Expected language codes: fr, de.", prompt)
+        box = '{"left":L,"top":T,"right":R,"bottom":B}'
+        # The prompt names each field of the layout that the backend reads. A box has
+        # names for its sides, so that their sequence is not in doubt.
+        for field in (
+            f'{{"page_top":"top","content_box":{box},"blocks":[...]}}',
+            '"continued":true',
+            '"header_rows"',
+            '"colspan"',
+            '"rowspan"',
+            '"rules"',
+            f'"box":{box}',
+            '"caption"',
+            '"mark"',
+            "0-to-1000 grid",
+            "<fn>mark</fn>",
+            # The place of a running head and of a page number. The shape names no
+            # place, so that the reply has the place of the page and not that of an example.
+            '{"type":"page_number","text":"...","position":"..."}',
+            "A left page and a right page of a book can have different places.",
+            (
+                '"top-left", "top-center", "top-right", "bottom-left", "bottom-center", or '
+                '"bottom-right"'
+            ),
+            '"double_rule":true',
+            # A lost tag must not change a capital form to a lowercase letter.
+            "Capital forms. Write each letter in the case that the page prints.",
+            "write its letters as capital letters, also in a caption and in a running head.",
+            "Do not change such a line to lowercase letters or to sentence case.",
+            "Put only them in <sc>, and write a large capital letter before the tag.",
+            # The examples are two different forms, and not the form of one page.
+            'write "P<sc>ART</sc> O<sc>NE</sc>" and not "Part One".',
+            'write "<sc>THE END OF THE FIRST BOOK</sc>" and not "The end of the first book".',
+            "Do not add an accent that the page does not print.",
+            "the lines of a centered caption",
+            # The writer needs the hyphen to know that the page boundary divides a word.
+            (
+                "When the last line of the page ends with such a hyphen, keep that hyphen at "
+                "the end of the text: the rest of the word is on the next page."
+            ),
+            # The model does not read a page that is not upright.
+            'Return only {"page_top":"<side>","blocks":[]}.',
+            'Return {"page_top":"top","blocks":[]} for a page that has no content.',
+        ):
+            with self.subTest(field=field):
+                self.assertIn(field, prompt)
+        # The prompt names each block type that the layout parser knows.
+        for block_type in BLOCK_TYPES:
+            with self.subTest(block_type=block_type):
+                self.assertIn(f'{{"type":"{block_type}"', prompt)
+
+    def test_does_not_ask_for_the_direction_of_a_page_that_is_upright(self) -> None:
+        # The caller knows the direction. A request for the direction lets the model
+        # return no blocks, and the page is then not in the document.
+        completions = FakeCompletions('{"blocks":[{"type":"paragraph","text":"Text."}]}')
+
+        layout = self.recognize_layout(completions, upright=True)
+
+        self.assertEqual(layout, PageLayout(blocks=(Paragraph("Text."),)))
+        (request,) = completions.calls
+        prompt = request["messages"][1]["content"][0]["text"]
+        self.assertIn("The page is upright in the image.", prompt)
+        self.assertIn(
+            'Return one JSON object with this shape: {"content_box":'
+            '{"left":L,"top":T,"right":R,"bottom":B},"blocks":[...]}',
+            prompt,
+        )
+        self.assertIn('Return {"blocks":[]} for a page that has no content.', prompt)
+        self.assertNotIn("page_top", prompt)
+        self.assertNotIn("do not read the page", prompt)
+        # The rest of the request is the same as for a page with an unknown direction.
+        other_completions = FakeCompletions('{"blocks":[]}')
+        self.recognize_layout(other_completions)
+        (other_request,) = other_completions.calls
+        other_prompt = other_request["messages"][1]["content"][0]["text"]
+
+        def shared_part(text: str) -> str:
+            return text[text.index("Coordinates.") : text.rindex("Return {")]
+
+        self.assertEqual(shared_part(prompt), shared_part(other_prompt))
+        self.assertGreater(len(shared_part(prompt)), 2000)
+
+    def test_asks_the_model_to_correct_a_layout_that_loses_content(self) -> None:
+        # The reply has a nested list. The layout has no place for it, so its text must
+        # not disappear.
+        secret = "private text of the page"
+        nested = {"marker": "1.", "text": "a", "sublist": [{"marker": "a)", "text": secret}]}
+        unusable = json.dumps({"blocks": [{"type": "list", "items": [nested]}]})
+        flat = [{"marker": "1.", "text": "a"}, {"marker": "a)", "text": secret}]
+        usable = json.dumps({"blocks": [{"type": "list", "items": flat}]})
+        completions = FakeCompletions(unusable, usable)
+
+        with self.assertLogs("scanwich", level="DEBUG") as captured_logs:
+            layout = self.recognize_layout(completions)
+
+        self.assertEqual(
+            layout,
+            PageLayout(
+                blocks=(
+                    ListBlock(items=(ListItem("a", marker="1."), ListItem(secret, marker="a)"))),
+                )
+            ),
+        )
+        self.assertEqual(len(completions.calls), 2)
+        # The model gets the name of the field and the place of the object.
+        self.assertEqual(
+            completions.calls[1]["messages"][3]["content"].split("\n")[0],
+            "Your last reply cannot be used: block 1 (list) item 1 has text in a field that "
+            "the layout does not read; its fields are: marker, text. The layout does not read "
+            'these fields: "sublist" in 1 object (block 1 (list) item 1). This rule is for '
+            "each object of the reply. Remove these fields from all objects, or put their "
+            "text in a field that the layout reads.",
+        )
+        # A log record has no text from the reply: no page text and no field name.
+        log_output = "\n".join(captured_logs.output)
+        self.assertNotIn(secret, log_output)
+        self.assertNotIn("sublist", log_output)
+        self.assertIn(
+            "returned an unusable reply in attempt 1 of 3 (LayoutFormatError: block 1 (list) "
+            "item 1 has text in a field that the layout does not read; its fields are: "
+            "marker, text)",
+            log_output,
+        )
+
+    def test_correction_request_names_a_field_that_each_block_has(self) -> None:
+        # A model that adds one field mostly adds it to each block. A message that names
+        # only the first block lets the model correct one block for each request.
+        blocks = [
+            {"type": "paragraph", "shelfmark": f"b{number}", "text": f"Paragraph {number}."}
+            for number in range(1, 5)
+        ]
+        unusable = json.dumps({"page_top": "top", "blocks": blocks})
+        completions = FakeCompletions(unusable)
+
+        with (
+            self.assertLogs("scanwich", level="DEBUG") as captured_logs,
+            self.assertRaises(LayoutFormatError) as raised,
+        ):
+            self.recognize_layout(completions)
+
+        self.assertEqual(len(completions.calls), DEFAULT_MAX_ATTEMPTS)
+        for request in completions.calls[1:]:
+            self.assertIn(
+                'The layout does not read these fields: "shelfmark" in 4 objects (the first '
+                "one is block 1 (paragraph)). This rule is for each object of the reply.",
+                request["messages"][-1]["content"],
+            )
+        # The error of the conversion and the log records do not name the field.
+        self.assertEqual(
+            str(raised.exception),
+            "block 1 (paragraph) has text in a field that the layout does not read; "
+            "its fields are: type, text, align, continued",
+        )
+        self.assertNotIn("shelfmark", "\n".join(captured_logs.output))
+
+    def test_reply_cannot_name_the_image_file_of_a_figure(self) -> None:
+        # The pipeline makes the image file from the box. Text in an image field of a
+        # reply would disappear.
+        box = {"left": 100, "top": 200, "right": 800, "bottom": 900}
+        unusable = json.dumps({"blocks": [{"type": "figure", "box": box, "image": "A wheel"}]})
+        usable = json.dumps({"blocks": [{"type": "figure", "box": box, "caption": "A wheel"}]})
+        completions = FakeCompletions(unusable, usable)
+
+        with self.assertLogs(LOGGER_NAME, level="WARNING"):
+            layout = self.recognize_layout(completions)
+
+        self.assertEqual(
+            layout,
+            PageLayout(blocks=(Figure(box=Box(100, 200, 800, 900), caption="A wheel"),)),
+        )
+        self.assertIn(
+            "block 1 (figure) has text in a field that the layout does not read; its fields "
+            'are: type, box, caption. The layout does not read these fields: "image" in 1 '
+            "object (block 1 (figure)).",
+            completions.calls[1]["messages"][3]["content"],
+        )
+
+    def test_returns_the_side_of_a_page_that_is_not_upright(self) -> None:
+        layout = self.recognize_layout(FakeCompletions('{"page_top":"right","blocks":[]}'))
+        self.assertEqual(layout, PageLayout(page_top="right"))
+
+    def test_asks_the_model_to_correct_a_layout_that_it_cannot_use(self) -> None:
+        # The box uses the pixels of the image and not the grid.
+        unusable = json.dumps({"blocks": [{"type": "figure", "box": [100, 200, 2400, 3100]}]})
+        usable = json.dumps({"blocks": [{"type": "figure", "box": [100, 200, 800, 900]}]})
+        completions = FakeCompletions(unusable, usable)
+
+        with self.assertLogs(LOGGER_NAME, level="INFO") as captured_logs:
+            layout = self.recognize_layout(completions)
+
+        self.assertEqual(layout, PageLayout(blocks=(Figure(box=Box(100, 200, 800, 900)),)))
+        first_request, second_request = completions.calls
+        self.assertEqual(second_request["messages"][:2], first_request["messages"])
+        self.assertEqual(
+            second_request["messages"][2:],
+            [
+                {"role": "assistant", "content": unusable},
+                {
+                    "role": "user",
+                    "content": (
+                        "Your last reply cannot be used: block 1 (figure) box must use the "
+                        "0-to-1000 grid of the image, not its pixels\n"
+                        "Return the complete JSON object again, in the shape that the first "
+                        'message gives. In a JSON string, write a double quote as \\" and a '
+                        "backslash as \\\\. Return only the JSON object."
+                    ),
+                },
+            ],
+        )
+        defect = (
+            "LayoutFormatError: block 1 (figure) box must use the 0-to-1000 grid of the image, "
+            "not its pixels"
+        )
+        self.assertIn(
+            f"WARNING:{LOGGER_NAME}:OpenAI-compatible model {DEFAULT_LAYOUT_MODEL} "
+            f"returned an unusable reply in attempt 1 of 3 ({defect})",
+            captured_logs.output,
+        )
+        self.assertIn(
+            f"INFO:{LOGGER_NAME}:OpenAI-compatible model {DEFAULT_LAYOUT_MODEL} "
+            "corrected its reply in attempt 2 of 3",
+            captured_logs.output,
+        )
+
+    def test_fails_when_each_attempt_gives_an_unusable_layout(self) -> None:
+        completions = FakeCompletions('{"blocks":[{"type":"table"}]}')
+        with (
+            self.assertLogs(LOGGER_NAME, level="WARNING"),
+            self.assertRaisesRegex(LayoutFormatError, r"block 1 \(table\) must have a rows array"),
+        ):
+            self.recognize_layout(completions)
+        self.assertEqual(len(completions.calls), DEFAULT_MAX_ATTEMPTS)
+
+        completions = FakeCompletions("not JSON")
+        with (
+            self.assertLogs(LOGGER_NAME, level="WARNING"),
+            self.assertRaisesRegex(RuntimeError, "returned invalid JSON"),
+        ):
+            self.recognize_layout(completions, options={"max_attempts": 1})
+        self.assertEqual(len(completions.calls), 1)
+
+    def test_log_records_have_no_text_from_the_reply(self) -> None:
+        secret = "private text of the page"
+        unusable = json.dumps(
+            {"blocks": [{"type": secret, "text": secret}, {"type": secret, "rows": secret}]}
+        )
+        completions = FakeCompletions(unusable)
+        with (
+            self.assertLogs("scanwich", level="DEBUG") as captured_logs,
+            self.assertRaises(LayoutFormatError) as raised,
+        ):
+            self.recognize_layout(completions)
+
+        self.assertEqual(
+            str(raised.exception),
+            "block 2 (unknown type) has a type that the layout does not have; the types are: "
+            "heading, paragraph, quote, list, table, figure, footnote, page_header, "
+            "page_footer, page_number",
+        )
+        self.assertNotIn(secret, "\n".join(captured_logs.output))
+
+
+class FigureLocationTests(TestCase):
+    def locate_figure(
+        self,
+        completions: FakeCompletions,
+        *,
+        image_size: tuple[int, int] = (900, 600),
+        estimate: Box | None = None,
+        caption: str | None = None,
+    ) -> FigureLocation | None:
+        """Return the place that the backend makes from the replies for one part of a page."""
+        fake_client = SimpleNamespace(chat=SimpleNamespace(completions=completions))
+        fake_openai = SimpleNamespace(OpenAI=lambda **_: fake_client)
+        with TemporaryDirectory() as temporary_directory:
+            image_path = Path(temporary_directory) / "region.png"
+            Image.new("RGB", image_size, "white").save(image_path)
+            backend = OpenAICompatibleBackend(languages=["en"], options={})
+
+            with (
+                patch.dict(os.environ, {"OPENROUTER_API_KEY": "test-secret"}),
+                patch.dict(sys.modules, {"openai": fake_openai}),
+            ):
+                return backend.locate_figure(image_path, estimate=estimate, caption=caption)
+
+    def test_backend_finds_the_box_of_an_illustration(self) -> None:
+        backend = OpenAICompatibleBackend(languages=["en"], options={})
+        self.assertIsInstance(backend, FigureLocator)
+
+    def test_returns_the_box_and_the_cut_sides_of_the_reply(self) -> None:
+        reply = '{"box":{"left":250,"top":150,"right":750,"bottom":640},"cut":["top"]}'
+        completions = FakeCompletions(reply)
+
+        location = self.locate_figure(completions)
+
+        self.assertEqual(location, FigureLocation(Box(250, 150, 750, 640), frozenset({"top"})))
+        (request,) = completions.calls
+        self.assertEqual(request["response_format"], {"type": "json_object"})
+        self.assertEqual(request["temperature"], 0)
+        self.assertEqual(sent_image(request).size, (900, 600))
+        prompt = request["messages"][1]["content"][0]["text"]
+        for part in (
+            "This 900x600 pixel image shows a part of one page of a printed document.",
+            (
+                'Return one JSON object with this shape: {"box":{"left":L,"top":T,"right":R,'
+                '"bottom":B},"cut":[]}'
+            ),
+            "0-to-1000 grid",
+            # A crop that is too large loses nothing. A crop that cuts the drawing does.
+            "all its lines, and all the labels and numbers that are a part of it",
+            "It does not contain the caption",
+            "When you are not sure that a mark is a part of the illustration, include it.",
+            '"cut" has the sides of the image where the illustration continues outside',
+            'Return {"box":null,"cut":[]} when the image shows no illustration.',
+        ):
+            with self.subTest(part=part):
+                self.assertIn(part, prompt)
+        # Without data about the illustration, the request does not tell which one to find.
+        self.assertNotIn("Which illustration.", prompt)
+
+    def test_tells_the_model_which_illustration_to_find(self) -> None:
+        # An image can show two illustrations. Without these data, a model returns one
+        # box around the two of them.
+        completions = FakeCompletions('{"box":[250,150,750,640],"cut":[]}')
+        caption = 'Fig. 2. <i>A wheel</i> with "spokes"<br>and a hub<fn>1</fn>'
+
+        self.locate_figure(completions, estimate=Box(213, 317, 617, 723), caption=caption)
+
+        prompt = completions.calls[0]["messages"][1]["content"][0]["text"]
+        self.assertIn(
+            "Which illustration. The page gives this caption to the illustration: "
+            '"Fig. 2. A wheel with \\"spokes\\" and a hub". A first estimate puts the center '
+            "of the illustration near x=415, y=520 on the grid. The estimate is not exact. "
+            "When the image shows more than one illustration, find only the one that these "
+            "data describe.\n\n",
+            prompt,
+        )
+        # The sides of the estimate are the values that the request must correct, so the
+        # model does not get them.
+        for side in ("213", "317", "617", "723"):
+            self.assertNotIn(side, prompt)
+
+        completions = FakeCompletions('{"box":[250,150,750,640],"cut":[]}')
+        self.locate_figure(completions, caption="Plate " + "long caption " * 60)
+        prompt = completions.calls[0]["messages"][1]["content"][0]["text"]
+        quoted = prompt.split("caption to the illustration: ")[1].split(". When the image")[0]
+        self.assertEqual(len(json.loads(quoted)), 300)
+        self.assertNotIn("A first estimate", prompt)
+
+    def test_returns_none_when_the_image_shows_no_illustration(self) -> None:
+        self.assertIsNone(self.locate_figure(FakeCompletions('{"box":null,"cut":[]}')))
+
+    def test_one_call_is_one_request(self) -> None:
+        # The caller has a limit for its calls for one illustration. A correction request
+        # for each call would multiply that limit by the attempts of the backend.
+        replies = {
+            # The box uses the pixels of the image and not the grid.
+            '{"box":{"left":250,"top":150,"right":2400,"bottom":1700},"cut":[]}': (
+                LayoutFormatError,
+                "box must use the 0-to-1000 grid of the image, not its pixels",
+            ),
+            '{"cut":[]}': (LayoutFormatError, "the reply must be a JSON object with a box"),
+            "not JSON": (RuntimeError, "returned invalid JSON"),
+        }
+        for reply, (error_type, message) in replies.items():
+            completions = FakeCompletions(reply, '{"box":[250,150,750,640],"cut":[]}')
+            with (
+                self.subTest(reply=reply),
+                self.assertLogs(LOGGER_NAME, level="WARNING") as captured_logs,
+                self.assertRaisesRegex(error_type, message),
+            ):
+                self.locate_figure(completions)
+            self.assertEqual(len(completions.calls), 1)
+            self.assertIn("returned an unusable reply in attempt 1 of 1 (", captured_logs.output[0])
+
+
+class RequestDefaultsTests(TestCase):
+    """LaTeX output and the searchable PDF have their own default model and effort."""
+
+    def requests(self, options: dict[str, Any]) -> dict[str, dict[str, Any]]:
+        """Return the request of each request type, for a backend with these options."""
+        replies = {
+            "regions": '{"coordinate_system":"normalized","regions":[]}',
+            "layout": '{"page_top":"top","blocks":[]}',
+            "figure": '{"box":null,"cut":[]}',
+        }
+        result = {}
+        with TemporaryDirectory() as temporary_directory:
+            image_path = Path(temporary_directory) / "page.png"
+            Image.new("RGB", (400, 300), "white").save(image_path)
+            for name, reply in replies.items():
+                completions = FakeCompletions(reply)
+                fake_client = SimpleNamespace(chat=SimpleNamespace(completions=completions))
+                fake_openai = SimpleNamespace(OpenAI=lambda _client=fake_client, **_: _client)
+                backend = OpenAICompatibleBackend(languages=["en"], options=options)
+                call = {
+                    "regions": backend.recognize,
+                    "layout": backend.recognize_layout,
+                    "figure": backend.locate_figure,
+                }[name]
+                with (
+                    patch.dict(os.environ, {"OPENROUTER_API_KEY": "test-secret"}),
+                    patch.dict(sys.modules, {"openai": fake_openai}),
+                ):
+                    call(image_path)
+                (result[name],) = completions.calls
+        return result
+
+    def test_latex_requests_have_their_own_model_and_effort(self) -> None:
+        requests = self.requests({})
+        # The requests for text regions did not get a test with the model for layouts.
+        self.assertEqual(DEFAULT_MODEL, "deepseek/deepseek-v4-flash-vision-exp")
+        self.assertEqual(requests["regions"]["model"], DEFAULT_MODEL)
+        self.assertEqual(requests["regions"]["extra_body"], {"reasoning_effort": "low"})
+        for name in ("layout", "figure"):
+            with self.subTest(request=name):
+                self.assertEqual(requests[name]["model"], "~openai/gpt-luna-latest")
+                self.assertEqual(requests[name]["model"], DEFAULT_LAYOUT_MODEL)
+                self.assertEqual(requests[name]["extra_body"], {"reasoning_effort": "medium"})
+
+    def test_option_of_the_caller_is_for_all_requests(self) -> None:
+        requests = self.requests({"model": "provider/vision-model", "reasoning_effort": "high"})
+        for name, request in requests.items():
+            with self.subTest(request=name):
+                self.assertEqual(request["model"], "provider/vision-model")
+                self.assertEqual(request["extra_body"], {"reasoning_effort": "high"})
+        # One option does not change the default of the other option.
+        requests = self.requests({"model": "provider/vision-model"})
+        self.assertEqual(requests["regions"]["extra_body"], {"reasoning_effort": "low"})
+        self.assertEqual(requests["layout"]["extra_body"], {"reasoning_effort": "medium"})
+        requests = self.requests({"reasoning_effort": "low"})
+        self.assertEqual(requests["layout"]["model"], DEFAULT_LAYOUT_MODEL)
+        self.assertEqual(requests["figure"]["extra_body"], {"reasoning_effort": "low"})
+
+    def test_no_effort_and_an_alias_are_for_all_requests(self) -> None:
+        # A value of null sends no effort. That is a value of the caller, not "no value".
+        for name, request in self.requests({"reasoning_effort": None}).items():
+            with self.subTest(request=name):
+                self.assertNotIn("extra_body", request)
+        # The built-in alias is not the default model for layouts: it names a model of
+        # a different endpoint.
+        for name, request in self.requests({"model": "luna"}).items():
+            with self.subTest(request=name):
+                self.assertEqual(request["model"], "gpt-5.6-luna")
+
+    def test_log_records_name_the_model_of_the_request_and_of_the_response(self) -> None:
+        usage = SimpleNamespace(prompt_tokens=1500, completion_tokens=800, cost=0.004)
+
+        class Completions(FakeCompletions):
+            def __init__(self, response_model: object) -> None:
+                super().__init__('{"blocks":[]}')
+                self.response_model = response_model
+
+            def create(self, **request: Any) -> SimpleNamespace:
+                completion = super().create(**request)
+                completion.usage = usage
+                if self.response_model is not None:
+                    completion.model = self.response_model
+                return completion
+
+        cases = {
+            # The model ID of the request is an alias that the provider moves. The
+            # response names the model that made the reply.
+            "openai/gpt-luna-2026-09-30": (
+                "; the response names the model openai/gpt-luna-2026-09-30"
+            ),
+            None: "",
+            # A log record has only the characters of a model ID from the response.
+            "a model\nwith a line break": "",
+            17: "",
+        }
+        for response_model, suffix in cases.items():
+            completions = Completions(response_model)
+            fake_client = SimpleNamespace(chat=SimpleNamespace(completions=completions))
+            fake_openai = SimpleNamespace(OpenAI=lambda _client=fake_client, **_: _client)
+            with TemporaryDirectory() as temporary_directory:
+                image_path = Path(temporary_directory) / "page.png"
+                Image.new("RGB", (400, 300), "white").save(image_path)
+                with (
+                    self.subTest(response_model=response_model),
+                    patch.dict(os.environ, {"OPENROUTER_API_KEY": "test-secret"}),
+                    patch.dict(sys.modules, {"openai": fake_openai}),
+                    patch("uuid.uuid4", return_value=uuid.UUID(int=7)),
+                    self.assertLogs(LOGGER_NAME, level="INFO") as captured_logs,
+                ):
+                    backend = OpenAICompatibleBackend(languages=["en"], options={})
+                    backend.recognize_layout(image_path)
+            prefix = f"INFO:{LOGGER_NAME}:OpenAI-compatible session {uuid.UUID(int=7)}, model "
+            records = [
+                record
+                for record in captured_logs.output
+                if "usage." in record or "client" in record
+            ]
+            self.assertEqual(
+                records,
+                [
+                    (
+                        f"INFO:{LOGGER_NAME}:Initializing OpenAI-compatible client for model "
+                        f"{DEFAULT_LAYOUT_MODEL}"
+                    ),
+                    (
+                        f"{prefix}{DEFAULT_LAYOUT_MODEL}: usage.prompt_tokens=1500, "
+                        f"usage.completion_tokens=800 for this request{suffix}"
+                    ),
+                    (
+                        f"{prefix}{DEFAULT_LAYOUT_MODEL}: usage.cost=0.004000 for this request, "
+                        "total 0.004000 for 1 request(s)"
+                    ),
+                ],
+            )
