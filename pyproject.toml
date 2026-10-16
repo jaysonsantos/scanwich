@@ -41,7 +41,7 @@ openai-compatible = "scanwich.backends.openai_compatible:factory"
 where = ["src"]
 
 [dependency-groups]
-dev = ["ruff==0.17.0", "zizmor==1.31.0"]
+dev = ["ruff==0.17.0", "zizmor==1.31.1"]
 
 [tool.ruff]
 line-length = 100
