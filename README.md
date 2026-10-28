@@ -551,6 +551,19 @@ scanwich input.pdf output.pdf \
   --backend-option 'readtext={"batch_size": 4}'
 ```
 
+EasyOCR's detector finds text that is upright in the page image. Words printed at 90° or
+270° are missed on that pass, so Scanwich reads the page again at those angles and puts
+the words back on the original page. The upright pass still runs, and an upright word is
+kept when a turned pass only repeats it. The page is read three times. `rotations` chooses
+the extra angles (`90`, `180`, and `270`); an empty list turns the extra passes off:
+
+```console
+scanwich input.pdf output.pdf --backend-option 'rotations=[]'
+```
+
+The OpenAI-compatible backend is unchanged. It asks the vision model for every visible
+line in one pass, and rotated words depend on that model.
+
 ### OpenAI-compatible vision backend
 
 The built-in `openai-compatible` backend sends each rasterized page to an OpenAI-compatible

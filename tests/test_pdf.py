@@ -2,6 +2,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest import TestCase
 
+import pypdfium2 as pdfium
 from PIL import Image
 from pypdf import PdfReader, PdfWriter
 from reportlab.pdfgen import canvas
@@ -198,3 +199,38 @@ class AssembleSearchablePdfTests(TestCase):
             text = PdfReader(output_path).pages[1].extract_text()
             self.assertIn("visible", text)
             self.assertNotIn("hidden", text)
+
+    def test_extracts_text_drawn_along_a_vertical_baseline(self) -> None:
+        with TemporaryDirectory() as temporary_directory:
+            directory = Path(temporary_directory)
+            image_path = directory / "page.png"
+            output_path = directory / "result.pdf"
+            Image.new("RGB", (200, 200), "white").save(image_path)
+            # Top-left, top-right, bottom-right, bottom-left of glyphs that read upward.
+            region = OcrRegion(
+                text="SIDE",
+                polygon=(Point(20, 160), Point(20, 40), Point(50, 40), Point(50, 160)),
+            )
+            page = RasterizedPage(
+                image_path=image_path, width_points=200, height_points=200, dpi=72
+            )
+
+            assemble_searchable_pdf([page], [[region]], output_path)
+
+            self.assertIn("SIDE", PdfReader(output_path).pages[0].extract_text())
+            document = pdfium.PdfDocument(output_path)
+            try:
+                text_page = document[0].get_textpage()
+                centers = []
+                for index in range(text_page.count_chars()):
+                    if not text_page.get_text_range(index, 1).strip():
+                        continue
+                    left, bottom, right, top = text_page.get_charbox(index)
+                    centers.append(((left + right) / 2, (bottom + top) / 2))
+            finally:
+                document.close()
+            xs = [x for x, _ in centers]
+            ys = [y for _, y in centers]
+            # The letters of a vertical word stack, so they spread in y and not in x.
+            self.assertGreater(max(ys) - min(ys), max(xs) - min(xs))
+            self.assertGreater(max(ys) - min(ys), 50)
