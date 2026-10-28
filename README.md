@@ -518,7 +518,9 @@ The result has the box on the same grid and the sides where the image cuts the i
 For a book, a provider can also have these methods:
 
 ```python
-async def recognize_layout_async(self, image_path: Path, *, upright: bool = False) -> PageLayout: ...
+async def recognize_layout_async(
+    self, image_path: Path, *, upright: bool = False
+) -> PageLayout: ...
 async def locate_figure_async(
     self, image_path: Path, *, estimate: Box | None = None, caption: str | None = None
 ) -> FigureLocation | None: ...
@@ -553,8 +555,12 @@ scanwich input.pdf output.pdf \
 
 EasyOCR's detector finds text that is upright in the page image. Words printed at 90° or
 270° are missed on that pass, so Scanwich reads the page again at those angles and puts
-the words back on the original page. The upright pass still runs, and an upright word is
-kept when a turned pass only repeats it. The page is read three times. `rotations` chooses
+the words back on the original page. The upright pass still runs. A turned pass replaces
+an upright word only when that reading is weak and the turned reading is clearly more
+confident, so a horizontal word stays. The page is read three times. A turned pass keeps
+the page's own resolution, up to 4096 pixels on the long side, so nearby vertical labels
+stay separate words. A page larger than EasyOCR's usual 2560-pixel detection size
+therefore takes longer on the turned passes than on the upright pass. `rotations` chooses
 the extra angles (`90`, `180`, and `270`); an empty list turns the extra passes off:
 
 ```console

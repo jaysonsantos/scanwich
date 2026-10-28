@@ -130,24 +130,49 @@ class EasyOcrBackendTests(TestCase):
         self.assertEqual(
             turned_options,
             [
-                {"detail": 1, "paragraph": False, "rotation_info": [180]},
-                {"detail": 1, "paragraph": False, "rotation_info": [180]},
+                {
+                    "detail": 1,
+                    "paragraph": False,
+                    "rotation_info": [180],
+                    "canvas_size": 2560,
+                },
+                {
+                    "detail": 1,
+                    "paragraph": False,
+                    "rotation_info": [180],
+                    "canvas_size": 2560,
+                },
             ],
         )
         self.assertNotIn("rotation_info", reader.calls[0]["options"])
+        self.assertNotIn("canvas_size", reader.calls[0]["options"])
 
     def test_keeps_an_upright_word_when_a_turned_pass_reads_it_again(self) -> None:
         with TemporaryDirectory() as temporary_directory:
             image_path = Path(temporary_directory) / "page.png"
             page_image(image_path)
             reader = RecordingReader()
-            # The box is ALPHA after the inverse of a 90-degree turn, and slightly more confident.
-            reader.turn_90 = [raw_region("ALPF", ((16, 10), (26, 10), (26, 50), (16, 50)), 0.93)]
+            # The box is ALPHA after the inverse of a 90-degree turn, and more confident.
+            reader.turn_90 = [raw_region("ALPF", ((16, 10), (26, 10), (26, 50), (16, 50)), 0.99)]
             reader.turn_270 = []
             regions = recognize(reader, image_path)
 
         self.assertEqual([region.text for region in regions], ["ALPHA"])
         self.assertAlmostEqual(regions[0].confidence or 0, 0.91)
+
+    def test_keeps_a_weak_upright_word_when_the_turned_reading_is_only_a_little_better(
+        self,
+    ) -> None:
+        with TemporaryDirectory() as temporary_directory:
+            image_path = Path(temporary_directory) / "page.png"
+            page_image(image_path)
+            reader = RecordingReader()
+            reader.upright = [raw_region("LABEL", ((10, 4), (50, 4), (50, 14), (10, 14)), 0.4)]
+            reader.turn_90 = [raw_region("NOPE", ((16, 10), (26, 10), (26, 50), (16, 50)), 0.5)]
+            reader.turn_270 = []
+            regions = recognize(reader, image_path)
+
+        self.assertEqual([region.text for region in regions], ["LABEL"])
 
     def test_replaces_a_weak_fragment_with_the_rotated_word(self) -> None:
         with TemporaryDirectory() as temporary_directory:
@@ -215,8 +240,43 @@ class EasyOcrBackendTests(TestCase):
         )
         self.assertEqual(
             reader.calls[1]["options"],
-            {"detail": 1, "paragraph": False, "batch_size": 4, "rotation_info": [180]},
+            {
+                "detail": 1,
+                "paragraph": False,
+                "batch_size": 4,
+                "rotation_info": [180],
+                "canvas_size": 2560,
+            },
         )
+
+    def test_does_not_replace_two_upright_words_with_one_turned_line(self) -> None:
+        with TemporaryDirectory() as temporary_directory:
+            image_path = Path(temporary_directory) / "page.png"
+            page_image(image_path)
+            reader = RecordingReader()
+            reader.upright = [
+                raw_region("ALPHA", ((10, 4), (50, 4), (50, 14), (10, 14)), 0.6),
+                raw_region("WIDE", ((10, 20), (50, 20), (50, 28), (10, 28)), 0.6),
+            ]
+            # One box on the turned page covers both words, and it is more confident.
+            reader.turn_90 = [raw_region("BOTH", ((2, 10), (26, 10), (26, 50), (2, 50)), 0.99)]
+            reader.turn_270 = []
+            regions = recognize(reader, image_path)
+
+        self.assertEqual([region.text for region in regions], ["ALPHA", "WIDE"])
+
+    def test_keeps_a_canvas_size_the_caller_set(self) -> None:
+        with TemporaryDirectory() as temporary_directory:
+            image_path = Path(temporary_directory) / "page.png"
+            page_image(image_path)
+            reader = RecordingReader()
+            recognize(reader, image_path, rotations=[90], readtext={"canvas_size": 1280})
+
+        # The caller's readtext options apply to every pass, including the detection size.
+        self.assertEqual(reader.calls[0]["options"]["canvas_size"], 1280)
+        self.assertNotIn("rotation_info", reader.calls[0]["options"])
+        self.assertEqual(reader.calls[1]["options"]["canvas_size"], 1280)
+        self.assertEqual(reader.calls[1]["options"]["rotation_info"], [180])
 
     def test_rejects_a_rotation_that_is_not_a_quarter_turn(self) -> None:
         with self.assertRaisesRegex(ValueError, "90, 180, or 270"):

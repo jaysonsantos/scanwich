@@ -19,15 +19,22 @@ logger = logging.getLogger(__name__)
 # that direction is upright, then the boxes are mapped back onto the original page.
 # 180 is not a default: pass it with the `rotations` option when a page is upside down.
 DEFAULT_ROTATIONS = (90, 270)
-# A rotated pass can see an upright word again and read it worse. An existing region is
-# replaced only when the new reading is clearly more confident, or the existing one is weak.
-REPLACEMENT_MARGIN = 0.2
+# A turned pass can see an upright word again. It replaces that word only when the
+# existing reading is weak and the new one is clearly more confident. A small gain is
+# not enough: a weak but correct horizontal word must not be overwritten by a misread.
 WEAK_CONFIDENCE = 0.5
+REPLACEMENT_MARGIN = 0.2
 # Two regions are the same spot when at least this share of one box lies inside the other.
 OVERLAP_FRACTION = 0.5
 # On a turned page the glyphs may be upside down. EasyOCR then recognizes each crop both
 # ways and keeps the reading with the higher confidence. The box itself does not move.
 UPSIDE_DOWN = (180,)
+# EasyOCR otherwise shrinks the long side to this size. Nearby vertical labels then become
+# one word. A turned pass keeps the page's own long side when it is larger than this.
+DEFAULT_CANVAS_SIZE = 2560
+# The detection image is not larger than this. A bigger page is still shrunk, but less
+# than the default, and the cost of a turned pass stays bounded.
+ROTATED_CANVAS_LIMIT = 4096
 
 
 class EasyOcrBackend:
@@ -45,9 +52,15 @@ class EasyOcrBackend:
         self._reader: Any | None = None
 
     def recognize(self, image_path: Path) -> list[OcrRegion]:
+        started = time.monotonic()
         regions = self._read(str(image_path), self._readtext_options)
         if not self._rotations:
             return regions
+        logger.info(
+            "The upright pass found %d text region(s) in %.1f seconds",
+            len(regions),
+            time.monotonic() - started,
+        )
         with Image.open(image_path) as image:
             image.load()
             width, height = image.size
@@ -60,6 +73,7 @@ class EasyOcrBackend:
             with TemporaryDirectory(prefix="scanwich-ocr-") as temporary_directory:
                 directory = Path(temporary_directory)
                 for degrees in self._rotations:
+                    pass_started = time.monotonic()
                     turned_path = directory / f"turn-{degrees}.png"
                     # The same fast compression the page images use. The file is temporary.
                     turn_clockwise(image, degrees).save(
@@ -69,15 +83,24 @@ class EasyOcrBackend:
                     )
                     options = dict(self._readtext_options)
                     options.setdefault("rotation_info", list(UPSIDE_DOWN))
+                    # Full resolution keeps a gap between labels that sit in a row once the
+                    # page is turned. The upright pass keeps EasyOCR's own detection size.
+                    long_side = max(width, height)
+                    options.setdefault(
+                        "canvas_size",
+                        min(max(long_side, DEFAULT_CANVAS_SIZE), ROTATED_CANVAS_LIMIT),
+                    )
                     turned_regions = self._read(str(turned_path), options)
                     mapped = [
                         _region_on_page(region, degrees, width, height) for region in turned_regions
                     ]
                     regions = _merge_regions(regions, mapped)
                     logger.info(
-                        "The %d-degree pass found %d text region(s); %d region(s) are kept",
+                        "The %d-degree pass found %d text region(s) in %.1f seconds; "
+                        "%d region(s) are kept",
                         degrees,
                         len(turned_regions),
+                        time.monotonic() - pass_started,
                         len(regions),
                     )
         return regions
@@ -177,8 +200,11 @@ def _point_on_page(point: Point, degrees: int, width: int, height: int) -> Point
 def _merge_regions(regions: list[OcrRegion], extra: Sequence[OcrRegion]) -> list[OcrRegion]:
     """Add regions from one turned pass, without a second copy of the same spot.
 
-    A new region that lands on an existing one replaces it only when the new reading is
-    clearly better. An upright word that the turned pass reads again therefore stays.
+    A new region that lands on one existing region replaces it only when that reading is
+    weak and the new one is clearly more confident. A clear upright word, and a weak but
+    still plausible one, therefore stay. A new region that covers more than one existing
+    region is left out: it is a line of several words, and replacing them would drop the
+    upright readings.
     """
     merged = list(regions)
     for region in extra:
@@ -189,20 +215,18 @@ def _merge_regions(regions: list[OcrRegion], extra: Sequence[OcrRegion]) -> list
         ]
         if not overlaps:
             merged.append(region)
-            continue
-        if all(_prefer_new(merged[index], region) for index in overlaps):
-            for index in reversed(overlaps):
-                del merged[index]
-            merged.append(region)
+        elif len(overlaps) == 1 and _prefer_new(merged[overlaps[0]], region):
+            merged[overlaps[0]] = region
     return merged
 
 
 def _prefer_new(current: OcrRegion, new: OcrRegion) -> bool:
     new_confidence = 0.0 if new.confidence is None else new.confidence
     current_confidence = 0.0 if current.confidence is None else current.confidence
-    if new_confidence >= current_confidence + REPLACEMENT_MARGIN:
-        return True
-    return current_confidence < WEAK_CONFIDENCE and new_confidence > current_confidence
+    return (
+        current_confidence < WEAK_CONFIDENCE
+        and new_confidence >= current_confidence + REPLACEMENT_MARGIN
+    )
 
 
 def _overlap_fraction(region: OcrRegion, other: OcrRegion) -> float:
