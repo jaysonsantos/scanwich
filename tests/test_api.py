@@ -596,7 +596,9 @@ class TestApi(TestCase):
     def post_pdf(self, provider_body: dict, *, pages: int, output: str):
         """Return the response, the provider requests, and the cost records for one PDF."""
         provider_requests: list[httpx.Request] = []
-        backend = OpenAICompatibleBackend(languages=["en"], options={"model": "provider/model"})
+        backend = OpenAICompatibleBackend(
+            languages=["en"], options={"model": "provider/model", "rotations": []}
+        )
         with (
             patch("scanwich.api.load_backend", return_value=backend),
             patch.dict(os.environ, {"OPENROUTER_API_KEY": "sk-private-key"}),
@@ -611,6 +613,41 @@ class TestApi(TestCase):
             )
         cost_records = [record for record in logs.output if "usage.cost" in record]
         return response, provider_requests, cost_records
+
+    def test_pdf_output_asks_again_for_rotated_text(self):
+        content = json.dumps({"coordinate_system": "normalized", "regions": []})
+        choice = {"finish_reason": "stop", "message": {"content": content}}
+        plain = {"choices": [{"finish_reason": "stop", "message": {"content": "upright"}}]}
+        regions = {"choices": [choice]}
+        provider_requests: list[httpx.Request] = []
+        backend = OpenAICompatibleBackend(languages=["en"], options={"model": "provider/model"})
+        with (
+            patch("scanwich.api.load_backend", return_value=backend),
+            patch.dict(os.environ, {"OPENROUTER_API_KEY": "sk-private-key"}),
+            patch(
+                "openai.AsyncOpenAI",
+                provider_client(200, [regions, regions, regions, plain], provider_requests),
+            ),
+            TestClient(create_app()) as api,
+        ):
+            response = api.post(
+                "/ocr/openai-compatible",
+                data={"output": "pdf+text"},
+                files={"file": ("scan.pdf", pdf_bytes(1))},
+            )
+
+        self.assertEqual(response.status_code, 200, response.text)
+        # Three requests read the page upright, at 90 degrees, and at 270 degrees.
+        # The plain-text transcription is a fourth request and is not turned.
+        self.assertEqual(len(provider_requests), 4)
+        prompts = [
+            json.loads(request.content)["messages"][1]["content"][0]["text"]
+            for request in provider_requests
+        ]
+        self.assertIn("600x300", prompts[0])
+        self.assertIn("300x600", prompts[1])
+        self.assertIn("300x600", prompts[2])
+        self.assertIn("plain text", prompts[3])
 
     def test_one_document_is_one_provider_session_with_a_logged_cost(self):
         content = json.dumps({"coordinate_system": "normalized", "regions": []})
@@ -647,7 +684,7 @@ class TestApi(TestCase):
         regions = [region("first line", 100, 150), region("private letter", 1200, 1400)]
         content = json.dumps({"coordinate_system": "normalized", "regions": regions})
         body = {"choices": [{"finish_reason": "stop", "message": {"content": content}}]}
-        backend = OpenAICompatibleBackend(languages=["en"], options={})
+        backend = OpenAICompatibleBackend(languages=["en"], options={"rotations": []})
         with (
             patch("scanwich.api.load_backend", return_value=backend),
             patch.dict(os.environ, {"OPENROUTER_API_KEY": "sk-private-key"}),
@@ -731,7 +768,7 @@ class TestApi(TestCase):
                 provider_requests: list[httpx.Request] = []
                 client = provider_client(200, [unusable, correction_reply], provider_requests)
                 backend = OpenAICompatibleBackend(
-                    languages=["en"], options={"model": "provider/model"}
+                    languages=["en"], options={"model": "provider/model", "rotations": []}
                 )
                 with (
                     patch("scanwich.api.load_backend", return_value=backend),
@@ -870,7 +907,9 @@ class TestAsyncBackend(IsolatedAsyncioTestCase):
         )
         sync_create = Mock(return_value=response)
         async_create = AsyncMock(return_value=response)
-        backend = OpenAICompatibleBackend(languages=["en"], options={"model": "provider/model"})
+        backend = OpenAICompatibleBackend(
+            languages=["en"], options={"model": "provider/model", "rotations": []}
+        )
         backend._client = SimpleNamespace(
             chat=SimpleNamespace(completions=SimpleNamespace(create=sync_create))
         )

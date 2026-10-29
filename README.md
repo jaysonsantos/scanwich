@@ -518,7 +518,9 @@ The result has the box on the same grid and the sides where the image cuts the i
 For a book, a provider can also have these methods:
 
 ```python
-async def recognize_layout_async(self, image_path: Path, *, upright: bool = False) -> PageLayout: ...
+async def recognize_layout_async(
+    self, image_path: Path, *, upright: bool = False
+) -> PageLayout: ...
 async def locate_figure_async(
     self, image_path: Path, *, estimate: Box | None = None, caption: str | None = None
 ) -> FigureLocation | None: ...
@@ -551,6 +553,35 @@ scanwich input.pdf output.pdf \
   --backend-option 'readtext={"batch_size": 4}'
 ```
 
+EasyOCR's detector finds text that is upright in the page image. Words printed at 90° or
+270° are missed on that pass, so Scanwich reads the page again at those angles and puts
+the words back on the original page. The upright pass runs at EasyOCR's usual detection size, then, when the page is larger
+than 2560 pixels on the long side, once more at the page's own size up to 4096.
+The second read only adds labels the first read missed, or replaces a weak one. It does
+not overwrite a confident horizontal word. `refine=false` skips that second read.
+A turned pass keeps the page's own
+resolution up to 4096 pixels on the long side, so nearby vertical labels stay separate.
+A box that is much taller than it is wide in a turned image is horizontal text stood on
+end. It is dropped, so a 270° misread cannot overwrite a horizontal label such as LSY and
+cannot come back as a wide flat duplicate. A vertical label inside a much wider horizontal
+detection is kept as its own word. `rotations` chooses the
+extra angles (`90`, `180`, and `270`); an empty list turns the extra passes off. `tiles`
+is how many overlapping pieces each pass is split into on a side (`1` to `6`, default `1`).
+A grid multiplies the reads:
+
+```console
+scanwich input.pdf output.pdf --backend-option 'rotations=[]'
+```
+
+The OpenAI-compatible backend uses the same turns for the text regions of a searchable
+PDF. Each turn is another model request, so a page costs about three times one upright
+request. The model does not return a confidence, so a turned word is added only when its
+box does not land on an upright word; it does not replace that word. A box that is
+taller than wide in a turned image is dropped: that is horizontal text stood on end,
+and mapping it makes a wide flat duplicate away from the upright word. Layout requests,
+figure requests, and plain-text transcription stay one request.
+`--backend-option 'rotations=[]'` turns the extra requests off, as it does for EasyOCR.
+
 ### OpenAI-compatible vision backend
 
 The built-in `openai-compatible` backend sends each rasterized page to an OpenAI-compatible
@@ -569,8 +600,8 @@ scanwich input.pdf output.pdf \
 ```
 
 The backend accepts `model`, `base_url`, `api_key_env`, `timeout`, `max_tokens`,
-`reasoning_effort`, and `max_attempts` backend options. Set `base_url` and `api_key_env` to use
-another OpenAI-compatible service:
+`reasoning_effort`, `max_attempts`, and `rotations` backend options.
+Set `base_url` and `api_key_env` to use another OpenAI-compatible service:
 
 ```console
 scanwich input.pdf output.pdf \
@@ -658,7 +689,10 @@ page dimensions. For an image upload, the API uses 300 DPI for the PDF page dime
 Set the optional `dpi` multipart field to override the DPI for every page.
 The server limits that field to `max_dpi`, which is 600 by default. Higher values return 422.
 This limit bounds the rendered page size, and with it the memory of one request.
-The API recognizes pages in order, one page at a time, and sends one backend request for each page.
+The API recognizes pages in order, one page at a time. The OpenAI-compatible backend
+sends three requests for the text regions of each page (upright, 90°, and 270°) unless
+`rotations` is empty. Plain-text output is one request per page and is not turned.
+`pdf+text` sends the three region requests and that one plain-text request.
 A document with many pages needs proportionally more time and provider quota.
 Text output preserves the provider's line breaks and spacing.
 Text output separates pages with a form feed (`\f`).
