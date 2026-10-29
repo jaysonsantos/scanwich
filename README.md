@@ -567,8 +567,12 @@ the extra angles (`90`, `180`, and `270`); an empty list turns the extra passes 
 scanwich input.pdf output.pdf --backend-option 'rotations=[]'
 ```
 
-The OpenAI-compatible backend is unchanged. It asks the vision model for every visible
-line in one pass, and rotated words depend on that model.
+The OpenAI-compatible backend uses the same turns for the text regions of a searchable
+PDF. Each turn is another model request, so a page costs about three times one upright
+request. The model does not return a confidence, so a turned word is added only when its
+box does not land on an upright word; it does not replace that word. Layout requests,
+figure requests, and plain-text transcription stay one request.
+`--backend-option 'rotations=[]'` turns the extra requests off, as it does for EasyOCR.
 
 ### OpenAI-compatible vision backend
 
@@ -588,8 +592,8 @@ scanwich input.pdf output.pdf \
 ```
 
 The backend accepts `model`, `base_url`, `api_key_env`, `timeout`, `max_tokens`,
-`reasoning_effort`, and `max_attempts` backend options. Set `base_url` and `api_key_env` to use
-another OpenAI-compatible service:
+`reasoning_effort`, `max_attempts`, and `rotations` backend options.
+Set `base_url` and `api_key_env` to use another OpenAI-compatible service:
 
 ```console
 scanwich input.pdf output.pdf \
@@ -677,7 +681,10 @@ page dimensions. For an image upload, the API uses 300 DPI for the PDF page dime
 Set the optional `dpi` multipart field to override the DPI for every page.
 The server limits that field to `max_dpi`, which is 600 by default. Higher values return 422.
 This limit bounds the rendered page size, and with it the memory of one request.
-The API recognizes pages in order, one page at a time, and sends one backend request for each page.
+The API recognizes pages in order, one page at a time. The OpenAI-compatible backend
+sends three requests for the text regions of each page (upright, 90°, and 270°) unless
+`rotations` is empty. Plain-text output is one request per page and is not turned.
+`pdf+text` sends the three region requests and that one plain-text request.
 A document with many pages needs proportionally more time and provider quota.
 Text output preserves the provider's line breaks and spacing.
 Text output separates pages with a form feed (`\f`).

@@ -118,7 +118,7 @@ class OpenAICompatibleBackendTests(TestCase):
         with TemporaryDirectory() as temporary_directory:
             image_path = Path(temporary_directory) / "page.png"
             Image.new("RGB", image_size, "white").save(image_path)
-            backend = OpenAICompatibleBackend(languages=["en"], options={})
+            backend = OpenAICompatibleBackend(languages=["en"], options={"rotations": []})
 
             with (
                 patch.dict(os.environ, {"OPENROUTER_API_KEY": "test-secret"}),
@@ -139,7 +139,9 @@ class OpenAICompatibleBackendTests(TestCase):
         with TemporaryDirectory() as temporary_directory:
             image_path = Path(temporary_directory) / "page.png"
             (image or Image.new("RGB", (2000, 3000), "white")).save(image_path)
-            backend = OpenAICompatibleBackend(languages=["en"], options=options or {})
+            backend = OpenAICompatibleBackend(
+                languages=["en"], options={"rotations": [], **(options or {})}
+            )
 
             with (
                 patch.dict(os.environ, {"OPENROUTER_API_KEY": "test-secret"}),
@@ -155,7 +157,7 @@ class OpenAICompatibleBackendTests(TestCase):
         with TemporaryDirectory() as temporary_directory:
             image_path = Path(temporary_directory) / "page.png"
             Image.new("RGB", (10, 10), "white").save(image_path)
-            backend = OpenAICompatibleBackend(languages=["en"], options={})
+            backend = OpenAICompatibleBackend(languages=["en"], options={"rotations": []})
 
             with (
                 patch.dict(os.environ, {"OPENROUTER_API_KEY": "test-secret"}),
@@ -181,7 +183,7 @@ class OpenAICompatibleBackendTests(TestCase):
         with TemporaryDirectory() as temporary_directory:
             image_path = Path(temporary_directory) / "page.png"
             Image.new("RGB", (10, 10), "white").save(image_path)
-            backend = OpenAICompatibleBackend(languages=["en"], options={})
+            backend = OpenAICompatibleBackend(languages=["en"], options={"rotations": []})
 
             with (
                 patch.dict(os.environ, {"OPENROUTER_API_KEY": "test-secret"}),
@@ -414,7 +416,11 @@ class OpenAICompatibleBackendTests(TestCase):
         ):
             image_path = Path(temporary_directory) / "page.png"
             Image.new("RGB", (10, 10), "white").save(image_path)
-            for options in ({}, {}, {"base_url": "https://example.invalid/v1"}):
+            for options in (
+                {"rotations": []},
+                {"rotations": []},
+                {"base_url": "https://example.invalid/v1", "rotations": []},
+            ):
                 backend = OpenAICompatibleBackend(languages=["en"], options=options)
                 backend.recognize(image_path)
                 backend.recognize(image_path)
@@ -1520,7 +1526,9 @@ class RequestDefaultsTests(TestCase):
                 completions = FakeCompletions(reply)
                 fake_client = SimpleNamespace(chat=SimpleNamespace(completions=completions))
                 fake_openai = SimpleNamespace(OpenAI=lambda _client=fake_client, **_: _client)
-                backend = OpenAICompatibleBackend(languages=["en"], options=options)
+                backend = OpenAICompatibleBackend(
+                    languages=["en"], options={"rotations": [], **options}
+                )
                 call = {
                     "regions": backend.recognize,
                     "layout": backend.recognize_layout,
@@ -2036,3 +2044,138 @@ class AsyncRequestTests(TestCase):
         )
         # The settings go to a file, so they have no address and no name of a key.
         self.assertEqual(json.loads(json.dumps(settings)), settings)
+
+
+def _pixel_page(text: str, left: float, top: float, right: float, bottom: float) -> str:
+    return json.dumps(
+        {"coordinate_system": "pixels", "regions": [box(text, left, top, right, bottom)]}
+    )
+
+
+class _TurningCompletions:
+    """Return an upright word or a turned word, chosen from the image the request shows."""
+
+    def __init__(self, turned_text: str, turned_box: tuple[float, float, float, float]) -> None:
+        self.calls: list[dict[str, Any]] = []
+        self._turned_text = turned_text
+        self._turned_box = turned_box
+
+    def create(self, **request: Any) -> SimpleNamespace:
+        self.calls.append(request)
+        image = sent_image(request)
+        if image.size == (80, 30):
+            content = _pixel_page("ALPHA", 10, 4, 50, 14)
+        else:
+            left, top, right, bottom = self._turned_box
+            content = _pixel_page(self._turned_text, left, top, right, bottom)
+        return SimpleNamespace(
+            choices=[
+                SimpleNamespace(finish_reason="stop", message=SimpleNamespace(content=content))
+            ]
+        )
+
+    async def create_async(self, **request: Any) -> SimpleNamespace:
+        return self.create(**request)
+
+
+class RotatedOpenAITextTests(TestCase):
+    def recognize(
+        self, completions: _TurningCompletions | FakeCompletions, **options: Any
+    ) -> list[OcrRegion]:
+        fake_client = SimpleNamespace(chat=SimpleNamespace(completions=completions))
+        fake_openai = SimpleNamespace(OpenAI=lambda **_: fake_client)
+        with TemporaryDirectory() as temporary_directory:
+            image_path = Path(temporary_directory) / "page.png"
+            Image.new("RGB", (80, 30), "white").save(image_path)
+            backend = OpenAICompatibleBackend(languages=["en"], options=options)
+            with (
+                patch.dict(os.environ, {"OPENROUTER_API_KEY": "test-secret"}),
+                patch.dict(sys.modules, {"openai": fake_openai}),
+            ):
+                return backend.recognize(image_path)
+
+    def test_maps_a_word_from_a_quarter_turn_back_onto_the_page(self) -> None:
+        for degrees, text, turned_box, polygon in (
+            (
+                90,
+                "BETA",
+                (4, 10, 16, 14),
+                (Point(10, 26), Point(10, 14), Point(14, 14), Point(14, 26)),
+            ),
+            (
+                270,
+                "GAMMA",
+                (4, 10, 16, 14),
+                (Point(70, 4), Point(70, 16), Point(66, 16), Point(66, 4)),
+            ),
+        ):
+            with self.subTest(degrees=degrees):
+                completions = _TurningCompletions(text, turned_box)
+                regions = self.recognize(completions, rotations=[degrees])
+                by_text = {region.text: region for region in regions}
+                self.assertEqual(set(by_text), {"ALPHA", text})
+                self.assertEqual(
+                    by_text["ALPHA"].polygon,
+                    (Point(10, 4), Point(50, 4), Point(50, 14), Point(10, 14)),
+                )
+                self.assertEqual(by_text[text].polygon, polygon)
+                self.assertEqual(sent_image(completions.calls[0]).size, (80, 30))
+                self.assertEqual(sent_image(completions.calls[1]).size, (30, 80))
+                self.assertIn("30x80", completions.calls[1]["messages"][1]["content"][0]["text"])
+
+    def test_keeps_an_upright_word_when_a_turned_pass_reads_the_same_spot(self) -> None:
+        # The turned box maps onto ALPHA. Neither reading has a confidence.
+        completions = _TurningCompletions("NOPE", (16, 10, 26, 50))
+        regions = self.recognize(completions, rotations=[90])
+
+        self.assertEqual([region.text for region in regions], ["ALPHA"])
+
+    def test_default_rotations_send_three_requests(self) -> None:
+        completions = FakeCompletions(
+            json.dumps({"coordinate_system": "normalized", "regions": []})
+        )
+        self.recognize(completions)
+        self.assertEqual(
+            [sent_image(request).size for request in completions.calls],
+            [(80, 30), (30, 80), (30, 80)],
+        )
+
+    def test_empty_rotations_send_one_request(self) -> None:
+        completions = FakeCompletions(
+            json.dumps({"coordinate_system": "normalized", "regions": []})
+        )
+        self.recognize(completions, rotations=[])
+        self.assertEqual(len(completions.calls), 1)
+
+    def test_async_recognition_maps_a_turned_word(self) -> None:
+        completions = _TurningCompletions("BETA", (4, 10, 16, 14))
+
+        async def create(**request: Any) -> SimpleNamespace:
+            return completions.create(**request)
+
+        fake_client = SimpleNamespace(
+            chat=SimpleNamespace(completions=SimpleNamespace(create=create))
+        )
+        fake_openai = SimpleNamespace(AsyncOpenAI=lambda **_: fake_client)
+        with TemporaryDirectory() as temporary_directory:
+            image_path = Path(temporary_directory) / "page.png"
+            Image.new("RGB", (80, 30), "white").save(image_path)
+            backend = OpenAICompatibleBackend(languages=["en"], options={"rotations": [90]})
+            with (
+                patch.dict(os.environ, {"OPENROUTER_API_KEY": "test-secret"}),
+                patch.dict(sys.modules, {"openai": fake_openai}),
+            ):
+                regions = asyncio.run(backend.recognize_async(image_path))
+
+        by_text = {region.text: region for region in regions}
+        self.assertEqual(
+            by_text["BETA"].polygon,
+            (Point(10, 26), Point(10, 14), Point(14, 14), Point(14, 26)),
+        )
+        self.assertIn("ALPHA", by_text)
+
+    def test_rejects_a_rotation_that_is_not_a_quarter_turn(self) -> None:
+        with self.assertRaisesRegex(ValueError, "90, 180, or 270"):
+            OpenAICompatibleBackend(languages=["en"], options={"rotations": [45]})
+        with self.assertRaisesRegex(TypeError, "list of 90, 180, and 270"):
+            OpenAICompatibleBackend(languages=["en"], options={"rotations": "90"})

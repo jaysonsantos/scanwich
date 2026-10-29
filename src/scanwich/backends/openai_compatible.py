@@ -29,6 +29,12 @@ from scanwich.layout import (
 )
 from scanwich.models import OcrRegion, Point
 from scanwich.ocr import NoReplyError, RateLimitError
+from scanwich.rotated_text import (
+    DEFAULT_ROTATIONS,
+    recognize_turned,
+    recognize_turned_async,
+    rotations_from_option,
+)
 
 DEFAULT_MODEL = "deepseek/deepseek-v4-flash-vision-exp"
 DEFAULT_MODEL_ALIASES = {
@@ -190,6 +196,7 @@ class OpenAICompatibleBackend:
             "max_attempts",
             DEFAULT_MAX_ATTEMPTS,
         )
+        self._rotations = rotations_from_option(option_values.pop("rotations", DEFAULT_ROTATIONS))
         if option_values:
             unsupported = ", ".join(sorted(option_values))
             raise TypeError(f"unsupported OpenAI-compatible backend option(s): {unsupported}")
@@ -201,6 +208,19 @@ class OpenAICompatibleBackend:
         self._session_requests_with_cost = 0
 
     def recognize(self, image_path: Path) -> list[OcrRegion]:
+        """Return the text regions of one page, including words printed at 90° or 270°.
+
+        Each extra angle is another request. `rotations=[]` reads the page once.
+        """
+        return recognize_turned(
+            image_path,
+            self._rotations,
+            lambda path, _degrees: self._recognize_image(path),
+            reader_name="the OpenAI-compatible model",
+            log=logger,
+        )
+
+    def _recognize_image(self, image_path: Path) -> list[OcrRegion]:
         image = _encode_image(image_path)
         return self._complete(
             self._request(image), lambda content: self._parse_reply(content, image)
@@ -403,6 +423,16 @@ class OpenAICompatibleBackend:
                 return result
 
     async def recognize_async(self, image_path: Path) -> list[OcrRegion]:
+        """Return the text regions of one page, as `recognize` does."""
+        return await recognize_turned_async(
+            image_path,
+            self._rotations,
+            lambda path, _degrees: self._recognize_image_async(path),
+            reader_name="the OpenAI-compatible model",
+            log=logger,
+        )
+
+    async def _recognize_image_async(self, image_path: Path) -> list[OcrRegion]:
         image = await asyncio.to_thread(_encode_image, image_path)
         client = self._get_client(asynchronous=True)
         request = self._request(image)
