@@ -174,6 +174,36 @@ class EasyOcrBackendTests(TestCase):
 
         self.assertEqual([region.text for region in regions], ["LABEL"])
 
+    def test_keeps_a_vertical_label_inside_a_wide_horizontal_detection(self) -> None:
+        with TemporaryDirectory() as temporary_directory:
+            image_path = Path(temporary_directory) / "page.png"
+            page_image(image_path)
+            reader = RecordingReader()
+            reader.upright = [raw_region("GARBAGE", ((10, 4), (70, 4), (70, 20), (10, 20)), 0.9)]
+            # Horizontal in the turned image, so it was vertical on the page, and it
+            # lands inside the wide upright box.
+            reader.turn_90 = [raw_region("TP63", ((12, 20), (24, 20), (24, 28), (12, 28)), 0.9)]
+            reader.turn_270 = []
+            regions = recognize(reader, image_path)
+
+        self.assertEqual({region.text for region in regions}, {"GARBAGE", "TP63"})
+
+    def test_does_not_replace_a_horizontal_word_with_a_turned_character(self) -> None:
+        # The upright label is weak, and the turned character is confident enough that
+        # the old confidence rule would have overwritten it. The turned box is tall, so
+        # it is text that was horizontal on the page.
+        with TemporaryDirectory() as temporary_directory:
+            image_path = Path(temporary_directory) / "page.png"
+            page_image(image_path)
+            reader = RecordingReader()
+            reader.upright = [raw_region("LSY", ((10, 4), (50, 4), (50, 14), (10, 14)), 0.4)]
+            reader.turn_90 = [raw_region("5", ((16, 10), (26, 10), (26, 50), (16, 50)), 0.78)]
+            reader.turn_270 = []
+            regions = recognize(reader, image_path)
+
+        self.assertEqual([region.text for region in regions], ["LSY"])
+        self.assertAlmostEqual(regions[0].confidence or 0, 0.4)
+
     def test_replaces_a_weak_fragment_with_the_rotated_word(self) -> None:
         with TemporaryDirectory() as temporary_directory:
             image_path = Path(temporary_directory) / "page.png"
@@ -277,6 +307,35 @@ class EasyOcrBackendTests(TestCase):
         self.assertNotIn("rotation_info", reader.calls[0]["options"])
         self.assertEqual(reader.calls[1]["options"]["canvas_size"], 1280)
         self.assertEqual(reader.calls[1]["options"]["rotation_info"], [180])
+
+    def test_tiles_shift_each_crop_back_onto_the_page(self) -> None:
+        class CornerReader:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def readtext(self, image: str, **options: object) -> list[object]:
+                self.calls += 1
+                return [raw_region("T", ((0, 0), (4, 0), (4, 2), (0, 2)), 0.9)]
+
+        with TemporaryDirectory() as temporary_directory:
+            image_path = Path(temporary_directory) / "page.png"
+            page_image(image_path)
+            reader = CornerReader()
+            seen: dict[str, object] = {}
+            backend = EasyOcrBackend(languages=["en"], options={"tiles": 2, "rotations": []})
+
+            def make_reader(languages: list[str], **reader_options: object) -> CornerReader:
+                seen.update(reader_options)
+                return reader
+
+            with patch.dict(sys.modules, {"easyocr": SimpleNamespace(Reader=make_reader)}):
+                regions = backend.recognize(image_path)
+
+        self.assertGreater(reader.calls, 1)
+        self.assertNotIn("tiles", seen)
+        xs = [min(point.x for point in region.polygon) for region in regions]
+        self.assertIn(0, xs)
+        self.assertTrue(any(x > 10 for x in xs))
 
     def test_rejects_a_rotation_that_is_not_a_quarter_turn(self) -> None:
         with self.assertRaisesRegex(ValueError, "90, 180, or 270"):

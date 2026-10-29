@@ -2123,6 +2123,17 @@ class RotatedOpenAITextTests(TestCase):
                 self.assertEqual(sent_image(completions.calls[1]).size, (30, 80))
                 self.assertIn("30x80", completions.calls[1]["messages"][1]["content"][0]["text"])
 
+    def test_drops_a_sideways_reread_of_a_horizontal_word(self) -> None:
+        # A tall box in the turned image is horizontal page text stood on end. Mapping
+        # it makes a wide flat copy that may not overlap the upright word.
+        completions = _TurningCompletions("MOTORS", (10, 20, 14, 60))
+        regions = self.recognize(
+            completions,
+            rotations=[90],
+        )
+        # The upright fixture still returns ALPHA. MOTORS is the tall turned box.
+        self.assertEqual([region.text for region in regions], ["ALPHA"])
+
     def test_keeps_an_upright_word_when_a_turned_pass_reads_the_same_spot(self) -> None:
         # The turned box maps onto ALPHA. Neither reading has a confidence.
         completions = _TurningCompletions("NOPE", (16, 10, 26, 50))

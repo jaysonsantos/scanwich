@@ -29,6 +29,10 @@ WEAK_CONFIDENCE = 0.5
 REPLACEMENT_MARGIN = 0.2
 # Two regions are the same spot when at least this share of one box lies inside the other.
 OVERLAP_FRACTION = 0.5
+# A turned box this many times taller than wide is horizontal page text stood on end.
+# The false "5" over a horizontal label is about twice as tall as it is wide. A real
+# vertical label, after the turn, is wider than it is tall, so this does not drop it.
+SIDEWAYS_ASPECT = 1.5
 
 # recognize_image(path, degrees) reads one image. degrees is 0 for the upright page.
 RecognizeImage = Callable[[Path, int], Sequence[OcrRegion]]
@@ -171,7 +175,13 @@ def _keep_turned_regions(
     width: int,
     height: int,
 ) -> list[OcrRegion]:
-    mapped = [region_on_page(region, degrees, width, height) for region in turned_regions]
+    # A box that is taller than it is wide in the turned image is text that was
+    # horizontal on the page: the turn stood it on end. Mapping that axis-aligned
+    # box makes a wide, flat copy of a word the upright pass already read, often a
+    # little away from the original, so the two do not overlap. Those copies are
+    # dropped. A box that is horizontal in the turned image was vertical on the page.
+    horizontal = [region for region in turned_regions if not _is_sideways_reread(region)]
+    mapped = [region_on_page(region, degrees, width, height) for region in horizontal]
     return merge_regions(regions, mapped)
 
 
@@ -209,10 +219,11 @@ def merge_regions(regions: Sequence[OcrRegion], extra: Sequence[OcrRegion]) -> l
     """Add regions from one turned pass, without a second copy of the same spot.
 
     A new region that lands on one existing region replaces it only when that reading is
-    weak and the new one is clearly more confident. A clear upright word, and a weak but
-    still plausible one, therefore stay. A region with no confidence does not replace
-    another one. A new region that covers more than one existing region is left out: it
-    is a line of several words, and replacing them would drop the upright readings.
+    weak and the new one is clearly more confident. A region with no confidence does not
+    replace another one. A new region that covers more than one existing region is left
+    out: it is a line of several words, and replacing them would drop the upright readings.
+    Boxes that are taller than they are wide in the turned image are not merged in: they
+    are horizontal page text stood on end.
     """
     merged = list(regions)
     for region in extra:
@@ -225,7 +236,46 @@ def merge_regions(regions: Sequence[OcrRegion], extra: Sequence[OcrRegion]) -> l
             merged.append(region)
         elif len(overlaps) == 1 and _prefer_new(merged[overlaps[0]], region):
             merged[overlaps[0]] = region
+        elif _vertical_label_across_a_wider_line(merged, overlaps, region):
+            # The upright box is a wide horizontal smear. The turned box is a
+            # vertical label inside it. They are not the same word.
+            merged.append(region)
     return merged
+
+
+def _vertical_label_across_a_wider_line(
+    merged: Sequence[OcrRegion], overlaps: Sequence[int], region: OcrRegion
+) -> bool:
+    """A tall label may sit inside a much wider horizontal detection."""
+    if _is_horizontal(region) or not overlaps:
+        return False
+    for index in overlaps:
+        existing = merged[index]
+        if not _is_horizontal(existing):
+            return False
+        existing_width = _bounds(existing)[2] - _bounds(existing)[0]
+        region_width = _bounds(region)[2] - _bounds(region)[0]
+        if existing_width <= region_width * 2.5:
+            return False
+    return True
+
+
+def _is_sideways_reread(region: OcrRegion) -> bool:
+    """Return whether this turned-image box is horizontal page text stood on end."""
+    left, top, right, bottom = _bounds(region)
+    width = right - left
+    height = bottom - top
+    return height > width * SIDEWAYS_ASPECT
+
+
+def _is_horizontal(region: OcrRegion) -> bool:
+    """Return whether the box is wider than it is tall.
+
+    Equality counts as not horizontal, so a square fragment of a vertical label can
+    still be replaced. A horizontal word is clearly wider than it is tall.
+    """
+    left, top, right, bottom = _bounds(region)
+    return (right - left) > (bottom - top)
 
 
 def _prefer_new(current: OcrRegion, new: OcrRegion) -> bool:
