@@ -1,4 +1,4 @@
-FROM docker.io/nixos/nix:2.35.3 AS base
+FROM docker.io/nixos/nix:2.36.0 AS base
 
 ENV NIX_CONFIG="experimental-features = nix-command flakes"
 
